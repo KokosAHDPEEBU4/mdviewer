@@ -12,12 +12,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from PyQt6.QtCore import QEvent, QPoint, QPointF, QSettings, Qt
-from PyQt6.QtGui import QMouseEvent, QWheelEvent
+from PyQt6.QtGui import QMouseEvent, QPalette, QWheelEvent
 from PyQt6.QtWidgets import QApplication, QTextBrowser
 
 import viewer as viewer_mod
 from main import create_app
-from theme import MEASURE, MIN_COLUMN, side_margin
+from theme import EDITOR_SELECTION, MEASURE, MIN_COLUMN, PREVIEW_SELECTION, side_margin
 from version import APP_NAME, APP_VERSION
 
 SOURCE = "# Title\r\n\r\nHello.\r\n"
@@ -273,6 +273,13 @@ def main() -> int:
         win._handle_esc()
         check("Esc stops autoscroll", win._autoscroll_pane, None)
         check("indicator hidden after stop", win._scroll_indicator.isVisible(), False)
+
+        # --- selection is colour-coded per pane
+        preview_sel = win._browser.palette().color(QPalette.ColorRole.Highlight)
+        editor_sel = win._editor.palette().color(QPalette.ColorRole.Highlight)
+        check("preview selection is orange", preview_sel.name(), PREVIEW_SELECTION)
+        check("editor selection is teal", editor_sel.name(), EDITOR_SELECTION)
+        check("the two selections differ", preview_sel != editor_sel, True)
 
         win._confirm_discard = lambda: True
         win._leave_edit()

@@ -39,7 +39,11 @@ CODE_INLINE_TEXT = "#e0ab6e"
 SUCCESS = "#7fd8a8"
 MARK_BG = "#5c4a17"     # ==highlighted==
 MARK_TEXT = "#ffe9a8"
-SELECTION = "#2f5f9e"   # text selection in both panes
+SELECTION = "#2f5f9e"   # generic selection (find hits, line edits)
+# Selection is colour-coded per pane so it is obvious where the highlight lives:
+# warm orange in the rendered preview, teal in the markdown source.
+PREVIEW_SELECTION = "#b5712a"
+EDITOR_SELECTION = "#2f8f8f"
 SCROLL_HANDLE = "#3d3d3d"
 SCROLL_HANDLE_HOVER = "#4d4d4d"
 
@@ -231,7 +235,7 @@ QTextBrowser {{
     background-color: {BG};
     border: none;
     color: {TEXT};
-    selection-background-color: {SELECTION};
+    selection-background-color: {PREVIEW_SELECTION};
     selection-color: #ffffff;
 }}
 QScrollBar:vertical {{
@@ -308,7 +312,7 @@ QPlainTextEdit {{
     color: {CODE_TEXT};
     font-family: {MONO};
     font-size: 13.5px;
-    selection-background-color: {SELECTION};
+    selection-background-color: {EDITOR_SELECTION};
     selection-color: #ffffff;
 }}
 #editorPanel {{ background-color: {CODE_BG}; }}
