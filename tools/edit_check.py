@@ -62,6 +62,7 @@ def main() -> int:
         for _ in range(3):
             app.processEvents()
         check("preview keeps its width when editing", win._browser.width() >= read_preview - 20, True)
+        check("editor is not wider than the preview", win._panel.width() <= win._browser.width() + 20, True)
         check("editor visible", win._editing(), True)
         check("editor holds the source", win._editor.toPlainText().splitlines()[2], "Hello.")
         check("window widened", win.width() > 1000, True)

@@ -377,10 +377,7 @@ class Viewer(QMainWindow):
 
     def _build_edit_button(self) -> None:
         self._edit_btn = QPushButton("Редактировать")
-        self._edit_btn.setToolTip("Редактировать Markdown как обычный текст (Ctrl+E)")
         self._edit_btn.clicked.connect(self._toggle_edit)
-        self._edit_hint = QLabel("Ctrl+E")
-        self._edit_hint.setToolTip("Правка в соседней панели: исходник справа, предпросмотр слева")
 
     def _title(self, unsaved: bool) -> str:
         """The version is in the title on purpose: it tells builds apart when
@@ -444,13 +441,14 @@ class Viewer(QMainWindow):
         self._baseline = _normalized(self._text)
         self._panel.setVisible(True)
 
-        # Keep the preview exactly where it was: widen the window by the width
-        # the editor needs instead of re-splitting the existing width.
+        # Keep the preview exactly where it was, and make the editor the same
+        # width instead of a fixed 1700 px that dwarfs it and squeezes the
+        # window. The window grows by at most that much.
         screen = QGuiApplication.primaryScreen()
         available = screen.availableGeometry().width() if screen else EDIT_WIDTH
-        editor_min = min(EDIT_WIDTH, int(available * 0.92))
+        editor_width = min(EDIT_WIDTH, self._preview_width)
         toc_w = self._outline_width()
-        target = min(self._preview_width + editor_min + toc_w, int(available * 0.96))
+        target = min(self._preview_width + editor_width + toc_w, int(available * 0.96))
         if self.width() < target:
             # QByteArray, not QRect: this is what restoreGeometry expects
             self._view_geometry = self.saveGeometry()
@@ -594,7 +592,6 @@ class Viewer(QMainWindow):
         text = self._editor.toPlainText() if editing else self._text
         unsaved = editing and text != self._baseline
         self.setWindowTitle(self._title(unsaved))
-        self._edit_hint.setVisible(not editing)
         if self._convert_btn is not None:
             self._convert_btn.setEnabled(editing and text != self._rendered)
         if self._save_btn is not None:
@@ -626,17 +623,14 @@ class Viewer(QMainWindow):
 
         prev_btn = QToolButton()
         prev_btn.setText("↑")
-        prev_btn.setToolTip("Предыдущее (Shift+F3)")
         prev_btn.clicked.connect(lambda: self._find_next(backward=True))
 
         next_btn = QToolButton()
         next_btn.setText("↓")
-        next_btn.setToolTip("Следующее (F3)")
         next_btn.clicked.connect(lambda: self._find_next())
 
         close_btn = QToolButton()
         close_btn.setText("✕")
-        close_btn.setToolTip("Очистить (Esc)")
         close_btn.clicked.connect(self._close_find)
 
         for widget in (prev_btn, self._find_edit, next_btn, self._find_status, close_btn):
@@ -663,32 +657,26 @@ class Viewer(QMainWindow):
 
         self._toc_btn = QToolButton()
         self._toc_btn.setText("☰")
-        self._toc_btn.setToolTip("Оглавление (Ctrl+B)")
         self._toc_btn.clicked.connect(self._toggle_outline)
 
         search_btn = QToolButton()
         search_btn.setText("🔍")
-        search_btn.setToolTip("Найти (Ctrl+F)")
         search_btn.clicked.connect(self._toggle_find)
 
         open_btn = QToolButton()
         open_btn.setText("📂")
-        open_btn.setToolTip("Открыть файл (Ctrl+O)")
         open_btn.clicked.connect(self._open_file)
 
         zoom_out = QToolButton()
         zoom_out.setText("−")
-        zoom_out.setToolTip("Мельче (Ctrl+-)")
         zoom_out.clicked.connect(lambda: self._set_zoom(self._zoom - 1))
 
         self._zoom_label = QToolButton()
         self._zoom_label.setText("100%")
-        self._zoom_label.setToolTip("Сбросить масштаб (Ctrl+0)")
         self._zoom_label.clicked.connect(lambda: self._set_zoom(0))
 
         zoom_in = QToolButton()
         zoom_in.setText("+")
-        zoom_in.setToolTip("Крупнее (Ctrl+=)")
         zoom_in.clicked.connect(lambda: self._set_zoom(self._zoom + 1))
 
         for widget in (
@@ -771,6 +759,19 @@ class Viewer(QMainWindow):
             matches.next()
             hits += 1
         self._find_status.setText(str(hits))
+        if hits:
+            # jump to the first match as the user types, not only on Enter
+            self._find_first()
+
+    def _find_first(self) -> None:
+        """Select the first match in the document."""
+        pattern = self._search_pattern(self._find_edit.text())
+        if pattern is None:
+            return
+        cursor = self._browser.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.Start)
+        self._browser.setTextCursor(cursor)
+        self._browser.find(pattern, QTextDocument.FindFlag(0))
 
     def _find_next(self, backward: bool = False) -> None:
         pattern = self._search_pattern(self._find_edit.text())
