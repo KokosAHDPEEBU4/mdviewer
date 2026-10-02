@@ -42,6 +42,7 @@ from renderer import Heading, render_with_outline
 from theme import (
     EDIT_SPLIT,
     EDIT_WIDTH,
+    MIN_COLUMN,
     SURFACE,
     TEXT_MUTED,
     TOC_WIDTH,
@@ -132,6 +133,7 @@ class Viewer(QMainWindow):
         self._save_btn: QPushButton | None = None
         self._view_geometry = None
         self._dark_titled = False
+        self._preview_width = 0      # preview width to preserve when editing
         self._outline: list[Heading] = []
         self._outline_offset: list[float] = []   # y of each heading in the doc
         self._outline_ready = False  # offsets are measured from the first render
@@ -430,6 +432,9 @@ class Viewer(QMainWindow):
         return self._edit_mode
 
     def _enter_edit(self) -> None:
+        # measure the preview before anything is added to the splitter: adding
+        # the (still hidden) editor panel already hands it space
+        self._preview_width = max(self._browser.width(), MIN_COLUMN)
         if self._editor is None:
             self._build_editor()
         self._edit_mode = True
@@ -438,9 +443,13 @@ class Viewer(QMainWindow):
         self._baseline = _normalized(self._text)
         self._panel.setVisible(True)
 
+        # Keep the preview exactly where it was: widen the window by the width
+        # the editor needs instead of re-splitting the existing width.
         screen = QGuiApplication.primaryScreen()
         available = screen.availableGeometry().width() if screen else EDIT_WIDTH
-        target = min(EDIT_WIDTH, int(available * 0.92))
+        editor_min = min(EDIT_WIDTH, int(available * 0.92))
+        toc_w = self._outline_width()
+        target = min(self._preview_width + editor_min + toc_w, int(available * 0.96))
         if self.width() < target:
             # QByteArray, not QRect: this is what restoreGeometry expects
             self._view_geometry = self.saveGeometry()
@@ -450,8 +459,35 @@ class Viewer(QMainWindow):
 
         self._edit_btn.setText("Выйти из правки")
         self._editor.setFocus()
-        self._editor.moveCursor(QTextCursor.MoveOperation.End)
+        self._move_editor_to_preview()
+        self._show_overlay()  # move it over the (now narrower) preview at once
         self._update_state()
+
+    def _move_editor_to_preview(self) -> None:
+        """Put the editor caret on the section the preview is currently showing.
+
+        The preview renders HTML and the editor holds the original markdown, so
+        they are matched by heading text, not by offset.
+        """
+        if not self._outline:
+            self._editor.moveCursor(QTextCursor.MoveOperation.Start)
+            return
+        if not self._outline_ready:
+            self._measure_outline()
+        scroll = self._browser.verticalScrollBar().value()
+        current = 0
+        for index, offset in enumerate(self._outline_offset):
+            if offset <= scroll + 24:
+                current = index
+            else:
+                break
+        label = self._outline[current].label
+        cursor = self._editor.document().find(label)
+        if cursor.isNull():
+            cursor = self._editor.document().find(label.split(" ")[0])
+        if not cursor.isNull():
+            self._editor.setTextCursor(cursor)
+            self._editor.centerCursor()
 
     def _leave_edit(self) -> None:
         if not self._confirm_discard():
@@ -469,6 +505,7 @@ class Viewer(QMainWindow):
             self._view_geometry = None
         self._edit_btn.setText("Редактировать")
         self._browser.setFocus()
+        self._show_overlay()  # back over the full-width preview
         self._update_state()
 
     def _apply_split(self) -> None:
@@ -483,24 +520,26 @@ class Viewer(QMainWindow):
         toc_w = self._outline_width()
         if editor:
             rest = total - toc_w
-            preview = int(rest * EDIT_SPLIT)
+            if self._preview_width:
+                preview = min(self._preview_width, max(MIN_COLUMN, rest - MIN_COLUMN))
+            else:
+                preview = int(rest * EDIT_SPLIT)
             sizes = ([toc_w] if toc else []) + [preview, rest - preview]
         else:
             sizes = ([toc_w] if toc else []) + [total - toc_w]
         self._splitter.setSizes(sizes)
-        # setSizes is relative to the splitter's *current* total; force a layout
-        # pass once the widget has really been resized
-        QTimer.singleShot(0, self._apply_split_if_stale)
+        if getattr(self, "_overlay", None) is not None and self._overlay.isVisible():
+            self._place_overlay()
+        # setSizes is relative to the splitter's *current* total; once the window
+        # has its real size, lay it out again with the absolute numbers
+        QTimer.singleShot(0, self._apply_split_settled)
         QTimer.singleShot(0, self._set_margins)
 
-    def _apply_split_if_stale(self) -> None:
-        """setSizes before the first show uses a stale total width, so redo it
-        once the window has its real size."""
-        expected = sum(self._splitter.sizes())
-        if expected and expected != self.width():
-            self._splitter.setSizes(
-                [int(size * self.width() / expected) for size in self._splitter.sizes()]
-            )
+    def _apply_split_settled(self) -> None:
+        total = self._splitter.width()
+        if total <= 0 or total == self.width():
+            return
+        self._apply_split()
 
     def _convert(self) -> None:
         if not self._editing():

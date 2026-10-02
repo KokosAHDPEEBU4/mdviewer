@@ -46,15 +46,22 @@ def main() -> int:
         path.write_bytes(SOURCE.encode("utf-8"))
 
         win = viewer_mod.Viewer(path, QSettings(tempfile.mkdtemp(), "edit_check"))
+        win.resize(1000, 700)
         win.show()
+        for _ in range(3):
+            app.processEvents()
 
         # --- read mode
         check("preview has the original text", "Hello." in win._browser.toPlainText(), True)
         check("title carries the version", win.windowTitle(), f"sample.md — {APP_NAME} {APP_VERSION}")
         check("dark title bar requested once", win._dark_titled, True)
+        read_preview = win._browser.width()
 
         # --- enter edit mode
         win._enter_edit()
+        for _ in range(3):
+            app.processEvents()
+        check("preview keeps its width when editing", win._browser.width() >= read_preview - 20, True)
         check("editor visible", win._editing(), True)
         check("editor holds the source", win._editor.toPlainText().splitlines()[2], "Hello.")
         check("window widened", win.width() > 1000, True)
@@ -63,9 +70,6 @@ def main() -> int:
         check("outline, preview and editor are three panes", len(sizes), 3 if win._toc.isVisible() else 2)
         check("preview gets the middle", sizes[-2] > 400, True)
         check("editor gets the right part", sizes[-1] > 400, True)
-        win._apply_split()
-        win._browser.resize(sizes[-2], win._browser.height())
-        win._set_margins()
         # setViewportMargins shrinks the viewport itself, so its width *is* the column
         column = win._browser.viewport().width()
         check("preview column keeps a usable width", column > 500, True)
