@@ -122,7 +122,9 @@ class Viewer(QMainWindow):
         self._settings = settings or QSettings()
         self._side = -1
         self._zoom = 0
+        self._editor_zoom = 0
         self._zoom_label = None
+        self._editor_zoom_label = None
         self._editor_base_font = None
 
         self._text = ""          # what is on disk
@@ -400,16 +402,25 @@ class Viewer(QMainWindow):
         caption = QLabel("ИСХОДНИК")
         caption.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px;")
         self._convert_btn = QPushButton("Конвертировать")
-        self._convert_btn.setToolTip("Пересчитать оформление слева (Ctrl+Enter)")
         self._convert_btn.clicked.connect(self._convert)
         self._save_btn = QPushButton("Сохранить")
         self._save_btn.setObjectName("primary")
-        self._save_btn.setToolTip("Записать файл на диск (Ctrl+S)")
         self._save_btn.clicked.connect(self._save)
         for widget in (caption, self._convert_btn, self._save_btn):
             header.addWidget(widget)
         header.addStretch(1)
-        header.addWidget(QLabel("Esc — выйти"))
+        # the editor has its own zoom, independent of the preview
+        self._editor_zoom_out = QToolButton()
+        self._editor_zoom_out.setText("−")
+        self._editor_zoom_out.clicked.connect(lambda: self._set_editor_zoom(self._editor_zoom - 1))
+        self._editor_zoom_label = QToolButton()
+        self._editor_zoom_label.setText("100%")
+        self._editor_zoom_label.clicked.connect(lambda: self._set_editor_zoom(0))
+        self._editor_zoom_in = QToolButton()
+        self._editor_zoom_in.setText("+")
+        self._editor_zoom_in.clicked.connect(lambda: self._set_editor_zoom(self._editor_zoom + 1))
+        for widget in (self._editor_zoom_out, self._editor_zoom_label, self._editor_zoom_in):
+            header.addWidget(widget)
         layout.addLayout(header)
 
         self._editor = QPlainTextEdit()
@@ -462,7 +473,7 @@ class Viewer(QMainWindow):
 
         self._edit_btn.setText("Выйти из правки")
         self._editor.setFocus()
-        self._apply_editor_zoom()
+        self._set_editor_zoom(self._editor_zoom)
         self._move_editor_to_preview()
         self._show_overlay()  # move it over the (now narrower) preview at once
         self._update_state()
@@ -810,32 +821,32 @@ class Viewer(QMainWindow):
             "Ctrl+B": self._toggle_outline,
             "Ctrl+Return": self._convert,
             "Ctrl+S": self._save,
-            "Ctrl+=": lambda: self._set_zoom(self._zoom + 1),
-            "Ctrl++": lambda: self._set_zoom(self._zoom + 1),
-            "Ctrl+-": lambda: self._set_zoom(self._zoom - 1),
-            "Ctrl+0": lambda: self._set_zoom(0),
+            "Ctrl+=": lambda: self._zoom_step(1),
+            "Ctrl++": lambda: self._zoom_step(1),
+            "Ctrl+-": lambda: self._zoom_step(-1),
+            "Ctrl+0": lambda: self._zoom_step(0),
         }
         for keys, slot in actions.items():
             QShortcut(QKeySequence(keys), self, slot)
 
+    def _zoom_step(self, step: int) -> None:
+        """Zoom the pane the user is working in: editor while editing, else
+        the preview. The two factors are independent."""
+        if self._editing() and self._editor.hasFocus():
+            target = self._editor_zoom + step if step else 0
+            self._set_editor_zoom(target)
+        else:
+            target = self._zoom + step if step else 0
+            self._set_zoom(target)
+
     def _set_zoom(self, level: int) -> None:
-        """Scale both panes. The label always shows the real factor."""
+        """Preview zoom only; the editor has its own (`_set_editor_zoom`)."""
         level = max(-8, min(20, level))
         delta = level - self._zoom
         for _ in range(abs(delta)):
             self._browser.zoomIn(1 if delta > 0 else -1)
         self._zoom = level
-        self._apply_editor_zoom()
         self._update_zoom_label()
-
-    def _apply_editor_zoom(self) -> None:
-        if self._editor is None or self._editor_base_font is None:
-            return
-        font = QFont(self._editor_base_font)  # QFont is mutable: never edit in place
-        if self._zoom:
-            size = font.pointSizeF() * (1.0 + 0.1 * self._zoom)
-            font.setPointSizeF(max(6.0, size))
-        self._editor.setFont(font)
 
     def _update_zoom_label(self) -> None:
         if self._zoom_label is None:
@@ -844,6 +855,26 @@ class Viewer(QMainWindow):
 
     def _reset_zoom(self) -> None:
         self._set_zoom(0)
+
+    def _set_editor_zoom(self, level: int) -> None:
+        """Editor zoom only, independent of the preview."""
+        self._editor_zoom = max(-8, min(20, level))
+        self._apply_editor_zoom()
+        self._update_editor_zoom_label()
+
+    def _apply_editor_zoom(self) -> None:
+        if self._editor is None or self._editor_base_font is None:
+            return
+        font = QFont(self._editor_base_font)  # QFont is mutable: never edit in place
+        if self._editor_zoom:
+            size = font.pointSizeF() * (1.0 + 0.1 * self._editor_zoom)
+            font.setPointSizeF(max(6.0, size))
+        self._editor.setFont(font)
+
+    def _update_editor_zoom_label(self) -> None:
+        if getattr(self, "_editor_zoom_label", None) is None:
+            return
+        self._editor_zoom_label.setText(f"{round((1.0 + 0.1 * self._editor_zoom) * 100)}%")
 
     def _open_file(self) -> None:
         if not self._confirm_discard():
