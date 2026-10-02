@@ -11,7 +11,7 @@ import ctypes
 import re
 import sys
 
-from PyQt6.QtCore import QRegularExpression, QSettings, QTimer, QUrl, Qt
+from PyQt6.QtCore import QEvent, QRegularExpression, QSettings, QTimer, QUrl, Qt
 from PyQt6.QtGui import (
     QDesktopServices,
     QFont,
@@ -153,6 +153,7 @@ class Viewer(QMainWindow):
         self._browser.setFrameShape(QTextBrowser.Shape.NoFrame)
         self._browser.setOpenExternalLinks(True)
         self._browser.anchorClicked.connect(self._open_link)
+        self._browser.installEventFilter(self)  # Ctrl+wheel zooms the preview
         self._browser.verticalScrollBar().valueChanged.connect(self._sync_outline)
 
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -431,6 +432,7 @@ class Viewer(QMainWindow):
         self._editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self._editor.setPlaceholderText("Исходный Markdown — как в блокноте")
         self._editor.textChanged.connect(self._update_state)
+        self._editor.installEventFilter(self)  # Ctrl+wheel zooms the editor
         self._editor_base_font = self._editor.font()
         layout.addWidget(self._editor, 1)
 
@@ -746,6 +748,20 @@ class Viewer(QMainWindow):
     def enterEvent(self, event):
         super().enterEvent(event)
         self._show_overlay()
+
+    def eventFilter(self, obj, event):
+        """Ctrl+wheel over a pane zooms that pane instead of scrolling."""
+        if event.type() == QEvent.Type.Wheel and (
+            event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
+            up = event.angleDelta().y() > 0
+            if obj is self._editor:
+                self._set_editor_zoom(self._editor_zoom + (1 if up else -1))
+                return True
+            if obj is self._browser:
+                self._set_zoom(self._zoom + (1 if up else -1))
+                return True
+        return super().eventFilter(obj, event)
 
     def leaveEvent(self, event):
         super().leaveEvent(event)

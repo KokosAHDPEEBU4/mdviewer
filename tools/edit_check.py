@@ -11,7 +11,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from PyQt6.QtCore import QSettings, Qt
+from PyQt6.QtCore import QPoint, QPointF, QSettings, Qt
+from PyQt6.QtGui import QWheelEvent
 from PyQt6.QtWidgets import QApplication, QTextBrowser
 
 import viewer as viewer_mod
@@ -72,6 +73,16 @@ def main() -> int:
         check("preview zoom untouched by editor zoom", win._zoom, preview_zoom)
         win._set_editor_zoom(0)
         check("editor zoom reset restores the font", win._editor.font().pointSizeF(), base_font)
+        # Ctrl+wheel over the editor must zoom it, not scroll it
+        wheel = QWheelEvent(
+            QPointF(10, 10), QPointF(10, 10), QPoint(0, 0), QPoint(0, 120),
+            Qt.MouseButton.NoButton, Qt.KeyboardModifier.ControlModifier,
+            Qt.ScrollPhase.NoScrollPhase, False,
+        )
+        before_wheel = win._editor_zoom
+        win.eventFilter(win._editor, wheel)
+        check("Ctrl+wheel zooms the editor", win._editor_zoom, before_wheel + 1)
+        win._set_editor_zoom(0)
         check("window widened", win.width() > 1000, True)
         check("editor panel visible", win._panel.isVisible(), True)
         sizes = win._splitter.sizes()

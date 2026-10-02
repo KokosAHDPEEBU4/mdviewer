@@ -339,10 +339,26 @@ QListWidget#outline::item:selected {{
 }}
 #overlay QToolButton {{
     color: {TEXT};
+    background-color: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 4px;
     padding: 4px 8px;
     font-size: 14px;
 }}
 #overlay QToolButton:hover {{
     background-color: {SURFACE_2};
+    border-color: {ACCENT_DIM};
+}}
+
+#editorPanel QToolButton {{
+    color: {TEXT};
+    background-color: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 4px;
+    padding: 3px 8px;
+}}
+#editorPanel QToolButton:hover {{
+    background-color: {SURFACE_2};
+    border-color: {ACCENT_DIM};
 }}
 """
