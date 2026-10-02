@@ -31,5 +31,8 @@ Footnote ref[^1]
 [^1]: The footnote text.
 """
 
-html = renderer.render(SOURCE)
+html, outline = renderer.render_with_outline(SOURCE)
+for heading in outline:
+    print(heading)
+print()
 print(html)

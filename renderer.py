@@ -11,12 +11,18 @@ because the target engine has quirks that HTML alone doesn't cover:
 """
 
 import re
+from collections import namedtuple
+from html import unescape
 from pathlib import Path
 
 import mistune
 from PyQt6.QtGui import QImageReader
 
 from theme import IMAGE_MAX
+
+# One heading of the document outline. `anchor` is the name injected into the
+# HTML so the table of contents can scroll to it (QTextBrowser.scrollToAnchor).
+Heading = namedtuple("Heading", "level label anchor")
 
 _MARKDOWN = mistune.create_markdown(
     escape=False,  # local, offline viewer: raw HTML is harmless and sometimes used
@@ -42,6 +48,9 @@ _CHECKBOX = re.compile(r"<input[^>]*type=\"checkbox\"[^>]*/>\s?")
 _FOOTNOTES = re.compile(r"<section class=\"footnotes\">(.*?)</section>", re.S)
 _IMAGE = re.compile(r"<img src=\"([^\"]*)\"([^>]*)>")
 _EXTERNAL = re.compile(r"^[a-z][a-z0-9+.-]*:", re.I)
+_HEADING = re.compile(r"<h([1-6])( [^>]*)?>(.*?)</h\1>", re.S)
+_TAGS = re.compile(r"<[^>]+>")
+_SPACES = re.compile(r"\s+")
 
 _TASK_OPEN, _TASK_DONE = '<span class="task-box">&#9744;</span> ', (
     '<span class="task-box-done">&#9745;</span> '
@@ -99,11 +108,40 @@ def _natural_width(path: Path) -> int:
     return size.width() if size.isValid() else 0
 
 
-def render(text: str, base_dir: Path | None = None) -> str:
-    """Convert markdown `text` (belonging to `base_dir`) to displayable HTML."""
+def _heading_label(inner: str) -> str:
+    """Heading text without markup: it ends up in a plain QListWidget."""
+    return _SPACES.sub(" ", unescape(_TAGS.sub("", inner))).strip()
+
+
+def _with_outline(html: str) -> tuple[str, list[Heading]]:
+    """Inject an <a name> into every heading and collect the outline.
+
+    Catches only real headings: mistune strips the raw tag to plain text inside
+    fenced code, so a ``# comment`` in a code block is never matched here. The
+    atx form (``# text``) is the only markdown heading, including setext.
+    """
+    outline: list[Heading] = []
+
+    def replace(match: re.Match) -> str:
+        level = int(match.group(1))
+        anchor = f"md-h{len(outline)}"
+        outline.append(Heading(level, _heading_label(match.group(3)), anchor))
+        attrs = match.group(2) or ""
+        return f'<h{level}{attrs}><a name="{anchor}"></a>{match.group(3)}</h{level}>'
+
+    return _HEADING.sub(replace, html), outline
+
+
+def render_with_outline(text: str, base_dir: Path | None = None) -> tuple[str, list[Heading]]:
+    """Like `render`, but also returns the document outline."""
     html = _MARKDOWN(text)
     html = _CODE_BLOCK.sub(lambda m: _code_block(m.group(1), m.group(2)), html)
     html = _CHECKBOX.sub(_checkbox, html)
     html = _FOOTNOTES.sub(_footnotes, html)
     html = _IMAGE.sub(lambda m: _image(m, base_dir), html)
-    return html
+    return _with_outline(html)
+
+
+def render(text: str, base_dir: Path | None = None) -> str:
+    """Convert markdown `text` (belonging to `base_dir`) to displayable HTML."""
+    return render_with_outline(text, base_dir)[0]
