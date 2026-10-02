@@ -199,6 +199,20 @@ def main() -> int:
         check("search clears the query", win._find_edit.text(), "")
         check("search field stays in the overlay", win._find_bar.isVisible(), True)
 
+        # --- search targets the editor while editing
+        win._enter_edit()
+        for _ in range(3):
+            app.processEvents()
+        win._find_edit.setText("Section 7")
+        app.processEvents()
+        check("editor search finds the source", int(win._find_status.text()) >= 1, True)
+        win._find_next()
+        check("editor search selects a match", win._editor.textCursor().hasSelection(), True)
+        win._confirm_discard = lambda: True
+        win._leave_edit()
+        for _ in range(3):
+            app.processEvents()
+
         win.close()
         app.processEvents()
 

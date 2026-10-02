@@ -126,6 +126,7 @@ class Viewer(QMainWindow):
         self._zoom_label = None
         self._editor_zoom_label = None
         self._editor_base_font = None
+        self._shortcuts_built = False
 
         self._text = ""          # what is on disk
         self._encoding = "utf-8"
@@ -165,10 +166,9 @@ class Viewer(QMainWindow):
         self._splitter.splitterMoved.connect(self._on_splitter_moved)
         self.setCentralWidget(self._splitter)
 
-        self._build_find_bar()
-        self._build_edit_button()
-        self._build_shortcuts()
-        self._build_overlay()
+        self._edit_btn = None
+        self._overlay = None
+        self._find_bar = None
 
         geometry = self._settings.value("geometry")
         if geometry:
@@ -176,6 +176,10 @@ class Viewer(QMainWindow):
 
         self.load()
         QTimer.singleShot(0, self._set_margins)
+        self._build_shortcuts()
+        # the hover chrome warms up QStyleSheetStyle (~300 ms); build it after
+        # the first frame so the document shows up sooner
+        QTimer.singleShot(0, self._ensure_overlay)
 
     # -- content ----------------------------------------------------------
 
@@ -445,6 +449,7 @@ class Viewer(QMainWindow):
         return self._edit_mode
 
     def _enter_edit(self) -> None:
+        self._ensure_overlay()
         # measure the preview before anything is added to the splitter: adding
         # the (still hidden) editor panel already hands it space
         self._preview_width = max(self._browser.width(), MIN_COLUMN)
@@ -475,6 +480,7 @@ class Viewer(QMainWindow):
         self._editor.setFocus()
         self._set_editor_zoom(self._editor_zoom)
         self._move_editor_to_preview()
+        self._update_hits(self._find_edit.text())  # search now targets the editor
         self._show_overlay()  # move it over the (now narrower) preview at once
         self._update_state()
 
@@ -507,6 +513,7 @@ class Viewer(QMainWindow):
     def _leave_edit(self) -> None:
         if not self._confirm_discard():
             return
+        self._ensure_overlay()
         self._edit_mode = False
         self._panel.setVisible(False)
         self._apply_split()
@@ -520,6 +527,7 @@ class Viewer(QMainWindow):
             self._view_geometry = None
         self._edit_btn.setText("Редактировать")
         self._browser.setFocus()
+        self._update_hits(self._find_edit.text())  # search back to the preview
         self._show_overlay()  # back over the full-width preview
         self._update_state()
 
@@ -614,7 +622,7 @@ class Viewer(QMainWindow):
             self._save_btn.setEnabled(unsaved)
 
     def _handle_esc(self) -> None:
-        if self._find_edit.hasFocus():
+        if self._find_edit is not None and self._find_edit.hasFocus():
             self._close_find()
         elif self._editing():
             self._leave_edit()
@@ -656,6 +664,15 @@ class Viewer(QMainWindow):
         # the field stays in the overlay for good: showing/hiding it made the
         # overlay change width long after the search was over
         bar.setVisible(True)
+
+    def _ensure_overlay(self) -> None:
+        """Build the hover chrome on first need (it is not free: the first
+        styled widget warms up QStyleSheetStyle for ~300 ms)."""
+        if self._overlay is not None:
+            return
+        self._build_find_bar()
+        self._build_edit_button()
+        self._build_overlay()
 
     def _build_overlay(self) -> None:
         """A floating control strip over the preview, shown on hover.
@@ -712,6 +729,7 @@ class Viewer(QMainWindow):
         self._overlay = panel
 
     def _show_overlay(self) -> None:
+        self._ensure_overlay()
         self._overlay.setVisible(True)
         self._overlay.raise_()
         self._place_overlay()
@@ -733,7 +751,7 @@ class Viewer(QMainWindow):
         super().leaveEvent(event)
         # hide only when the pointer really left the window, not just the
         # central widget (the overlay itself counts as inside)
-        if not self.underMouse():
+        if not self.underMouse() and self._overlay is not None:
             self._overlay.setVisible(False)
 
     def _toggle_find(self) -> None:
@@ -764,12 +782,23 @@ class Viewer(QMainWindow):
         # the query match any run of whitespace in the document
         return QRegularExpression(escaped.replace("\\ ", r"\s+"))
 
+    def _search_target(self):
+        """The pane the search works on: the editor while editing, else preview."""
+        if self._editing() and self._editor is not None:
+            return self._editor
+        return self._browser
+
+    def _target_text(self, target) -> str:
+        if target is self._editor:
+            return target.toPlainText()
+        return target.document().toPlainText()
+
     def _update_hits(self, text: str) -> None:
         pattern = self._search_pattern(text)
         if pattern is None:
             self._find_status.setText("")
             return
-        matches = pattern.globalMatch(self._browser.document().toPlainText())
+        matches = pattern.globalMatch(self._target_text(self._search_target()))
         hits = 0
         while matches.hasNext():
             matches.next()
@@ -780,29 +809,31 @@ class Viewer(QMainWindow):
             self._find_first()
 
     def _find_first(self) -> None:
-        """Select the first match in the document."""
+        """Select the first match in the active pane."""
         pattern = self._search_pattern(self._find_edit.text())
         if pattern is None:
             return
-        cursor = self._browser.textCursor()
+        target = self._search_target()
+        cursor = target.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.Start)
-        self._browser.setTextCursor(cursor)
-        self._browser.find(pattern, QTextDocument.FindFlag(0))
+        target.setTextCursor(cursor)
+        target.find(pattern, QTextDocument.FindFlag(0))
 
     def _find_next(self, backward: bool = False) -> None:
         pattern = self._search_pattern(self._find_edit.text())
         if pattern is None:
             return
+        target = self._search_target()
         flags = QTextDocument.FindFlag.FindBackward if backward else QTextDocument.FindFlag(0)
-        if self._browser.find(pattern, flags):
+        if target.find(pattern, flags):
             return
         # wrap around: start from the document edge and search again
-        cursor = self._browser.textCursor()
+        cursor = target.textCursor()
         cursor.movePosition(
             QTextCursor.MoveOperation.End if backward else QTextCursor.MoveOperation.Start
         )
-        self._browser.setTextCursor(cursor)
-        self._browser.find(pattern, flags)
+        target.setTextCursor(cursor)
+        target.find(pattern, flags)
 
     # -- shortcuts --------------------------------------------------------
 
