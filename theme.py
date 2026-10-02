@@ -19,23 +19,28 @@ single-cell table by `renderer.py`.
 """
 
 # --- palette ---------------------------------------------------------------
+# Neutral greys (QuickLook-like) rather than the earlier blue-violet tint: a
+# document viewer should keep its chrome out of the way of the text.
 
-BG = "#15151a"          # page
-SURFACE = "#1e1e25"     # quote, table header, footnotes
-SURFACE_2 = "#26262f"    # table header / hover
-CODE_BG = "#101015"     # fenced code, editor background
-CODE_INLINE_BG = "#22222b"
-BORDER = "#2e2e39"
-TEXT = "#e2e2e8"
-TEXT_HEAD = "#f4f4f7"
-TEXT_MUTED = "#9a9aa6"
-ACCENT = "#6cb2ff"
-ACCENT_DIM = "#3f6fa8"
-CODE_TEXT = "#e6e6ec"
-CODE_INLINE_TEXT = "#ffc38b"
-SUCCESS = "#79e2b6"
-MARK_BG = "#6a5518"     # ==highlighted==
+BG = "#1b1b1b"          # page
+SURFACE = "#242424"     # quote, table header, footnotes
+SURFACE_2 = "#2e2e2e"   # table header / hover
+CODE_BG = "#141414"     # fenced code, editor background
+CODE_INLINE_BG = "#2a2a2a"
+BORDER = "#3a3a3a"
+TEXT = "#e8e8e8"
+TEXT_HEAD = "#ffffff"
+TEXT_MUTED = "#9e9e9e"
+ACCENT = "#5aa9ff"
+ACCENT_DIM = "#3d6ea8"
+CODE_TEXT = "#e6e6e6"
+CODE_INLINE_TEXT = "#e0ab6e"
+SUCCESS = "#7fd8a8"
+MARK_BG = "#5c4a17"     # ==highlighted==
 MARK_TEXT = "#ffe9a8"
+SELECTION = "#2f5f9e"   # text selection in both panes
+SCROLL_HANDLE = "#3d3d3d"
+SCROLL_HANDLE_HOVER = "#4d4d4d"
 
 SANS = '"Segoe UI Variable Text", "Segoe UI", Inter, Arial, sans-serif'
 MONO = '"Cascadia Mono", "Cascadia Code", Consolas, "Courier New", monospace'
@@ -221,35 +226,35 @@ QTextBrowser {{
     background-color: {BG};
     border: none;
     color: {TEXT};
-    selection-background-color: #2f5f9e;
+    selection-background-color: {SELECTION};
     selection-color: #ffffff;
 }}
 QScrollBar:vertical {{
     background-color: {BG};
-    width: 13px;
+    width: 9px;
     margin: 0;
     border: none;
 }}
 QScrollBar::handle:vertical {{
-    background-color: #34343f;
+    background-color: {SCROLL_HANDLE};
     min-height: 32px;
-    border-radius: 5px;
-    margin: 3px;
+    border-radius: 4px;
+    margin: 2px;
 }}
-QScrollBar::handle:vertical:hover {{ background-color: #45454f; }}
+QScrollBar::handle:vertical:hover {{ background-color: {SCROLL_HANDLE_HOVER}; }}
 QScrollBar:horizontal {{
     background-color: {BG};
-    height: 13px;
+    height: 9px;
     margin: 0;
     border: none;
 }}
 QScrollBar::handle:horizontal {{
-    background-color: #34343f;
+    background-color: {SCROLL_HANDLE};
     min-width: 32px;
-    border-radius: 5px;
-    margin: 3px;
+    border-radius: 4px;
+    margin: 2px;
 }}
-QScrollBar::handle:horizontal:hover {{ background-color: #45454f; }}
+QScrollBar::handle:horizontal:hover {{ background-color: {SCROLL_HANDLE_HOVER}; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background-color: transparent; }}
 
@@ -259,7 +264,7 @@ QLineEdit {{
     border-radius: 5px;
     padding: 3px 8px;
     color: {TEXT};
-    selection-background-color: #2f5f9e;
+    selection-background-color: {SELECTION};
 }}
 QLineEdit:focus {{ border: 1px solid {ACCENT_DIM}; }}
 QToolButton {{
@@ -280,9 +285,9 @@ QPushButton {{
 }}
 QPushButton:hover:!disabled {{ background-color: {SURFACE_2}; }}
 QPushButton:disabled {{
-    background-color: #191920;
-    color: #5c5c68;
-    border-color: #232330;
+    background-color: #1f1f1f;
+    color: #5f5f5f;
+    border-color: #2a2a2a;
 }}
 QPushButton#primary {{
     background-color: {ACCENT_DIM};
@@ -298,7 +303,7 @@ QPlainTextEdit {{
     color: {CODE_TEXT};
     font-family: {MONO};
     font-size: 13.5px;
-    selection-background-color: #2f5f9e;
+    selection-background-color: {SELECTION};
     selection-color: #ffffff;
 }}
 #editorPanel {{ background-color: {CODE_BG}; }}

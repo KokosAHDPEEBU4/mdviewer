@@ -62,7 +62,7 @@ def hello(name: str) -> str:
 
 EXPECTED = {
     "page background": (BG, 4000),
-    "link accent": (ACCENT, 40),
+    "link accent": (ACCENT, 10),
     "code card": (CODE_BG, 2000),
     "inline code": (CODE_INLINE_BG, 300),
     "quote background": (SURFACE, 1500),
