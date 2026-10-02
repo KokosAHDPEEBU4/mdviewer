@@ -58,10 +58,12 @@ def main() -> int:
         check("editor holds the source", win._editor.toPlainText().splitlines()[2], "Hello.")
         check("window widened", win.width() > 1000, True)
         check("editor panel visible", win._panel.isVisible(), True)
-        check("preview gets the left part", win._splitter.sizes()[0] > 400, True)
-        check("editor gets the right part", win._splitter.sizes()[1] > 400, True)
+        sizes = win._splitter.sizes()
+        check("outline, preview and editor are three panes", len(sizes), 3 if win._toc.isVisible() else 2)
+        check("preview gets the middle", sizes[-2] > 400, True)
+        check("editor gets the right part", sizes[-1] > 400, True)
         win._apply_split()
-        win._browser.resize(win._splitter.sizes()[0], win._browser.height())
+        win._browser.resize(sizes[-2], win._browser.height())
         win._set_margins()
         # setViewportMargins shrinks the viewport itself, so its width *is* the column
         column = win._browser.viewport().width()
@@ -125,6 +127,35 @@ def main() -> int:
 
         win.close()
         win2.close()
+        app.processEvents()
+
+    # --- outline: headings, anchors, scrolling and visibility
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "outline.md"
+        body = "# One\n\n" + "\n\n".join(f"## Section {i}\n\n" + "text line\n" * 8 for i in range(40))
+        path.write_text(body, encoding="utf-8")
+        win = viewer_mod.Viewer(path, QSettings(tempfile.mkdtemp(), "toc_check"))
+        win.resize(1000, 700)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+        check("outline has every heading", win._toc.count(), 41)
+        check("outline visible when there are headings", win._toc.isVisible(), True)
+        check("anchors injected", win._browser.toHtml().count("<a name=\"md-h"), 41)
+        win._sync_outline()
+        check("offsets measured on demand", win._outline_ready, True)
+        check("first section is current at the top", win._toc.currentRow(), 0)
+        last = win._toc.item(win._toc.count() - 1)
+        win._outline_clicked(last)
+        app.processEvents()
+        check("clicking scrolls the preview", win._browser.verticalScrollBar().value() > 0, True)
+        check("current section follows the click", win._toc.currentRow(), win._toc.count() - 1)
+        win._toggle_outline()
+        check("outline can be hidden", win._toc.isVisible(), False)
+        check("visibility persisted", win._settings.value("toc_visible", True, type=bool), False)
+        win._toggle_outline()
+        check("outline comes back", win._toc.isVisible(), True)
+        win.close()
         app.processEvents()
 
     print("all checks passed" if not failures else f"{len(failures)} failure(s)")

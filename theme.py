@@ -54,6 +54,9 @@ MIN_COLUMN = 420        # never let the insets squeeze the text below this
 EDIT_WIDTH = 1700       # window width the editor asks for (clamped to the screen)
 EDIT_SPLIT = 0.55       # share of the window the preview keeps in edit mode
 IMAGE_MAX = 860         # widest an <img> is emitted at (renderer._image)
+TOC_WIDTH = 240         # table-of-contents pane width (px)
+TOC_STEP = 14           # indent per heading level
+TOC_ROW = "#0f0f0f"     # current section highlight in the outline
 
 
 def side_margin(width: int) -> int:
@@ -307,4 +310,25 @@ QPlainTextEdit {{
     selection-color: #ffffff;
 }}
 #editorPanel {{ background-color: {CODE_BG}; }}
+
+QListWidget#outline {{
+    background-color: {BG};
+    border: none;
+    border-right: 1px solid {BORDER};
+    outline: none;
+    color: {TEXT_MUTED};
+    font-size: 13px;
+}}
+QListWidget#outline::item {{
+    padding: 3px 8px;
+    border-radius: 4px;
+}}
+QListWidget#outline::item:hover {{
+    background-color: {SURFACE};
+    color: {TEXT};
+}}
+QListWidget#outline::item:selected {{
+    background-color: {SURFACE_2};
+    color: {TEXT_HEAD};
+}}
 """

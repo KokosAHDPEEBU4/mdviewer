@@ -18,6 +18,8 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -29,8 +31,16 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from renderer import render
-from theme import EDIT_SPLIT, EDIT_WIDTH, TEXT_MUTED, content_css, side_margin
+from renderer import Heading, render_with_outline
+from theme import (
+    EDIT_SPLIT,
+    EDIT_WIDTH,
+    SURFACE,
+    TEXT_MUTED,
+    TOC_WIDTH,
+    content_css,
+    side_margin,
+)
 from version import APP_NAME, APP_VERSION
 
 def read_document(path: Path) -> tuple[str, str, str]:
@@ -115,6 +125,10 @@ class Viewer(QMainWindow):
         self._save_btn: QPushButton | None = None
         self._view_geometry = None
         self._dark_titled = False
+        self._outline: list[Heading] = []
+        self._outline_offset: list[float] = []   # y of each heading in the doc
+        self._outline_ready = False  # offsets are measured from the first render
+        self._toc_syncing = False
 
         self.setWindowTitle(self._title(False))
         self.resize(1000, 800)
@@ -123,14 +137,17 @@ class Viewer(QMainWindow):
         self._browser.setFrameShape(QTextBrowser.Shape.NoFrame)
         self._browser.setOpenExternalLinks(True)
         self._browser.anchorClicked.connect(self._open_link)
+        self._browser.verticalScrollBar().valueChanged.connect(self._sync_outline)
 
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
         self._splitter.setChildrenCollapsible(False)
+        self._splitter.addWidget(self._build_outline())
         self._splitter.addWidget(self._browser)
-        self._splitter.setStretchFactor(0, 1)
+        self._splitter.setStretchFactor(0, 0)
+        self._splitter.setStretchFactor(1, 1)
         # the divider changes the preview width without resizing the window, so
         # no resizeEvent arrives and the insets would keep their old value
-        self._splitter.splitterMoved.connect(lambda *_: self._set_margins())
+        self._splitter.splitterMoved.connect(self._on_splitter_moved)
         self.setCentralWidget(self._splitter)
 
         self._build_find_bar()
@@ -164,7 +181,10 @@ class Viewer(QMainWindow):
         # the stylesheet has to be in place before the HTML: Qt matches CSS while
         # importing, not afterwards
         self._browser.document().setDefaultStyleSheet(content_css())
-        self._browser.setHtml(render(text, self._path.parent))
+        html, self._outline = render_with_outline(text, self._path.parent)
+        self._browser.setHtml(html)
+        self._outline_ready = False
+        self._populate_outline()
         self._set_margins()
         self._browser.verticalScrollBar().setValue(0)
 
@@ -187,15 +207,136 @@ class Viewer(QMainWindow):
             self._side = side
             self._browser.setViewportMargins(side, 0, side, 0)
 
+    def _on_splitter_moved(self, *_args) -> None:
+        self._set_margins()
+        # a wider preview re-wraps the text, so the cached heading offsets move
+        self._outline_ready = False
+
+    # -- table of contents -------------------------------------------------
+
+    def _build_outline(self) -> QWidget:
+        self._toc = QListWidget()
+        self._toc.setObjectName("outline")
+        self._toc.setUniformItemSizes(False)
+        self._toc.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._toc.itemClicked.connect(self._outline_clicked)
+        self._toc.setVisible(False)  # shown once a document has headings
+        return self._toc
+
+    def _populate_outline(self) -> None:
+        """Rebuild the list from the last render (cheap: it is plain text)."""
+        self._toc.clear()
+        for heading in self._outline:
+            item = QListWidgetItem("  " * (heading.level - 1) + heading.label)
+            item.setData(Qt.ItemDataRole.UserRole, heading.anchor)
+            item.setToolTip(heading.label)
+            self._toc.addItem(item)
+        visible = self._settings.value("toc_visible", True, type=bool) and bool(self._outline)
+        self._set_outline_visible(visible)
+
+    def _set_outline_visible(self, visible: bool) -> None:
+        self._toc.setVisible(visible)
+        if visible:
+            self._toc.setFixedWidth(int(self._settings.value("toc_width", TOC_WIDTH)))
+        self._settings.setValue("toc_visible", visible)
+        self._apply_split()
+        QTimer.singleShot(0, self._set_margins)
+        QTimer.singleShot(0, self._sync_outline)
+
+    def _outline_width(self) -> int:
+        """Width the outline pane should take in the splitter (0 when hidden)."""
+        if not self._toc.isVisible():
+            return 0
+        return int(self._settings.value("toc_width", TOC_WIDTH))
+
+    def _toggle_outline(self) -> None:
+        self._set_outline_visible(not self._toc.isVisible())
+
+    def _outline_clicked(self, item: QListWidgetItem) -> None:
+        anchor = item.data(Qt.ItemDataRole.UserRole)
+        self._browser.scrollToAnchor(anchor)
+        self._sync_outline()
+
+    def _measure_outline(self) -> None:
+        """Map every heading anchor to a y offset in the document layout.
+
+        The anchor name is a character format, not text (``<a name=...>`` has
+        no visible content), so it is read from the block fragments rather than
+        from ``block.text()``. Measured lazily on first need: block layout for a
+        large file is not free and the outline is only useful once scrolled.
+        """
+        layout = self._browser.document().documentLayout()
+        layout.documentSize()  # a lazy document reports every block at y=0
+        offsets = [-1.0] * len(self._outline)
+        wanted = {heading.anchor: index for index, heading in enumerate(self._outline)}
+        block = self._browser.document().begin()
+        seen = 0
+        while block.isValid():
+            fragment = block.begin()
+            while fragment != block.end():
+                piece = fragment.fragment()
+                if piece.isValid():
+                    for name in piece.charFormat().anchorNames():
+                        if name in wanted:
+                            offsets[wanted[name]] = layout.blockBoundingRect(block).top()
+                            seen += 1
+                fragment += 1
+            if seen == len(wanted):
+                break
+            block = block.next()
+        # A document that has not been laid out yet reports every heading at 0;
+        # keep the old offsets and try again after the next scroll.
+        if len(self._outline) > 1 and min(offsets) == max(offsets):
+            return
+        self._outline_offset = offsets
+        self._outline_ready = True
+
+    def _sync_outline(self) -> None:
+        """Highlight the section that owns the top of the viewport."""
+        if self._toc_syncing or not self._toc.isVisible() or not self._outline:
+            return
+        if not self._outline_ready:
+            self._measure_outline()
+        scroll = self._browser.verticalScrollBar().value()
+        current = 0
+        for index, offset in enumerate(self._outline_offset):
+            if offset <= scroll + 24:
+                current = index
+            else:
+                break
+        if self._toc.currentRow() == current:
+            return
+        self._toc_syncing = True
+        try:
+            self._toc.setCurrentRow(current)
+            self._toc.scrollToItem(self._toc.item(current), QListWidget.ScrollHint.EnsureVisible)
+        finally:
+            self._toc_syncing = False
+
     def showEvent(self, event):
         super().showEvent(event)
         if not self._dark_titled:
             self._dark_titled = True
             enable_dark_title_bar(self)
+        QTimer.singleShot(0, self._apply_split)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._set_margins()
+        self._resize_toc()
+
+    def _resize_toc(self) -> None:
+        """Keep the outline pane at its fixed width when the window resizes;
+        the splitter would otherwise hand the extra space to pane 0."""
+        if not self._toc.isVisible():
+            return
+        sizes = self._splitter.sizes()
+        if len(sizes) < 2:
+            return
+        width = self._outline_width()
+        if sizes[0] != width:
+            sizes[0] = width
+            self._splitter.setSizes(sizes)
 
     def closeEvent(self, event):
         if not self._confirm_discard():
@@ -306,7 +447,7 @@ class Viewer(QMainWindow):
             return
         self._edit_mode = False
         self._panel.setVisible(False)
-        self._splitter.setSizes([self.width(), 0])
+        self._apply_split()
         QTimer.singleShot(0, self._set_margins)
         if _normalized(self._text) != self._rendered:
             # the preview showed a converted but unsaved draft: go back to disk
@@ -320,13 +461,35 @@ class Viewer(QMainWindow):
         self._update_state()
 
     def _apply_split(self) -> None:
-        """Preview gets EDIT_SPLIT of the window, the editor gets the rest."""
-        if not self._edit_mode:
-            return
-        width = self.width()
-        self._splitter.setSizes([int(width * EDIT_SPLIT), width - int(width * EDIT_SPLIT)])
-        # the columns are only resized once the layout settles
+        """Lay out the splitter according to what is currently visible:
+
+            read mode:  [toc?] [preview]
+            edit mode:  [toc?] [preview] [editor]
+        """
+        total = self.width()
+        editor = self._editor is not None and self._panel.isVisible()
+        toc = self._toc.isVisible()
+        toc_w = self._outline_width()
+        if editor:
+            rest = total - toc_w
+            preview = int(rest * EDIT_SPLIT)
+            sizes = ([toc_w] if toc else []) + [preview, rest - preview]
+        else:
+            sizes = ([toc_w] if toc else []) + [total - toc_w]
+        self._splitter.setSizes(sizes)
+        # setSizes is relative to the splitter's *current* total; force a layout
+        # pass once the widget has really been resized
+        QTimer.singleShot(0, self._apply_split_if_stale)
         QTimer.singleShot(0, self._set_margins)
+
+    def _apply_split_if_stale(self) -> None:
+        """setSizes before the first show uses a stale total width, so redo it
+        once the window has its real size."""
+        expected = sum(self._splitter.sizes())
+        if expected and expected != self.width():
+            self._splitter.setSizes(
+                [int(size * self.width() / expected) for size in self._splitter.sizes()]
+            )
 
     def _convert(self) -> None:
         if not self._editing():
@@ -479,6 +642,7 @@ class Viewer(QMainWindow):
             "Ctrl+R": self.load,
             "Ctrl+O": self._open_file,
             "Ctrl+E": self._toggle_edit,
+            "Ctrl+B": self._toggle_outline,
             "Ctrl+Return": self._convert,
             "Ctrl+S": self._save,
             "Ctrl+=": lambda: self._set_zoom(self._zoom + 1),
