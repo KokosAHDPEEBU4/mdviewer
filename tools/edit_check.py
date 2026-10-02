@@ -50,6 +50,7 @@ def main() -> int:
         # --- read mode
         check("preview has the original text", "Hello." in win._browser.toPlainText(), True)
         check("title carries the version", win.windowTitle(), "sample.md — MD Viewer 2.0.0")
+        check("dark title bar requested once", win._dark_titled, True)
 
         # --- enter edit mode
         win._enter_edit()

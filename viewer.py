@@ -7,6 +7,8 @@ from the edited text, "Сохранить" writes the file and refreshes the pre
 """
 
 from pathlib import Path
+import ctypes
+import sys
 
 from PyQt6.QtCore import QSettings, QTimer, QUrl, Qt
 from PyQt6.QtGui import QDesktopServices, QGuiApplication, QKeySequence, QShortcut, QTextCursor
@@ -70,6 +72,29 @@ def _normalized(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
+# DwmSetWindowAttribute: the native caption is drawn light grey on Windows 10
+# unless the app opts out, and Qt exposes no API for it.
+_DWMWA_USE_IMMERSIVE_DARK_MODE = 20          # Windows 10 20H1+
+_DWMWA_USE_IMMERSIVE_DARK_MODE_OLD = 19      # Windows 10 1809..1909
+
+
+def enable_dark_title_bar(widget) -> bool:
+    """Ask DWM for a dark caption. False when the OS will not have it."""
+    if sys.platform != "win32":
+        return False
+    try:
+        value = ctypes.c_int(1)
+        for attribute in (_DWMWA_USE_IMMERSIVE_DARK_MODE, _DWMWA_USE_IMMERSIVE_DARK_MODE_OLD):
+            result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                int(widget.winId()), attribute, ctypes.byref(value), ctypes.sizeof(value)
+            )
+            if result == 0:
+                return True
+    except (AttributeError, OSError):
+        pass
+    return False
+
+
 class Viewer(QMainWindow):
     def __init__(self, path: Path, settings: QSettings | None = None):
         super().__init__()
@@ -89,6 +114,7 @@ class Viewer(QMainWindow):
         self._convert_btn: QPushButton | None = None
         self._save_btn: QPushButton | None = None
         self._view_geometry = None
+        self._dark_titled = False
 
         self.setWindowTitle(self._title(False))
         self.resize(1000, 800)
@@ -160,6 +186,12 @@ class Viewer(QMainWindow):
         if side != self._side:
             self._side = side
             self._browser.setViewportMargins(side, 0, side, 0)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._dark_titled:
+            self._dark_titled = True
+            enable_dark_title_bar(self)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
