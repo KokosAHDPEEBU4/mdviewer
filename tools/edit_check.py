@@ -11,8 +11,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from PyQt6.QtCore import QPoint, QPointF, QSettings, Qt
-from PyQt6.QtGui import QWheelEvent
+from PyQt6.QtCore import QEvent, QPoint, QPointF, QSettings, Qt
+from PyQt6.QtGui import QMouseEvent, QWheelEvent
 from PyQt6.QtWidgets import QApplication, QTextBrowser
 
 import viewer as viewer_mod
@@ -251,6 +251,29 @@ def main() -> int:
             app.processEvents()
         caret = win._editor.textCursor().block().text()
         check("caret lands on the visible section", win._heading_key(caret), win._heading_key(wanted))
+
+        # --- middle-click autoscroll, independently per pane
+        def middle_press(pane, x, y):
+            event = QMouseEvent(
+                QEvent.Type.MouseButtonPress, QPointF(x, y), QPointF(x, y),
+                Qt.MouseButton.MiddleButton, Qt.MouseButton.MiddleButton,
+                Qt.KeyboardModifier.NoModifier,
+            )
+            win.eventFilter(pane, event)
+
+        editor_bar = win._editor.verticalScrollBar()
+        preview_before = win._browser.verticalScrollBar().value()
+        middle_press(win._editor, 200, 200)
+        check("middle-click arms the editor", win._autoscroll_pane is win._editor, True)
+        win._move_autoscroll(QPointF(200, 300).toPoint())
+        for _ in range(20):
+            win._autoscroll_tick()
+        check("editor autoscrolls", editor_bar.value() > 0, True)
+        check("preview stays put while the editor scrolls", win._browser.verticalScrollBar().value(), preview_before)
+        win._handle_esc()
+        check("Esc stops autoscroll", win._autoscroll_pane, None)
+        check("indicator hidden after stop", win._scroll_indicator.isVisible(), False)
+
         win._confirm_discard = lambda: True
         win._leave_edit()
         for _ in range(3):

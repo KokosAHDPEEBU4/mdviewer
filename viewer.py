@@ -11,12 +11,15 @@ import ctypes
 import re
 import sys
 
-from PyQt6.QtCore import QEvent, QRegularExpression, QSettings, QTimer, QUrl, Qt
+from PyQt6.QtCore import QEvent, QPoint, QRegularExpression, QRect, QSettings, QTimer, QUrl, Qt
 from PyQt6.QtGui import (
+    QColor,
     QDesktopServices,
     QFont,
     QGuiApplication,
     QKeySequence,
+    QPainter,
+    QPen,
     QShortcut,
     QTextCursor,
     QTextDocument,
@@ -116,7 +119,53 @@ def enable_dark_title_bar(widget) -> bool:
     return False
 
 
+class ScrollIndicator(QWidget):
+    """The little anchor circle shown where a middle-click starts autoscroll.
+
+    Purely decorative: it is a child overlay of the scrolled pane and draws the
+    browser-style ring plus a dot that follows the pointer.
+    """
+
+    RADIUS = 22
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._origin = QPoint(0, 0)
+        self._dot = QPoint(0, 0)
+        self.hide()
+
+    def start(self, origin: QPoint) -> None:
+        self._origin = origin
+        self._dot = QPoint(0, 0)
+        size = self.RADIUS * 2
+        self.setGeometry(origin.x() - self.RADIUS, origin.y() - self.RADIUS, size, size)
+        self.show()
+        self.raise_()
+
+    def set_dot(self, offset: QPoint) -> None:
+        limit = self.RADIUS - 5
+        self._dot = QPoint(
+            max(-limit, min(limit, offset.x())),
+            max(-limit, min(limit, offset.y())),
+        )
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        centre = self.rect().center()
+        painter.setPen(QPen(QColor(210, 210, 220, 180), 2))
+        painter.drawEllipse(centre, self.RADIUS - 1, self.RADIUS - 1)
+        painter.setBrush(QColor(210, 210, 220, 200))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(centre + self._dot, 4, 4)
+
+
 class Viewer(QMainWindow):
+    SCROLL_DEAD_ZONE = 12   # px the pointer must move before autoscroll kicks in
+
     def __init__(self, path: Path, settings: QSettings | None = None):
         super().__init__()
         self._path = Path(path).resolve()
@@ -147,6 +196,13 @@ class Viewer(QMainWindow):
         self._outline: list[Heading] = []
         self._edit_anchor = None     # label of the visible section when editing starts
         self._toc_syncing = False
+        # middle-click autoscroll: one pane at a time, tracked per pane
+        self._autoscroll_pane = None
+        self._autoscroll_origin = QPoint(0, 0)
+        self._autoscroll_offset = QPoint(0, 0)
+        self._scroll_indicator = None
+        self._autoscroll_timer = QTimer(self)
+        self._autoscroll_timer.timeout.connect(self._autoscroll_tick)
 
         self.setWindowTitle(self._title(False))
         self.resize(1000, 800)
@@ -613,7 +669,9 @@ class Viewer(QMainWindow):
             self._save_btn.setEnabled(unsaved)
 
     def _handle_esc(self) -> None:
-        if self._find_edit is not None and self._find_edit.hasFocus():
+        if self._autoscroll_timer.isActive():
+            self._stop_autoscroll()
+        elif self._find_edit is not None and self._find_edit.hasFocus():
             self._close_find()
         elif self._editing():
             self._leave_edit()
@@ -739,21 +797,80 @@ class Viewer(QMainWindow):
         self._show_overlay()
 
     def eventFilter(self, obj, event):
-        """Ctrl+wheel over a pane zooms that pane instead of scrolling."""
-        if event.type() == QEvent.Type.Wheel and (
-            event.modifiers() & Qt.KeyboardModifier.ControlModifier
-        ):
-            up = event.angleDelta().y() > 0
-            if obj is self._editor:
-                self._set_editor_zoom(self._editor_zoom + (1 if up else -1))
+        """Per-pane chrome: Ctrl+wheel zooms, middle-click autoscrolls.
+
+        Autoscroll is tracked separately for the preview and the editor, so
+        starting it in one never moves the other.
+        """
+        etype = event.type()
+        if obj in (self._browser, self._editor):
+            if etype == QEvent.Type.Wheel:
+                if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                    up = event.angleDelta().y() > 0
+                    if obj is self._editor:
+                        self._set_editor_zoom(self._editor_zoom + (1 if up else -1))
+                    else:
+                        self._set_zoom(self._zoom + (1 if up else -1))
+                    return True
+                self._stop_autoscroll()
+            elif etype == QEvent.Type.MouseButtonPress:
+                if event.button() == Qt.MouseButton.MiddleButton:
+                    self._start_autoscroll(obj, event.position().toPoint())
+                    return True
+                self._stop_autoscroll()
+            elif etype == QEvent.Type.MouseMove and self._autoscroll_pane is obj:
+                self._move_autoscroll(event.position().toPoint())
                 return True
-            if obj is self._browser:
-                self._set_zoom(self._zoom + (1 if up else -1))
-                return True
-            if obj is self._toc:
+        elif obj is self._toc and etype == QEvent.Type.Wheel:
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                up = event.angleDelta().y() > 0
                 self._set_toc_zoom(self._toc_zoom + (1 if up else -1))
                 return True
         return super().eventFilter(obj, event)
+
+    # -- middle-click autoscroll ------------------------------------------
+
+    def _start_autoscroll(self, pane, point: QPoint) -> None:
+        if self._autoscroll_pane is pane and self._autoscroll_timer.isActive():
+            self._stop_autoscroll()
+            return
+        self._stop_autoscroll()
+        self._autoscroll_pane = pane
+        if self._scroll_indicator is None:
+            self._scroll_indicator = ScrollIndicator(pane.viewport())
+        else:
+            self._scroll_indicator.setParent(pane.viewport())
+        self._scroll_indicator.start(point)
+        self._autoscroll_origin = point
+        self._autoscroll_timer.start(16)
+
+    def _move_autoscroll(self, point: QPoint) -> None:
+        self._autoscroll_offset = point - self._autoscroll_origin
+        if self._scroll_indicator is not None:
+            self._scroll_indicator.set_dot(self._autoscroll_offset)
+
+    def _stop_autoscroll(self) -> None:
+        if self._autoscroll_timer.isActive():
+            self._autoscroll_timer.stop()
+        if self._scroll_indicator is not None:
+            self._scroll_indicator.hide()
+        self._autoscroll_pane = None
+        self._autoscroll_offset = QPoint(0, 0)
+
+    def _autoscroll_tick(self) -> None:
+        pane = self._autoscroll_pane
+        if pane is None:
+            self._stop_autoscroll()
+            return
+        # dead zone so a tiny wobble does not scroll; speed grows with distance
+        dy = self._autoscroll_offset.y()
+        step = 0
+        if abs(dy) > self.SCROLL_DEAD_ZONE:
+            over = abs(dy) - self.SCROLL_DEAD_ZONE
+            step = int((over / 3 + 1) * (1 if dy > 0 else -1))
+        if step:
+            bar = pane.verticalScrollBar()
+            bar.setValue(bar.value() + step)
 
     def leaveEvent(self, event):
         super().leaveEvent(event)
