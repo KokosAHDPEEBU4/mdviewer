@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import QApplication, QTextBrowser
 import viewer as viewer_mod
 from main import create_app
 from theme import MEASURE, MIN_COLUMN, side_margin
+from version import APP_NAME, APP_VERSION
 
 SOURCE = "# Title\r\n\r\nHello.\r\n"
 UPDATED = "# Title\r\n\r\nHello, world.\r\n"
@@ -49,7 +50,7 @@ def main() -> int:
 
         # --- read mode
         check("preview has the original text", "Hello." in win._browser.toPlainText(), True)
-        check("title carries the version", win.windowTitle(), "sample.md — MD Viewer 2.0.0")
+        check("title carries the version", win.windowTitle(), f"sample.md — {APP_NAME} {APP_VERSION}")
         check("dark title bar requested once", win._dark_titled, True)
 
         # --- enter edit mode
@@ -74,7 +75,7 @@ def main() -> int:
 
         # --- type something
         win._editor.setPlainText(UPDATED)
-        check("title marks unsaved changes", win.windowTitle(), "sample.md • — MD Viewer 2.0.0")
+        check("title marks unsaved changes", win.windowTitle(), f"sample.md • — {APP_NAME} {APP_VERSION}")
         check("save enabled after edit", win._save_btn.isEnabled(), True)
         check("convert enabled after edit", win._convert_btn.isEnabled(), True)
 
@@ -82,14 +83,14 @@ def main() -> int:
         win._convert()
         check("preview re-rendered", "Hello, world." in win._browser.toPlainText(), True)
         check("convert disabled after convert", win._convert_btn.isEnabled(), False)
-        check("still unsaved after convert", win.windowTitle(), "sample.md • — MD Viewer 2.0.0")
+        check("still unsaved after convert", win.windowTitle(), f"sample.md • — {APP_NAME} {APP_VERSION}")
         check("disk untouched by convert", path.read_bytes(), SOURCE.encode("utf-8"))
 
         # --- save: file written, preview already current
         check("save reports success", win._save(), True)
         check("file written as CRLF", path.read_bytes(), UPDATED.encode("utf-8"))
         check("no BOM added to a plain utf-8 file", path.read_bytes()[:3], b"# T")
-        check("title clean after save", win.windowTitle(), "sample.md — MD Viewer 2.0.0")
+        check("title clean after save", win.windowTitle(), f"sample.md — {APP_NAME} {APP_VERSION}")
         check("save disabled again", win._save_btn.isEnabled(), False)
 
         # --- encoding round-trip: cp1251 stays cp1251

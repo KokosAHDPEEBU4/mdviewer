@@ -9,10 +9,11 @@
 ```
 main.py         CLI (файлы, --install-default/--uninstall-default/--assoc-status),
                 QApplication, диалог открытия файла
-viewer.py       окно: QTextBrowser, QSplitter с QPlainTextEdit, поиск, shortcuts,
-                zoom, QSettings, dirty-state
-renderer.py     mistune -> HTML: post-processing кода, картинок, чекбоксов, сносок
-theme.py        палитра, CSS для Qt rich text, MEASURE/side_margin
+viewer.py       окно: превью + оглавление + QPlainTextEdit, оверлей, поиск,
+                shortcuts, zoom, QSettings, dirty-state
+renderer.py     mistune -> HTML: код, картинки, чекбоксы, сноски, якоря заголовков
+                и оглавление (render_with_outline)
+theme.py        палитра, CSS для Qt rich text, MEASURE/side_margin, QSS приложения
 winassoc.py     регистрация .md в HKCU (ProgID, OpenWithProgids, RegisteredApplications)
 version.py      APP_NAME, APP_VERSION, PROG_ID, EXTENSIONS — общий источник истины
 MDViewer.spec   PyInstaller: иконка, версия, excludes, вырезание лишнего Qt
@@ -26,7 +27,8 @@ tools/          make_icon.py, render_check.py, debug_html.py, edit_check.py
 .venv\Scripts\python main.py README.md          # запуск из исходников
 build.bat                                       # сборка dist\MDViewer
 .venv\Scripts\python tools\render_check.py      # визуальная проверка темы
-.venv\Scripts\python tools\edit_check.py        # правка/конвертация/сохранение
+.venv\Scripts\python tools\edit_check.py        # правка/конвертация/сохранение,
+                                                # оглавление, оверлей
 .venv\Scripts\python -m py_compile *.py
 ```
 
@@ -112,6 +114,22 @@ build.bat                                       # сборка dist\MDViewer
     `_view_geometry` — это `QByteArray` из `saveGeometry()`, а не `QRect`:
     у `QRect` нет метода `saveGeometry`, и исключение в слоте PyQt6 убивает
     процесс с `0xC0000409` без traceback.
+
+15. **Оглавление строится тем же проходом, что и рендер.** `render_with_outline`
+    вставляет `<a name="md-hN">` в заголовки и возвращает `Heading(level, label,
+    anchor)`. `block.text()` **не** видит анкоры (`<a name>` без текста) — их
+    надо читать через `charFormat().anchorNames()` по фрагментам блока, иначе
+    позиции разделов не находятся. Смещения измеряются лениво
+    (`viewer._measure_outline`) и кэшируются, сбрасываются при ресайзе/зуме.
+    Если документ ещё не разложен, все offsets равны — измерение откладывается.
+
+16. **Всплывающая панель — дочерний виджет окна**, а не элемент layout:
+    `_overlay` живёт поверх сплиттера (`self._overlay.raise_()`), поэтому не
+    отнимает место у текста. Первое появление — на `enterEvent` главного окна.
+    Статусбара в приложении нет, версия только в заголовке.
+
+Максимум контента — до `MEASURE` px, оглавление фиксируется по `TOC_WIDTH`,
+отступы уровней — `TOC_STEP`; всё в `theme.py`.
 
 ## Что НЕ делать (грабли)
 

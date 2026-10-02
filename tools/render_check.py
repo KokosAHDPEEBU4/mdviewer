@@ -10,6 +10,7 @@ them is missing.
 
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -17,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from PyQt6.QtGui import QColor, QImage  # noqa: E402
 
 from main import create_app  # noqa: E402
+from renderer import render_with_outline  # noqa: E402
 from theme import ACCENT, BG, CODE_BG, CODE_INLINE_BG, SUCCESS, SURFACE  # noqa: E402
 from viewer import Viewer  # noqa: E402
 
@@ -111,8 +113,32 @@ def main() -> int:
         if not ok:
             failures.append(name)
 
+    failures += _check_outline_budget()
+
     print(f"\npng: {out}")
     return 1 if failures else 0
+
+
+def _check_outline_budget() -> list[str]:
+    """The outline must not slow opening down: anchors and the outline come
+    from the same pass as the render, and the y-offsets are measured lazily."""
+    body = "# Doc\n\n" + "\n\n".join(
+        f"## Section {i}\n\n" + "text line\n" * 8 for i in range(500)
+    )
+    start = time.perf_counter()
+    html, outline = render_with_outline(body)
+    elapsed = (time.perf_counter() - start) * 1000
+    failures = []
+    ok = elapsed < 150
+    print(f"{'ok  ' if ok else 'FAIL'} {'outline budget':<18} {elapsed:.1f} ms for {len(outline)} headings")
+    if not ok:
+        failures.append("outline budget")
+    if outline and html.count('<a name="md-h') != len(outline):
+        print(f"FAIL {'outline anchors':<18} {html.count('<a name=')} anchors for {len(outline)} headings")
+        failures.append("outline anchors")
+    else:
+        print(f"ok   {'outline anchors':<18} all {len(outline)} headings anchored")
+    return failures
 
 
 if __name__ == "__main__":
