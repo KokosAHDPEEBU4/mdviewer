@@ -138,6 +138,23 @@ def _check_outline_budget() -> list[str]:
         failures.append("outline anchors")
     else:
         print(f"ok   {'outline anchors':<18} all {len(outline)} headings anchored")
+    failures += _check_table(render_with_outline)
+    return failures
+
+
+def _check_table(renderer) -> list[str]:
+    """Tables need visible borders and alternating row colours, which Qt gets
+    from HTML attributes (it ignores :nth-child and many CSS borders)."""
+    html, _ = renderer("| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n")
+    failures = []
+    checks = {
+        "table borders": 'border="1"' in html,
+        "table zebra rows": html.count("bgcolor=") >= 3,  # header + two body rows
+    }
+    for name, ok in checks.items():
+        print(f"{'ok  ' if ok else 'FAIL'} {name:<18} {ok}")
+        if not ok:
+            failures.append(name)
     return failures
 
 

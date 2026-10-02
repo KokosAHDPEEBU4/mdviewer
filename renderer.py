@@ -18,7 +18,7 @@ from pathlib import Path
 import mistune
 from PyQt6.QtGui import QImageReader
 
-from theme import IMAGE_MAX
+from theme import IMAGE_MAX, SURFACE
 
 # One heading of the document outline. `anchor` is the name injected into the
 # HTML so the table of contents can scroll to it (QTextBrowser.scrollToAnchor).
@@ -49,8 +49,17 @@ _FOOTNOTES = re.compile(r"<section class=\"footnotes\">(.*?)</section>", re.S)
 _IMAGE = re.compile(r"<img src=\"([^\"]*)\"([^>]*)>")
 _EXTERNAL = re.compile(r"^[a-z][a-z0-9+.-]*:", re.I)
 _HEADING = re.compile(r"<h([1-6])( [^>]*)?>(.*?)</h\1>", re.S)
+_TABLE = re.compile(r"<table>(.*?)</table>", re.S)
+_THEAD = re.compile(r"<thead>(.*?)</thead>", re.S)
+_TH = re.compile(r"<th([^>]*)>(.*?)</th>", re.S)
+_TD = re.compile(r"<td([^>]*)>(.*?)</td>", re.S)
 _TAGS = re.compile(r"<[^>]+>")
 _SPACES = re.compile(r"\s+")
+
+# Zebra striping for markdown tables. Qt rich text has no :nth-child, so the
+# row colour is written into the HTML. Applied to body rows only.
+_TABLE_ROW_A = "#1f1f1f"
+_TABLE_ROW_B = "#242424"
 
 _TASK_OPEN, _TASK_DONE = '<span class="task-box">&#9744;</span> ', (
     '<span class="task-box-done">&#9745;</span> '
@@ -108,6 +117,42 @@ def _natural_width(path: Path) -> int:
     return size.width() if size.isValid() else 0
 
 
+def _table_rows(match: re.Match) -> str:
+    """Rebuild a markdown table as valid HTML with borders and zebra rows.
+
+    mistune emits ``<th>``/``<td>`` without wrapping ``<tr>``, which Qt cannot
+    stripe (and may not lay out reliably), so the cells are regrouped into rows
+    using the header's column count.
+    """
+    inner = match.group(1)
+    head_match = _THEAD.search(inner)
+    headers = _TH.findall(head_match.group(1)) if head_match else []
+    if head_match:
+        inner = inner[head_match.end():]
+
+    columns = len(headers) or 1
+    cells = _TD.findall(inner)
+
+    head = ""
+    if headers:
+        head = (
+            '<tr bgcolor="%s">%s</tr>'
+            % (SURFACE, "".join(f'<th{attrs}>{body}</th>' for attrs, body in headers))
+        )
+
+    rows = []
+    for start in range(0, len(cells), columns):
+        chunk = cells[start:start + columns]
+        colour = _TABLE_ROW_A if (start // columns) % 2 == 0 else _TABLE_ROW_B
+        body = "".join(f"<td{attrs}>{cell}</td>" for attrs, cell in chunk)
+        rows.append(f'<tr bgcolor="{colour}">{body}</tr>')
+
+    return (
+        '<table class="md" border="1" cellspacing="0" cellpadding="6">'
+        f"{head}{''.join(rows)}</table>"
+    )
+
+
 def _heading_label(inner: str) -> str:
     """Heading text without markup: it ends up in a plain QListWidget."""
     return _SPACES.sub(" ", unescape(_TAGS.sub("", inner))).strip()
@@ -139,6 +184,7 @@ def render_with_outline(text: str, base_dir: Path | None = None) -> tuple[str, l
     html = _CHECKBOX.sub(_checkbox, html)
     html = _FOOTNOTES.sub(_footnotes, html)
     html = _IMAGE.sub(lambda m: _image(m, base_dir), html)
+    html = _TABLE.sub(_table_rows, html)
     return _with_outline(html)
 
 

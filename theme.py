@@ -22,7 +22,8 @@ single-cell table by `renderer.py`.
 # Neutral greys (QuickLook-like) rather than the earlier blue-violet tint: a
 # document viewer should keep its chrome out of the way of the text.
 
-BG = "#1b1b1b"          # page
+BG = "#1b1b1b"          # page chrome (window, gutters)
+PAGE_BG = "#212126"     # the reading surface: a touch lighter than the chrome
 SURFACE = "#242424"     # quote, table header, footnotes
 SURFACE_2 = "#2e2e2e"   # table header / hover
 CODE_BG = "#141414"     # fenced code, editor background
@@ -85,7 +86,7 @@ body {{
     margin-top: 0;
     margin-bottom: 48px;
     color: {TEXT};
-    background-color: {BG};
+    background-color: {PAGE_BG};
     font-family: {SANS};
     font-size: 16px;
     line-height: 168%;
@@ -170,13 +171,13 @@ img {{ margin-top: 6px; margin-bottom: 6px; }}
 
 code {{
     font-family: {MONO};
-    font-size: 13.5px;
+    font-size: 0.9em;
     color: {CODE_INLINE_TEXT};
     background-color: {CODE_INLINE_BG};
 }}
 pre {{
     font-family: {MONO};
-    font-size: 13.5px;
+    font-size: 0.9em;
     line-height: 158%;
     color: {CODE_TEXT};
     background-color: {CODE_BG};
@@ -185,7 +186,7 @@ pre {{
     margin-bottom: 0;
 }}
 pre code {{
-    font-size: 14px;
+    font-size: 1em;
     color: {CODE_TEXT};
     background-color: transparent;
 }}
