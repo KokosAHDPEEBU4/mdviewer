@@ -8,9 +8,10 @@ from the edited text, "Сохранить" writes the file and refreshes the pre
 
 from pathlib import Path
 import ctypes
+import re
 import sys
 
-from PyQt6.QtCore import QSettings, QTimer, QUrl, Qt
+from PyQt6.QtCore import QRegularExpression, QSettings, QTimer, QUrl, Qt
 from PyQt6.QtGui import (
     QDesktopServices,
     QGuiApplication,
@@ -600,7 +601,7 @@ class Viewer(QMainWindow):
             self._save_btn.setEnabled(unsaved)
 
     def _handle_esc(self) -> None:
-        if self._find_bar.isVisible():
+        if self._find_edit.hasFocus():
             self._close_find()
         elif self._editing():
             self._leave_edit()
@@ -635,14 +636,16 @@ class Viewer(QMainWindow):
 
         close_btn = QToolButton()
         close_btn.setText("✕")
-        close_btn.setToolTip("Закрыть (Esc)")
+        close_btn.setToolTip("Очистить (Esc)")
         close_btn.clicked.connect(self._close_find)
 
         for widget in (prev_btn, self._find_edit, next_btn, self._find_status, close_btn):
             layout.addWidget(widget)
 
         self._find_bar = bar
-        bar.setVisible(False)
+        # the field stays in the overlay for good: showing/hiding it made the
+        # overlay change width long after the search was over
+        bar.setVisible(True)
 
     def _build_overlay(self) -> None:
         """A floating control strip over the preview, shown on hover.
@@ -726,39 +729,55 @@ class Viewer(QMainWindow):
         super().leaveEvent(event)
         # hide only when the pointer really left the window, not just the
         # central widget (the overlay itself counts as inside)
-        if not self._find_bar.isVisible() and not self.underMouse():
+        if not self.underMouse():
             self._overlay.setVisible(False)
 
     def _toggle_find(self) -> None:
-        show = not self._find_bar.isVisible()
-        self._find_bar.setVisible(show)
-        if show:
-            self._show_overlay()
-            self._find_edit.setFocus()
-            self._find_edit.selectAll()
-            self._update_hits(self._find_edit.text())
-        else:
-            self._browser.setFocus()
-            if not self.underMouse():
-                self._overlay.setVisible(False)
+        self._show_overlay()
+        self._find_edit.setFocus()
+        self._find_edit.selectAll()
+        self._update_hits(self._find_edit.text())
 
     def _close_find(self) -> None:
-        self._find_bar.setVisible(False)
+        """Clear the query; the field itself stays in the overlay."""
+        self._find_edit.clear()
+        self._find_status.setText("")
         self._browser.setFocus()
 
+    def _search_pattern(self, text: str) -> QRegularExpression | None:
+        """Whitespace-insensitive query.
+
+        Qt collapses runs of spaces when it renders HTML, so a query copied
+        with two spaces would never match the document text. Every run of
+        whitespace is matched as one, and leading/trailing spaces are dropped
+        so a pasted fragment still finds the words.
+        """
+        collapsed = re.sub(r"\s+", " ", text.strip())
+        if not collapsed:
+            return None
+        escaped = QRegularExpression.escape(collapsed)
+        # QRegularExpression.escape turns a space into "\ ": let one space in
+        # the query match any run of whitespace in the document
+        return QRegularExpression(escaped.replace("\\ ", r"\s+"))
+
     def _update_hits(self, text: str) -> None:
-        if not text:
+        pattern = self._search_pattern(text)
+        if pattern is None:
             self._find_status.setText("")
             return
-        hits = self._browser.document().toPlainText().lower().count(text.lower())
+        matches = pattern.globalMatch(self._browser.document().toPlainText())
+        hits = 0
+        while matches.hasNext():
+            matches.next()
+            hits += 1
         self._find_status.setText(str(hits))
 
     def _find_next(self, backward: bool = False) -> None:
-        needle = self._find_edit.text()
-        if not needle:
+        pattern = self._search_pattern(self._find_edit.text())
+        if pattern is None:
             return
         flags = QTextDocument.FindFlag.FindBackward if backward else QTextDocument.FindFlag(0)
-        if self._browser.find(needle, flags):
+        if self._browser.find(pattern, flags):
             return
         # wrap around: start from the document edge and search again
         cursor = self._browser.textCursor()
@@ -766,7 +785,7 @@ class Viewer(QMainWindow):
             QTextCursor.MoveOperation.End if backward else QTextCursor.MoveOperation.Start
         )
         self._browser.setTextCursor(cursor)
-        self._browser.find(needle, flags)
+        self._browser.find(pattern, flags)
 
     # -- shortcuts --------------------------------------------------------
 

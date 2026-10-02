@@ -176,8 +176,14 @@ def main() -> int:
         check("search selects a match", win._browser.textCursor().hasSelection(), True)
         win._find_next(backward=True)
         check("search goes backwards", win._browser.textCursor().hasSelection(), True)
+        # Qt collapses whitespace when rendering, so a query with extra spaces
+        # or a leading space must still match
+        win._find_edit.setText("  text   line")
+        app.processEvents()
+        check("search ignores extra spaces", int(win._find_status.text()) > 0, True)
         win._close_find()
-        check("search closes", win._find_bar.isVisible(), False)
+        check("search clears the query", win._find_edit.text(), "")
+        check("search field stays in the overlay", win._find_bar.isVisible(), True)
 
         win.close()
         app.processEvents()
