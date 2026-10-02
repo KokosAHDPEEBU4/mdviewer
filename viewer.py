@@ -142,8 +142,7 @@ class Viewer(QMainWindow):
         self._dark_titled = False
         self._preview_width = 0      # preview width to preserve when editing
         self._outline: list[Heading] = []
-        self._outline_offset: list[float] = []   # y of each heading in the doc
-        self._outline_ready = False  # offsets are measured from the first render
+        self._edit_anchor = None     # label of the visible section when editing starts
         self._toc_syncing = False
 
         self.setWindowTitle(self._title(False))
@@ -204,7 +203,6 @@ class Viewer(QMainWindow):
         self._browser.document().setDefaultStyleSheet(content_css())
         html, self._outline = render_with_outline(text, self._path.parent)
         self._browser.setHtml(html)
-        self._outline_ready = False
         self._populate_outline()
         self._set_margins()
         self._browser.verticalScrollBar().setValue(0)
@@ -230,8 +228,6 @@ class Viewer(QMainWindow):
 
     def _on_splitter_moved(self, *_args) -> None:
         self._set_margins()
-        # a wider preview re-wraps the text, so the cached heading offsets move
-        self._outline_ready = False
 
     # -- table of contents -------------------------------------------------
 
@@ -278,57 +274,39 @@ class Viewer(QMainWindow):
         self._browser.scrollToAnchor(anchor)
         self._sync_outline()
 
-    def _measure_outline(self) -> None:
-        """Map every heading anchor to a y offset in the document layout.
+    def _current_section_index(self) -> int:
+        """Index of the heading on screen, from a cursor at the top of the
+        viewport walking back to the nearest anchored heading.
 
-        The anchor name is a character format, not text (``<a name=...>`` has
-        no visible content), so it is read from the block fragments rather than
-        from ``block.text()``. Measured lazily on first need: block layout for a
-        large file is not free and the outline is only useful once scrolled.
+        Earlier this used `blockBoundingRect` offsets, but they go stale as soon
+        as the document re-wraps (a resize, entering edit mode), so the section
+        is derived from the viewport cursor instead.
         """
-        layout = self._browser.document().documentLayout()
-        layout.documentSize()  # a lazy document reports every block at y=0
-        offsets = [-1.0] * len(self._outline)
-        wanted = {heading.anchor: index for index, heading in enumerate(self._outline)}
-        block = self._browser.document().begin()
-        seen = 0
+        cursor = self._browser.cursorForPosition(self._browser.viewport().rect().topLeft())
+        block = cursor.block()
         while block.isValid():
             fragment = block.begin()
             while fragment != block.end():
                 piece = fragment.fragment()
                 if piece.isValid():
                     for name in piece.charFormat().anchorNames():
-                        if name in wanted:
-                            offsets[wanted[name]] = layout.blockBoundingRect(block).top()
-                            seen += 1
+                        if name.startswith("md-h"):
+                            return int(name[4:])
                 fragment += 1
-            if seen == len(wanted):
-                break
-            block = block.next()
-        # A document that has not been laid out yet reports every heading at 0;
-        # keep the old offsets and try again after the next scroll.
-        if len(self._outline) > 1 and min(offsets) == max(offsets):
-            return
-        self._outline_offset = offsets
-        self._outline_ready = True
+            block = block.previous()
+        return 0
+
+    def _current_section_label(self) -> str | None:
+        """Label of the section currently at the top of the preview."""
+        if not self._outline:
+            return None
+        return self._outline[self._current_section_index()].label
 
     def _sync_outline(self) -> None:
         """Highlight the section that owns the top of the viewport."""
         if self._toc_syncing or not self._toc.isVisible() or not self._outline:
             return
-        if not self._outline_ready:
-            self._measure_outline()
-        bar = self._browser.verticalScrollBar()
-        scroll = bar.value()
-        if scroll >= bar.maximum():
-            current = len(self._outline) - 1  # scrolled to the end
-        else:
-            current = 0
-            for index, offset in enumerate(self._outline_offset):
-                if offset <= scroll + 24:
-                    current = index
-                else:
-                    break
+        current = self._current_section_index()
         if self._toc.currentRow() == current:
             return
         self._toc_syncing = True
@@ -452,6 +430,10 @@ class Viewer(QMainWindow):
 
     def _enter_edit(self) -> None:
         self._ensure_overlay()
+        # remember the section on screen *before* the layout changes below: the
+        # window resize re-wraps the preview, so re-reading the viewport after
+        # the resize would land on a different section
+        self._edit_anchor = self._current_section_label()
         # measure the preview before anything is added to the splitter: adding
         # the (still hidden) editor panel already hands it space
         self._preview_width = max(self._browser.width(), MIN_COLUMN)
@@ -487,30 +469,42 @@ class Viewer(QMainWindow):
         self._update_state()
 
     def _move_editor_to_preview(self) -> None:
-        """Put the editor caret on the section the preview is currently showing.
+        """Put the editor caret on the section the preview was showing.
 
-        The preview renders HTML and the editor holds the original markdown, so
-        they are matched by heading text, not by offset.
+        The label is captured in `_enter_edit` before the window resizes; a
+        plain `find(label)` would fail anyway because the label has markdown
+        markup stripped (`` `app/main.py` `` becomes ``app/main.py``), so each
+        heading line is normalised before comparing.
         """
-        if not self._outline:
+        label = self._edit_anchor
+        if not label:
             self._editor.moveCursor(QTextCursor.MoveOperation.Start)
             return
-        if not self._outline_ready:
-            self._measure_outline()
-        scroll = self._browser.verticalScrollBar().value()
-        current = 0
-        for index, offset in enumerate(self._outline_offset):
-            if offset <= scroll + 24:
-                current = index
-            else:
-                break
-        label = self._outline[current].label
-        cursor = self._editor.document().find(label)
-        if cursor.isNull():
-            cursor = self._editor.document().find(label.split(" ")[0])
-        if not cursor.isNull():
-            self._editor.setTextCursor(cursor)
+        block = self._find_heading_block(label)
+        if block is not None:
+            self._editor.setTextCursor(QTextCursor(block))
             self._editor.centerCursor()
+        else:
+            self._editor.moveCursor(QTextCursor.MoveOperation.Start)
+
+    @staticmethod
+    def _heading_key(text: str) -> str:
+        """Heading text without markdown markup or extra whitespace."""
+        stripped = text.lstrip("#").strip()
+        for char in ("`", "*", "_", "[", "]", "\\"):
+            stripped = stripped.replace(char, "")
+        return re.sub(r"\s+", " ", stripped).strip()
+
+    def _find_heading_block(self, label: str):
+        """Block whose heading text matches `label` (markup ignored)."""
+        want = self._heading_key(label)
+        block = self._editor.document().begin()
+        while block.isValid():
+            text = block.text()
+            if text.lstrip().startswith("#") and self._heading_key(text) == want:
+                return block
+            block = block.next()
+        return None
 
     def _leave_edit(self) -> None:
         if not self._confirm_discard():
@@ -642,7 +636,7 @@ class Viewer(QMainWindow):
         self._find_edit.setPlaceholderText("Найти в документе")
         self._find_edit.setFixedWidth(220)
         self._find_edit.returnPressed.connect(lambda: self._find_next())
-        self._find_edit.textChanged.connect(self._update_hits)
+        self._find_edit.textChanged.connect(lambda text: self._update_hits(text, jump=True))
 
         self._find_status = QLabel("")
         self._find_status.setStyleSheet(f"color: {TEXT_MUTED};")
@@ -809,7 +803,7 @@ class Viewer(QMainWindow):
             return target.toPlainText()
         return target.document().toPlainText()
 
-    def _update_hits(self, text: str) -> None:
+    def _update_hits(self, text: str, jump: bool = False) -> None:
         pattern = self._search_pattern(text)
         if pattern is None:
             self._find_status.setText("")
@@ -820,7 +814,7 @@ class Viewer(QMainWindow):
             matches.next()
             hits += 1
         self._find_status.setText(str(hits))
-        if hits:
+        if hits and jump:
             # jump to the first match as the user types, not only on Enter
             self._find_first()
 

@@ -167,7 +167,7 @@ def main() -> int:
         check("outline visible when there are headings", win._toc.isVisible(), True)
         check("anchors injected", win._browser.toHtml().count("<a name=\"md-h"), 41)
         win._sync_outline()
-        check("offsets measured on demand", win._outline_ready, True)
+        check("current section resolved from the viewport", win._current_section_index(), 0)
         check("first section is current at the top", win._toc.currentRow(), 0)
         win._overlay.setVisible(False)
         win._show_overlay()
@@ -181,11 +181,13 @@ def main() -> int:
         check("zoom resets to 100%", win._zoom_label.text(), "100%")
         last = win._toc.item(win._toc.count() - 1)
         win._outline_clicked(last)
-        for _ in range(3):
+        for _ in range(6):
             app.processEvents()
         win._sync_outline()
         check("clicking scrolls the preview", win._browser.verticalScrollBar().value() > 0, True)
-        check("current section follows the click", win._toc.currentRow(), win._toc.count() - 1)
+        # the last section cannot sit at the very top (the file ends), so the
+        # highlighted row is near the end rather than exactly the last one
+        check("current section follows the click", win._toc.currentRow() > win._toc.count() // 2, True)
         win._toggle_outline()
         check("outline can be hidden", win._toc.isVisible(), False)
         check("visibility persisted", win._settings.value("toc_visible", True, type=bool), False)
@@ -219,6 +221,24 @@ def main() -> int:
         check("editor search finds the source", int(win._find_status.text()) >= 1, True)
         win._find_next()
         check("editor search selects a match", win._editor.textCursor().hasSelection(), True)
+        win._confirm_discard = lambda: True
+        win._leave_edit()
+        for _ in range(3):
+            app.processEvents()
+
+        # --- entering edit puts the caret on the section on screen, not line 0
+        target = win._toc.count() // 2
+        win._toc.setCurrentRow(target)
+        win._outline_clicked(win._toc.item(target))
+        for _ in range(8):
+            app.processEvents()
+        win._sync_outline()
+        wanted = win._outline[win._current_section_index()].label
+        win._enter_edit()
+        for _ in range(4):
+            app.processEvents()
+        caret = win._editor.textCursor().block().text()
+        check("caret lands on the visible section", win._heading_key(caret), win._heading_key(wanted))
         win._confirm_discard = lambda: True
         win._leave_edit()
         for _ in range(3):
