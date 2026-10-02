@@ -162,6 +162,19 @@ def main() -> int:
         check("visibility persisted", win._settings.value("toc_visible", True, type=bool), False)
         win._toggle_outline()
         check("outline comes back", win._toc.isVisible(), True)
+
+        # --- search: PyQt6 wants a FindFlag, a bool used to abort the process
+        win._toggle_find()
+        win._find_edit.setText("text line")
+        app.processEvents()
+        check("search counts hits", int(win._find_status.text()) > 0, True)
+        win._find_next()
+        check("search selects a match", win._browser.textCursor().hasSelection(), True)
+        win._find_next(backward=True)
+        check("search goes backwards", win._browser.textCursor().hasSelection(), True)
+        win._close_find()
+        check("search closes", win._find_bar.isVisible(), False)
+
         win.close()
         app.processEvents()
 

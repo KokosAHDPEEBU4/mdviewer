@@ -11,7 +11,14 @@ import ctypes
 import sys
 
 from PyQt6.QtCore import QSettings, QTimer, QUrl, Qt
-from PyQt6.QtGui import QDesktopServices, QGuiApplication, QKeySequence, QShortcut, QTextCursor
+from PyQt6.QtGui import (
+    QDesktopServices,
+    QGuiApplication,
+    QKeySequence,
+    QShortcut,
+    QTextCursor,
+    QTextDocument,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -571,7 +578,7 @@ class Viewer(QMainWindow):
         self._find_edit = QLineEdit()
         self._find_edit.setPlaceholderText("Найти в документе")
         self._find_edit.setFixedWidth(220)
-        self._find_edit.returnPressed.connect(self._find_next)
+        self._find_edit.returnPressed.connect(lambda: self._find_next())
         self._find_edit.textChanged.connect(self._update_hits)
 
         self._find_status = QLabel("")
@@ -585,7 +592,7 @@ class Viewer(QMainWindow):
         next_btn = QToolButton()
         next_btn.setText("↓")
         next_btn.setToolTip("Следующее (F3)")
-        next_btn.clicked.connect(self._find_next)
+        next_btn.clicked.connect(lambda: self._find_next())
 
         close_btn = QToolButton()
         close_btn.setText("✕")
@@ -709,15 +716,18 @@ class Viewer(QMainWindow):
 
     def _find_next(self, backward: bool = False) -> None:
         needle = self._find_edit.text()
-        if not needle or self._browser.find(needle, backward):
+        if not needle:
             return
-        # wrap around
+        flags = QTextDocument.FindFlag.FindBackward if backward else QTextDocument.FindFlag(0)
+        if self._browser.find(needle, flags):
+            return
+        # wrap around: start from the document edge and search again
         cursor = self._browser.textCursor()
         cursor.movePosition(
             QTextCursor.MoveOperation.End if backward else QTextCursor.MoveOperation.Start
         )
         self._browser.setTextCursor(cursor)
-        self._browser.find(needle, backward)
+        self._browser.find(needle, flags)
 
     # -- shortcuts --------------------------------------------------------
 
