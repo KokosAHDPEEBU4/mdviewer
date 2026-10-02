@@ -10,7 +10,16 @@
 - локальные картинки (`![](img/a.png)`) подставляются из папки документа,
   внешние ссылки открываются в браузере;
 - поиск `Ctrl+F`, перезагрузка `F5`, масштаб `Ctrl`/`+`/`-`/`0`;
-- запоминает размер/положение окна и папку последнего открытия;
+- режим правки: `Ctrl+E` открывает справа исходный Markdown (окно расширяется,
+  две колонки делит `QSplitter`), кнопки «Конвертировать» (`Ctrl+Enter`) и
+  «Сохранить» (`Ctrl+S`); после сохранения превью слева обновляется само,
+  `•` в заголовке означает несохранённые изменения, `Esc` выходит из правки;
+- кодировка и переводы строк исходного файла сохраняются при записи
+  (utf-8 с/без BOM, utf-16, cp1251, LF или CRLF);
+- запоминает размер/положение окна и папку последнего открытия; при закрытии
+  из режима правки сохраняется геометрия окна просмотра, а не расширенного;
+- в заголовке окна всегда видно `— MD Viewer <версия>`: видно, какая сборка
+  запущена (внизу справа та же версия, рядом с кнопкой — подсказка `Ctrl+E`);
 - не пересобирает HTML при изменении размера окна (ширина колонки задаётся
   отступами `QTextBrowser.viewport()`, а не CSS) — resize крупного файла
   стоит ~14 мс вместо ~236 мс.
@@ -19,7 +28,10 @@
 
 ```bash
 py -3.14 -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python -m pip
+
+
+ install -r requirements.txt
 .venv\Scripts\python main.py README.md
 ```
 
@@ -36,7 +48,7 @@ build.bat --run      # ... и сразу регистрация обработч
 ## Ассоциация с .md
 
 ```bash
-dist\MDViewer\MDViewer.exe --install-default
+dist\MDViewer    \MDViewer.exe --install-default
 ```
 
 Приложение копируется в `%LOCALAPPDATA%\Programs\MDViewer`, регистрируется в
@@ -59,14 +71,15 @@ dist\MDViewer\MDViewer.exe --uninstall-default
 
 ```
 main.py        CLI, QApplication, диалог открытия файла
-viewer.py      окно: QTextBrowser, поиск, shortcuts, настройки
+viewer.py      окно: QTextBrowser, QSplitter с редактором, поиск, shortcuts
 renderer.py    mistune -> HTML (post-processing кода, картинок, чекбоксов)
 theme.py       палитра, CSS для Qt rich text, размеры колонки
 winassoc.py    регистрация обработчика .md в HKCU
 version.py     версия, имя, ProgID, расширения
 MDViewer.spec  PyInstaller: onedir, иконка, версия, вырезание лишнего Qt
 tools/         make_icon.py (генерация assets/icon.ico), render_check.py,
-               debug_html.py (быстрый просмотр HTML)
+               debug_html.py (быстрый просмотр HTML),
+               edit_check.py (сценарий правки без пользователя)
 ```
 
 ## Ограничения Qt, на которые заточен код
@@ -78,10 +91,16 @@ tools/         make_icon.py (генерация assets/icon.ico), render_check.p
 (у ячеек padding работает). Таблица приложения должна быть установлена до
 первого `setHtml()`, иначе Qt не применит стили к документу.
 
+Второй подвох Qt — `QPlainTextEdit.toPlainText()` всегда возвращает текст с
+`\n`, даже если в файле `\r\n`. Поэтому сравнение «правился ли файл»
+(`viewer._baseline`, `viewer._rendered`) идёт через `viewer._normalized()`,
+а не напрямую с `read_document()`.
+
 ## Проверки
 
 ```bash
 .venv\Scripts\python tools\render_check.py   # рендер всех стилей -> PNG
 .venv\Scripts\python tools\debug_html.py    # HTML без запуска GUI
+.venv\Scripts\python tools\edit_check.py    # правка/конвертация/сохранение
 .venv\Scripts\python -m py_compile *.py
 ```

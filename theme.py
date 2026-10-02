@@ -23,7 +23,7 @@ single-cell table by `renderer.py`.
 BG = "#15151a"          # page
 SURFACE = "#1e1e25"     # quote, table header, footnotes
 SURFACE_2 = "#26262f"    # table header / hover
-CODE_BG = "#101015"     # fenced code
+CODE_BG = "#101015"     # fenced code, editor background
 CODE_INLINE_BG = "#22222b"
 BORDER = "#2e2e39"
 TEXT = "#e2e2e8"
@@ -42,18 +42,32 @@ MONO = '"Cascadia Mono", "Cascadia Code", Consolas, "Courier New", monospace'
 
 # --- layout metrics (px) ---------------------------------------------------
 
-MEASURE = 860           # target width of the text column
-GUTTER_MIN = 20         # inset used when the window is narrower than MEASURE
+MEASURE = 1300          # widest the text column is allowed to get
+GUTTER_MIN = 20         # inset when the window is too narrow for MEASURE
 MARGIN_STEP = 8         # don't re-layout the document for sub-step resizes
+MIN_COLUMN = 420        # never let the insets squeeze the text below this
+EDIT_WIDTH = 1700       # window width the editor asks for (clamped to the screen)
+EDIT_SPLIT = 0.55       # share of the window the preview keeps in edit mode
+IMAGE_MAX = 860         # widest an <img> is emitted at (renderer._image)
 
 
 def side_margin(width: int) -> int:
-    """Inset that keeps the text column ~MEASURE px wide (QTextBrowser viewport
-    margins, so it costs nothing to change on resize)."""
-    slack = width - MEASURE
+    """Inset that centres the text column (QTextBrowser viewport margins, so it
+    costs nothing to change on resize).
+
+    A narrow window spends its width on text and keeps the insets minimal; the
+    column stops growing at MEASURE px and everything above that becomes
+    symmetric side bars -- around 12% each on a 1700 px window, ~7% on 2600 px.
+
+    The MIN_COLUMN clamp matters in edit mode: the preview column shrinks
+    without the window being resized, so a margin computed for the old width
+    would otherwise eat the whole column.
+    """
+    slack = width - min(width - GUTTER_MIN * 2, MEASURE)
     if slack <= GUTTER_MIN * 2:
         return GUTTER_MIN
-    return round(slack / 2 / MARGIN_STEP) * MARGIN_STEP
+    side = round(slack / 2 / MARGIN_STEP) * MARGIN_STEP
+    return min(side, max(GUTTER_MIN, (width - MIN_COLUMN) // 2))
 
 
 def content_css() -> str:
@@ -256,4 +270,36 @@ QToolButton {{
     padding: 3px 9px;
 }}
 QToolButton:hover {{ background-color: {SURFACE}; color: {TEXT}; }}
+
+QPushButton {{
+    background-color: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 5px;
+    padding: 4px 12px;
+    color: {TEXT};
+}}
+QPushButton:hover:!disabled {{ background-color: {SURFACE_2}; }}
+QPushButton:disabled {{
+    background-color: #191920;
+    color: #5c5c68;
+    border-color: #232330;
+}}
+QPushButton#primary {{
+    background-color: {ACCENT_DIM};
+    border-color: {ACCENT_DIM};
+    color: #ffffff;
+}}
+QPushButton#primary:hover:!disabled {{ background-color: {ACCENT}; }}
+
+QPlainTextEdit {{
+    background-color: {CODE_BG};
+    border: none;
+    border-top: 1px solid {BORDER};
+    color: {CODE_TEXT};
+    font-family: {MONO};
+    font-size: 13.5px;
+    selection-background-color: #2f5f9e;
+    selection-color: #ffffff;
+}}
+#editorPanel {{ background-color: {CODE_BG}; }}
 """

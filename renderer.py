@@ -16,7 +16,7 @@ from pathlib import Path
 import mistune
 from PyQt6.QtGui import QImageReader
 
-from theme import MEASURE
+from theme import IMAGE_MAX
 
 _MARKDOWN = mistune.create_markdown(
     escape=False,  # local, offline viewer: raw HTML is harmless and sometimes used
@@ -88,7 +88,7 @@ def _image(match: re.Match, base: Path | None) -> str:
         return f'<img src="{src}"{rest}>'
 
     width = _natural_width(target)
-    scaled = f' width="{MEASURE}"' if width and width > MEASURE else ""
+    scaled = f' width="{IMAGE_MAX}"' if width and width > IMAGE_MAX else ""
     return f'<img src="{target.as_uri()}"{scaled}{rest}>'
 
 

@@ -9,14 +9,15 @@
 ```
 main.py         CLI (файлы, --install-default/--uninstall-default/--assoc-status),
                 QApplication, диалог открытия файла
-viewer.py       окно: QTextBrowser, поиск, shortcuts, zoom, QSettings
+viewer.py       окно: QTextBrowser, QSplitter с QPlainTextEdit, поиск, shortcuts,
+                zoom, QSettings, dirty-state
 renderer.py     mistune -> HTML: post-processing кода, картинок, чекбоксов, сносок
 theme.py        палитра, CSS для Qt rich text, MEASURE/side_margin
 winassoc.py     регистрация .md в HKCU (ProgID, OpenWithProgids, RegisteredApplications)
 version.py      APP_NAME, APP_VERSION, PROG_ID, EXTENSIONS — общий источник истины
 MDViewer.spec   PyInstaller: иконка, версия, excludes, вырезание лишнего Qt
 build.bat       venv + pip + PyInstaller, флаг --run
-tools/          make_icon.py, render_check.py, debug_html.py
+tools/          make_icon.py, render_check.py, debug_html.py, edit_check.py
 ```
 
 ## Команды
@@ -25,6 +26,7 @@ tools/          make_icon.py, render_check.py, debug_html.py
 .venv\Scripts\python main.py README.md          # запуск из исходников
 build.bat                                       # сборка dist\MDViewer
 .venv\Scripts\python tools\render_check.py      # визуальная проверка темы
+.venv\Scripts\python tools\edit_check.py        # правка/конвертация/сохранение
 .venv\Scripts\python -m py_compile *.py
 ```
 
@@ -40,6 +42,13 @@ build.bat                                       # сборка dist\MDViewer
    (`theme.side_margin`, `viewer.Viewer._set_margins`), а не через CSS: пересборка
    HTML на каждый resize стоила ~236 мс, отступы — ~14 мс. HTML собирается один
    раз в `Viewer.load()`.
+   Политика: узкое окно отдаёт ширину тексту (отступ `GUTTER_MIN`=20),
+   колонка растёт максимум до `MEASURE`=1300 px, дальше лишнее уходит в
+   симметричные поля (на окне 1700 — по 200 px, на 3440 — по 1072 px).
+   Пересчитывать отступы нужно **и** при `QSplitter.splitterMoved`: правка
+   колонки не вызывает `resizeEvent` у окна, иначе в превью остаются поля,
+   посчитанные для старой ширины. Политика закреплена в `tools/edit_check.py`.
+   Ширина `<img>` от неё не зависит — это отдельный `IMAGE_MAX`.
 
 3. **Блоки кода рендерятся таблицей** (`renderer._code_block`), потому что у
    `<table><td>` в Qt работает `padding`, а у `<pre>` — нет. Регулярка
@@ -70,6 +79,39 @@ build.bat                                       # сборка dist\MDViewer
    6.22 отклоняет dict (`TypeError: Unsupported type for version info
    argument`). Структура собирается в `MDViewer.spec` из
    `PyInstaller.utils.win32.versioninfo`.
+
+9. **`create_app()` обязан быть присвоен переменной** (`app = create_app()`).
+   Если не удержать ссылку, CPython сразу уничтожит `QApplication`, и следующий
+   же `QWidget` уронит процесс с `0xC0000409` — без traceback и вывода.
+
+10. **`QPlainTextEdit.toPlainText()` отдаёт только `\n`.** Сравнивать его с
+    результатом `read_document()` нельзя: для CRLF-файла «правка» будет
+    считаться всегда. Базовая линия редактора — `viewer._normalized(text)`,
+    она же лежит в `_baseline` и `_rendered`.
+
+11. **Определение кодировки в `read_document()`** опирается на BOM, а не на
+    порядок проб. `utf-16` успешно декодирует любой байтовый массив чётной
+    длины, поэтому в `_candidate_encodings()` он идёт после `utf-8`/`cp1251`
+    и только при наличии BOM или нулевых байтов. Проверяй круг
+    «открыть → изменить → сохранить» через `tools/edit_check.py`.
+
+12. **Превью перерисовывается только по явной команде** («Конвертировать»
+    или сохранение), а не на каждое нажатие клавиши: рендер файла в ~600 КБ
+    занимает ~0.5 с. Состояние режима правки держи флагом `_edit_mode`,
+    а не `isVisible()` — иначе сохранение «отваливается» для невидимого окна.
+
+13. **Версия в заголовке — не украшение, а диагностика**
+    (`viewer._title()`, `MD Viewer <версия>`): по ней видно, какая копия
+    запустилась, когда пользователь жалуется на «старую версию». Проверять
+    надо сравнением деревьев: `dist\MDViewer` и
+    `%LOCALAPPDATA%\Programs\MDViewer` должны совпадать по sha256 всех файлов.
+
+14. **`closeEvent` в режиме правки сохраняет `_view_geometry`**, а не текущую
+    геометрию: иначе закрытие в разделённом режиме оставляет «широкое окно
+    без редактора» на следующий запуск — выглядит как сломанная/старая сборка.
+    `_view_geometry` — это `QByteArray` из `saveGeometry()`, а не `QRect`:
+    у `QRect` нет метода `saveGeometry`, и исключение в слоте PyQt6 убивает
+    процесс с `0xC0000409` без traceback.
 
 ## Что НЕ делать (грабли)
 

@@ -34,6 +34,17 @@ if errorlevel 1 (
 )
 
 echo.
+REM The work dir holds a bootloader-only MDViewer.exe that cannot run on its own
+REM (no _internal next to it). Remove it so dist\ stays the single entry point.
+REM Antivirus can still hold a handle for a moment, hence the retries.
+for /L %%i in (1,1,5) do (
+    if exist build rmdir /s /q build
+    if not exist build goto :clean
+    ping -n 2 127.0.0.1 >nul
+)
+echo WARNING: could not remove build\, delete it by hand.
+:clean
+
 echo Built: dist\MDViewer\MDViewer.exe
 if /I "%1"=="--run" (
     echo.
