@@ -47,6 +47,7 @@ from theme import (
     MIN_COLUMN,
     SURFACE,
     TEXT_MUTED,
+    TOC_MIN_WIDTH,
     TOC_WIDTH,
     content_css,
     side_margin,
@@ -123,6 +124,8 @@ class Viewer(QMainWindow):
         self._side = -1
         self._zoom = 0
         self._editor_zoom = 0
+        self._toc_zoom = 0
+        self._toc_base_font = None
         self._zoom_label = None
         self._editor_zoom_label = None
         self._editor_base_font = None
@@ -228,6 +231,11 @@ class Viewer(QMainWindow):
 
     def _on_splitter_moved(self, *_args) -> None:
         self._set_margins()
+        # remember a user-resized outline width so the next start keeps it
+        if self._toc.isVisible():
+            sizes = self._splitter.sizes()
+            if sizes:
+                self._settings.setValue("toc_width", max(TOC_MIN_WIDTH, sizes[0]))
 
     # -- table of contents -------------------------------------------------
 
@@ -236,7 +244,10 @@ class Viewer(QMainWindow):
         self._toc.setObjectName("outline")
         self._toc.setUniformItemSizes(False)
         self._toc.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._toc.setMinimumWidth(TOC_MIN_WIDTH)
         self._toc.itemClicked.connect(self._outline_clicked)
+        self._toc.installEventFilter(self)  # Ctrl+wheel zooms the outline
+        self._toc_base_font = self._toc.font()
         self._toc.setVisible(False)  # shown once a document has headings
         return self._toc
 
@@ -253,8 +264,6 @@ class Viewer(QMainWindow):
 
     def _set_outline_visible(self, visible: bool) -> None:
         self._toc.setVisible(visible)
-        if visible:
-            self._toc.setFixedWidth(int(self._settings.value("toc_width", TOC_WIDTH)))
         self._settings.setValue("toc_visible", visible)
         self._apply_split()
         QTimer.singleShot(0, self._set_margins)
@@ -264,7 +273,7 @@ class Viewer(QMainWindow):
         """Width the outline pane should take in the splitter (0 when hidden)."""
         if not self._toc.isVisible():
             return 0
-        return int(self._settings.value("toc_width", TOC_WIDTH))
+        return max(TOC_MIN_WIDTH, int(self._settings.value("toc_width", TOC_WIDTH)))
 
     def _toggle_outline(self) -> None:
         self._set_outline_visible(not self._toc.isVisible())
@@ -326,22 +335,8 @@ class Viewer(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._set_margins()
-        self._resize_toc()
         if getattr(self, "_overlay", None) is not None and self._overlay.isVisible():
             self._place_overlay()
-
-    def _resize_toc(self) -> None:
-        """Keep the outline pane at its fixed width when the window resizes;
-        the splitter would otherwise hand the extra space to pane 0."""
-        if not self._toc.isVisible():
-            return
-        sizes = self._splitter.sizes()
-        if len(sizes) < 2:
-            return
-        width = self._outline_width()
-        if sizes[0] != width:
-            sizes[0] = width
-            self._splitter.setSizes(sizes)
 
     def closeEvent(self, event):
         if not self._confirm_discard():
@@ -755,6 +750,9 @@ class Viewer(QMainWindow):
             if obj is self._browser:
                 self._set_zoom(self._zoom + (1 if up else -1))
                 return True
+            if obj is self._toc:
+                self._set_toc_zoom(self._toc_zoom + (1 if up else -1))
+                return True
         return super().eventFilter(obj, event)
 
     def leaveEvent(self, event):
@@ -871,9 +869,11 @@ class Viewer(QMainWindow):
             QShortcut(QKeySequence(keys), self, slot)
 
     def _zoom_step(self, step: int) -> None:
-        """Zoom the pane the user is working in: editor while editing, else
-        the preview. The two factors are independent."""
-        if self._editing() and self._editor.hasFocus():
+        """Zoom the pane the user is working in. All three are independent."""
+        if self._toc.isVisible() and self._toc.hasFocus():
+            target = self._toc_zoom + step if step else 0
+            self._set_toc_zoom(target)
+        elif self._editing() and self._editor.hasFocus():
             target = self._editor_zoom + step if step else 0
             self._set_editor_zoom(target)
         else:
@@ -916,6 +916,17 @@ class Viewer(QMainWindow):
         if getattr(self, "_editor_zoom_label", None) is None:
             return
         self._editor_zoom_label.setText(f"{round((1.0 + 0.1 * self._editor_zoom) * 100)}%")
+
+    def _set_toc_zoom(self, level: int) -> None:
+        """Outline zoom only, independent of the other panes."""
+        self._toc_zoom = max(-8, min(20, level))
+        if self._toc_base_font is None:
+            return
+        font = QFont(self._toc_base_font)  # QFont is mutable: copy it
+        if self._toc_zoom:
+            size = font.pointSizeF() * (1.0 + 0.1 * self._toc_zoom)
+            font.setPointSizeF(max(6.0, size))
+        self._toc.setFont(font)
 
     def _open_file(self) -> None:
         if not self._confirm_discard():

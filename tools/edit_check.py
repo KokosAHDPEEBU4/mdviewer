@@ -166,6 +166,18 @@ def main() -> int:
         check("outline has every heading", win._toc.count(), 41)
         check("outline visible when there are headings", win._toc.isVisible(), True)
         check("anchors injected", win._browser.toHtml().count("<a name=\"md-h"), 41)
+        # the outline has its own zoom, independent of the other panes
+        toc_base = win._toc_base_font.pointSizeF()
+        win._set_toc_zoom(3)
+        check("outline zoom scales its font", win._toc.font().pointSizeF() > toc_base, True)
+        check("outline zoom leaves the preview alone", win._zoom, 0)
+        win._set_toc_zoom(0)
+        check("outline zoom reset restores the font", win._toc.font().pointSizeF(), toc_base)
+        # the outline can be dragged wider and the width sticks
+        win._splitter.setSizes([360, win._splitter.sizes()[1] - 120])
+        win._on_splitter_moved()
+        check("outline width is saved", int(win._settings.value("toc_width")), win._splitter.sizes()[0])
+        check("outline is draggable past the default", win._splitter.sizes()[0] > 240, True)
         win._sync_outline()
         check("current section resolved from the viewport", win._current_section_index(), 0)
         check("first section is current at the top", win._toc.currentRow(), 0)
