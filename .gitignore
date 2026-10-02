@@ -1,0 +1,14 @@
+# build output
+build/
+dist/
+*.spec.bak
+
+# python
+.venv/
+__pycache__/
+*.py[cod]
+
+# tooling scratch
+tools/hash_reference.txt
+*.png
+!assets/*.png
