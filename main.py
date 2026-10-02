@@ -22,11 +22,11 @@ ICON_PATH = Path(__file__).with_name("assets") / "icon.ico"
 
 USAGE = f"""\
 {APP_NAME} {APP_VERSION}
-  MDViewer [file ...]            open markdown files, one window each
-  MDViewer --install-default     install and register as the .md handler
-  MDViewer --no-prompt           ... without the "Open with" dialog
-  MDViewer --uninstall-default   remove the registration
-  MDViewer --assoc-status        show what Windows has registered
+  MDViewer [файл ...]            открыть markdown-файлы, каждому — своё окно
+  MDViewer --install-default     установить и назначить обработчиком .md
+  MDViewer --no-prompt           ... без диалога «Открыть с помощью»
+  MDViewer --uninstall-default   удалить регистрацию
+  MDViewer --assoc-status        показать, что зарегистрировано в Windows
   MDViewer -h | -v
 """
 

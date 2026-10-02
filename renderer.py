@@ -82,7 +82,7 @@ def _checkbox(match: re.Match) -> str:
 def _footnotes(match: re.Match) -> str:
     return (
         '<div class="footnotes">'
-        '<p class="footnotes-title">Notes</p>'
+        '<p class="footnotes-title">Сноски</p>'
         f"{match.group(1)}</div>"
     )
 

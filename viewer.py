@@ -14,6 +14,7 @@ import sys
 from PyQt6.QtCore import QRegularExpression, QSettings, QTimer, QUrl, Qt
 from PyQt6.QtGui import (
     QDesktopServices,
+    QFont,
     QGuiApplication,
     QKeySequence,
     QShortcut,
@@ -121,6 +122,8 @@ class Viewer(QMainWindow):
         self._settings = settings or QSettings()
         self._side = -1
         self._zoom = 0
+        self._zoom_label = None
+        self._editor_base_font = None
 
         self._text = ""          # what is on disk
         self._encoding = "utf-8"
@@ -394,7 +397,7 @@ class Viewer(QMainWindow):
         header = QHBoxLayout()
         header.setContentsMargins(12, 8, 12, 8)
         header.setSpacing(8)
-        caption = QLabel("MARKDOWN")
+        caption = QLabel("ИСХОДНИК")
         caption.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px;")
         self._convert_btn = QPushButton("Конвертировать")
         self._convert_btn.setToolTip("Пересчитать оформление слева (Ctrl+Enter)")
@@ -413,6 +416,7 @@ class Viewer(QMainWindow):
         self._editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self._editor.setPlaceholderText("Исходный Markdown — как в блокноте")
         self._editor.textChanged.connect(self._update_state)
+        self._editor_base_font = self._editor.font()
         layout.addWidget(self._editor, 1)
 
         self._panel = panel
@@ -458,6 +462,7 @@ class Viewer(QMainWindow):
 
         self._edit_btn.setText("Выйти из правки")
         self._editor.setFocus()
+        self._apply_editor_zoom()
         self._move_editor_to_preview()
         self._show_overlay()  # move it over the (now narrower) preview at once
         self._update_state()
@@ -673,7 +678,7 @@ class Viewer(QMainWindow):
 
         self._zoom_label = QToolButton()
         self._zoom_label.setText("100%")
-        self._zoom_label.clicked.connect(lambda: self._set_zoom(0))
+        self._zoom_label.clicked.connect(self._reset_zoom)
 
         zoom_in = QToolButton()
         zoom_in.setText("+")
@@ -814,10 +819,31 @@ class Viewer(QMainWindow):
             QShortcut(QKeySequence(keys), self, slot)
 
     def _set_zoom(self, level: int) -> None:
+        """Scale both panes. The label always shows the real factor."""
+        level = max(-8, min(20, level))
         delta = level - self._zoom
         for _ in range(abs(delta)):
             self._browser.zoomIn(1 if delta > 0 else -1)
         self._zoom = level
+        self._apply_editor_zoom()
+        self._update_zoom_label()
+
+    def _apply_editor_zoom(self) -> None:
+        if self._editor is None or self._editor_base_font is None:
+            return
+        font = QFont(self._editor_base_font)  # QFont is mutable: never edit in place
+        if self._zoom:
+            size = font.pointSizeF() * (1.0 + 0.1 * self._zoom)
+            font.setPointSizeF(max(6.0, size))
+        self._editor.setFont(font)
+
+    def _update_zoom_label(self) -> None:
+        if self._zoom_label is None:
+            return
+        self._zoom_label.setText(f"{round((1.0 + 0.1 * self._zoom) * 100)}%")
+
+    def _reset_zoom(self) -> None:
+        self._set_zoom(0)
 
     def _open_file(self) -> None:
         if not self._confirm_discard():
