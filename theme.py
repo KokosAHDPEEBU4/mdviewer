@@ -331,4 +331,18 @@ QListWidget#outline::item:selected {{
     background-color: {SURFACE_2};
     color: {TEXT_HEAD};
 }}
+
+#overlay {{
+    background-color: rgba(38, 38, 38, 235);
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+}}
+#overlay QToolButton {{
+    color: {TEXT};
+    padding: 4px 8px;
+    font-size: 14px;
+}}
+#overlay QToolButton:hover {{
+    background-color: {SURFACE_2};
+}}
 """

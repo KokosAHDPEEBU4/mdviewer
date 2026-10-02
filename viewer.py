@@ -153,6 +153,7 @@ class Viewer(QMainWindow):
         self._build_find_bar()
         self._build_edit_button()
         self._build_shortcuts()
+        self._build_overlay()
 
         geometry = self._settings.value("geometry")
         if geometry:
@@ -328,6 +329,8 @@ class Viewer(QMainWindow):
         super().resizeEvent(event)
         self._set_margins()
         self._resize_toc()
+        if getattr(self, "_overlay", None) is not None and self._overlay.isVisible():
+            self._place_overlay()
 
     def _resize_toc(self) -> None:
         """Keep the outline pane at its fixed width when the window resizes;
@@ -367,10 +370,7 @@ class Viewer(QMainWindow):
         self._edit_btn.setToolTip("Редактировать Markdown как обычный текст (Ctrl+E)")
         self._edit_btn.clicked.connect(self._toggle_edit)
         self._edit_hint = QLabel("Ctrl+E")
-        self._edit_hint.setToolTip("Правка в соседней панели: исходник слева, предпросмотр справа")
-        for widget in (self._edit_btn, self._edit_hint):
-            self.statusBar().addWidget(widget)
-        self.statusBar().addPermanentWidget(QLabel(f"{APP_NAME} {APP_VERSION}"))
+        self._edit_hint.setToolTip("Правка в соседней панели: исходник справа, предпросмотр слева")
 
     def _title(self, unsaved: bool) -> str:
         """The version is in the title on purpose: it tells builds apart when
@@ -518,7 +518,6 @@ class Viewer(QMainWindow):
         self._editor.document().setModified(False)
         self._render_busy(text)  # a saved file should show what it will look like
         self._update_state()
-        self.statusBar().showMessage(f"Сохранено: {self._path.name}", 3000)
         return True
 
     def _confirm_discard(self) -> bool:
@@ -560,17 +559,18 @@ class Viewer(QMainWindow):
         elif self._editing():
             self._leave_edit()
 
-    # -- find bar ---------------------------------------------------------
+    # -- overlay (hover chrome) -------------------------------------------
 
     def _build_find_bar(self) -> None:
+        """The find row lives inside the overlay, not a status bar."""
         bar = QWidget()
         layout = QHBoxLayout(bar)
-        layout.setContentsMargins(10, 3, 10, 3)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
         self._find_edit = QLineEdit()
-        self._find_edit.setPlaceholderText("Find in document")
-        self._find_edit.setFixedWidth(240)
+        self._find_edit.setPlaceholderText("Найти в документе")
+        self._find_edit.setFixedWidth(220)
         self._find_edit.returnPressed.connect(self._find_next)
         self._find_edit.textChanged.connect(self._update_hits)
 
@@ -579,17 +579,17 @@ class Viewer(QMainWindow):
 
         prev_btn = QToolButton()
         prev_btn.setText("↑")
-        prev_btn.setToolTip("Previous (Shift+F3)")
+        prev_btn.setToolTip("Предыдущее (Shift+F3)")
         prev_btn.clicked.connect(lambda: self._find_next(backward=True))
 
         next_btn = QToolButton()
         next_btn.setText("↓")
-        next_btn.setToolTip("Next (F3)")
+        next_btn.setToolTip("Следующее (F3)")
         next_btn.clicked.connect(self._find_next)
 
         close_btn = QToolButton()
         close_btn.setText("✕")
-        close_btn.setToolTip("Close (Esc)")
+        close_btn.setToolTip("Закрыть (Esc)")
         close_btn.clicked.connect(self._close_find)
 
         for widget in (prev_btn, self._find_edit, next_btn, self._find_status, close_btn):
@@ -597,17 +597,104 @@ class Viewer(QMainWindow):
 
         self._find_bar = bar
         bar.setVisible(False)
-        self.statusBar().addPermanentWidget(bar)
+
+    def _build_overlay(self) -> None:
+        """A floating control strip over the preview, shown on hover.
+
+        It is a child of the main window rather than a layout item, so it can
+        sit on top of the splitter and never steals space from the text.
+        """
+        panel = QWidget(self)
+        panel.setObjectName("overlay")
+        panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
+        row = QHBoxLayout(panel)
+        row.setContentsMargins(10, 6, 10, 6)
+        row.setSpacing(4)
+
+        self._toc_btn = QToolButton()
+        self._toc_btn.setText("☰")
+        self._toc_btn.setToolTip("Оглавление (Ctrl+B)")
+        self._toc_btn.clicked.connect(self._toggle_outline)
+
+        search_btn = QToolButton()
+        search_btn.setText("🔍")
+        search_btn.setToolTip("Найти (Ctrl+F)")
+        search_btn.clicked.connect(self._toggle_find)
+
+        open_btn = QToolButton()
+        open_btn.setText("📂")
+        open_btn.setToolTip("Открыть файл (Ctrl+O)")
+        open_btn.clicked.connect(self._open_file)
+
+        zoom_out = QToolButton()
+        zoom_out.setText("−")
+        zoom_out.setToolTip("Мельче (Ctrl+-)")
+        zoom_out.clicked.connect(lambda: self._set_zoom(self._zoom - 1))
+
+        self._zoom_label = QToolButton()
+        self._zoom_label.setText("100%")
+        self._zoom_label.setToolTip("Сбросить масштаб (Ctrl+0)")
+        self._zoom_label.clicked.connect(lambda: self._set_zoom(0))
+
+        zoom_in = QToolButton()
+        zoom_in.setText("+")
+        zoom_in.setToolTip("Крупнее (Ctrl+=)")
+        zoom_in.clicked.connect(lambda: self._set_zoom(self._zoom + 1))
+
+        for widget in (
+            self._toc_btn,
+            self._edit_btn,
+            self._find_bar,
+            self._zoom_label,
+            search_btn,
+            open_btn,
+            zoom_out,
+            zoom_in,
+        ):
+            row.addWidget(widget)
+        row.addStretch(1)
+
+        panel.setVisible(False)
+        self._overlay = panel
+
+    def _show_overlay(self) -> None:
+        self._overlay.setVisible(True)
+        self._overlay.raise_()
+        self._place_overlay()
+
+    def _place_overlay(self) -> None:
+        """Centre the overlay over the preview pane, near its top edge."""
+        browser = self._browser
+        top_left = browser.mapTo(self, browser.rect().topLeft())
+        width = min(self._overlay.sizeHint().width(), browser.width() - 24)
+        x = top_left.x() + max(12, (browser.width() - width) // 2)
+        self._overlay.resize(width, self._overlay.sizeHint().height())
+        self._overlay.move(x, top_left.y() + 12)
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self._show_overlay()
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        # hide only when the pointer really left the window, not just the
+        # central widget (the overlay itself counts as inside)
+        if not self._find_bar.isVisible() and not self.underMouse():
+            self._overlay.setVisible(False)
 
     def _toggle_find(self) -> None:
         show = not self._find_bar.isVisible()
         self._find_bar.setVisible(show)
         if show:
+            self._show_overlay()
             self._find_edit.setFocus()
             self._find_edit.selectAll()
             self._update_hits(self._find_edit.text())
         else:
             self._browser.setFocus()
+            if not self.underMouse():
+                self._overlay.setVisible(False)
 
     def _close_find(self) -> None:
         self._find_bar.setVisible(False)
