@@ -297,13 +297,17 @@ class Viewer(QMainWindow):
             return
         if not self._outline_ready:
             self._measure_outline()
-        scroll = self._browser.verticalScrollBar().value()
-        current = 0
-        for index, offset in enumerate(self._outline_offset):
-            if offset <= scroll + 24:
-                current = index
-            else:
-                break
+        bar = self._browser.verticalScrollBar()
+        scroll = bar.value()
+        if scroll >= bar.maximum():
+            current = len(self._outline) - 1  # scrolled to the end
+        else:
+            current = 0
+            for index, offset in enumerate(self._outline_offset):
+                if offset <= scroll + 24:
+                    current = index
+                else:
+                    break
         if self._toc.currentRow() == current:
             return
         self._toc_syncing = True
