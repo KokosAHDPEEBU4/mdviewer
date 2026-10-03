@@ -990,13 +990,13 @@ class Viewer(QMainWindow):
         text = self._collapse(source.textCursor().selectedText())
         target = self._editor if source is self._browser else self._browser
         if target is not None:
-            cursor = self._mirror_cursor(source, target, text) if len(text) >= 2 else None
-            self._set_hl_layer(target, source, cursor, colour)
-        own = source.textCursor() if len(text) >= 2 else None
+            cursors = self._mirror_cursors(source, target, text) if len(text) >= 2 else []
+            self._set_hl_layer(target, source, cursors, colour)
+        own = [source.textCursor()] if len(text) >= 2 else []
         self._set_hl_layer(source, source, own, colour)
 
-    def _mirror_cursor(self, source, target, needle: str):
-        """Cursor for the same fragment in `target`.
+    def _mirror_cursors(self, source, target, needle: str):
+        """Extra-selection cursors for the same fragment in `target`.
 
         The position map is exact and handles multi-line selections and repeated
         phrases, so it is tried first. When there is no usable map (raw HTML the
@@ -1011,17 +1011,19 @@ class Viewer(QMainWindow):
                 span = source_map.to_render(cursor.selectionStart(), cursor.selectionEnd())
             else:
                 span = source_map.to_source(cursor.selectionStart(), cursor.selectionEnd())
-            mirrored = self._range_cursor(target, span)
-            if mirrored is not None:
-                return mirrored
+            cursors = self._range_cursors(target, span)
+            if cursors:
+                return cursors
         pattern = self._match_pattern(needle)
         if pattern is None:
-            return None
+            return []
         bounds = self._section_bounds(source, source.textCursor())
         if bounds is None:  # no section info: fall back to the whole document
-            return target.document().find(pattern)
-        document, start, end = bounds
-        return self._find_between(document, pattern, start, end)
+            found = target.document().find(pattern)
+        else:
+            document, start, end = bounds
+            found = self._find_between(document, pattern, start, end)
+        return [found] if found is not None and not found.isNull() else []
 
     def _ensure_map(self):
         """Build (once per render) the source <-> rendered position map."""
@@ -1035,18 +1037,36 @@ class Viewer(QMainWindow):
         return source_map
 
     @staticmethod
-    def _range_cursor(pane, span):
-        """A selection cursor for a character `(start, end)` span, or None."""
+    def _range_cursors(pane, span):
+        """Selection cursors for a character span, **one per block**.
+
+        Qt expands a single cursor that crosses table cells to whole cells, so a
+        mirror inside a table would light up entire cells (header included) that
+        the user did not select. Slicing at block boundaries keeps each fragment
+        inside one cell/paragraph, where selection stays character-exact.
+        """
         if span is None:
-            return None
+            return []
         start, end = span
         document = pane.document()
-        if start < 0 or end > document.characterCount() - 1:
-            return None
-        cursor = QTextCursor(document)
-        cursor.setPosition(start)
-        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-        return cursor if cursor.hasSelection() else None
+        if start < 0 or end > document.characterCount() - 1 or end <= start:
+            return []
+        cursors = []
+        block = document.findBlock(start)
+        while block.isValid():
+            block_start = block.position()
+            block_end = block_start + block.length() - 1  # separator excluded
+            segment_start = max(start, block_start)
+            segment_end = min(end, block_end)
+            if segment_end > segment_start:
+                cursor = QTextCursor(document)
+                cursor.setPosition(segment_start)
+                cursor.setPosition(segment_end, QTextCursor.MoveMode.KeepAnchor)
+                cursors.append(cursor)
+            if block_end >= end:
+                break
+            block = block.next()
+        return cursors
 
     def _section_bounds(self, source, cursor):
         """`(document, start_block, end_block)` of `source`'s section, in `target`."""
@@ -1130,17 +1150,25 @@ class Viewer(QMainWindow):
             QRegularExpression.PatternOption.UseUnicodePropertiesOption,
         )
 
-    def _set_hl_layer(self, pane, owner, cursor, colour: str) -> None:
-        """Replace `owner`'s layer in `pane` with `cursor` (or drop it).
+    def _set_hl_layer(self, pane, owner, cursors, colour: str) -> None:
+        """Replace `owner`'s layer in `pane` with `cursors` (or drop it).
 
-        The layer moves to the end of the list, i.e. on top: extra selections are
-        painted in order and over the pane's own native selection.
+        `cursors` is a list of selection cursors (a mirror is split per block so
+        table cells are not over-highlighted). The layer moves to the end of the
+        list, i.e. on top: extra selections are painted in order and over the
+        pane's own native selection.
         """
         layers = [layer for layer in self._hl_layers.get(pane, []) if layer[0] is not owner]
-        if cursor is not None and not cursor.isNull() and cursor.hasSelection():
-            layers.append((owner, cursor, colour))
+        valid = [c for c in cursors if c is not None and not c.isNull() and c.hasSelection()]
+        if valid:
+            layers.append((owner, valid, colour))
         self._hl_layers[pane] = layers
-        pane.setExtraSelections([self._extra_selection(cursor, col) for _, cursor, col in layers])
+        selections = [
+            self._extra_selection(cursor, col)
+            for _, layer_cursors, col in layers
+            for cursor in layer_cursors
+        ]
+        pane.setExtraSelections(selections)
 
     @staticmethod
     def _extra_selection(cursor, colour: str) -> QTextEdit.ExtraSelection:

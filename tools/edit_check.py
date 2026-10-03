@@ -695,10 +695,39 @@ def main() -> int:
         win._browser.setTextCursor(cursor)
         win._highlight_editor_from_preview()
         layers = win._editor.extraSelections()
-        check("multi-line selection yields one mirror", len(layers), 1)
-        mirrored = layers[0].cursor.selectedText() if layers else ""
+        check("multi-line selection yields a mirror", len(layers) >= 1, True)
+        mirrored = "".join(layer.cursor.selectedText() for layer in layers)
         check("mirror covers every selected line",
               all(word in mirrored for word in ("alpha", "beta", "gamma")), True)
+        win._confirm_discard = lambda: True
+        win._leave_edit()
+        win.close()
+        app.processEvents()
+
+    # --- a selection inside a table must not light up the whole table
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "table.md"
+        path.write_text(
+            "# T\n\n| A | B |\n|---|---|\n| one | two |\n| three | four |\n",
+            encoding="utf-8",
+        )
+        win = viewer_mod.Viewer(path, QSettings(tempfile.mkdtemp(), "tbl_check"))
+        win.resize(900, 600)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+        win._enter_edit()
+        for _ in range(3):
+            app.processEvents()
+        editor = win._editor.document()
+        cursor = QTextCursor(editor)
+        cursor.setPosition(editor.find("three").selectionStart())
+        cursor.setPosition(editor.find("four").selectionEnd(), QTextCursor.MoveMode.KeepAnchor)
+        win._editor.setTextCursor(cursor)
+        win._highlight_preview_from_editor()
+        text = "".join(sel.cursor.selectedText() for sel in win._browser.extraSelections())
+        check("table mirror covers the selected cells", "three" in text and "four" in text, True)
+        check("table mirror skips unselected cells", "one" not in text and "two" not in text, True)
         win._confirm_discard = lambda: True
         win._leave_edit()
         win.close()
