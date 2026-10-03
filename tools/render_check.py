@@ -8,6 +8,7 @@ always writes the PNG for a human to look at, and exits non-zero when one of
 them is missing.
 """
 
+import os
 import sys
 import tempfile
 import time
@@ -16,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from PyQt6.QtGui import QColor, QImage  # noqa: E402
+from PyQt6.QtWidgets import QApplication  # noqa: E402
 
 from main import create_app  # noqa: E402
 from renderer import render_with_outline  # noqa: E402
@@ -89,6 +91,27 @@ def _closest_counts(image: QImage, colour: str) -> int:
     return hits
 
 
+def _place_off_primary(widget) -> None:
+    """Optionally move the window off the primary monitor for a run.
+
+    `MDVIEWER_TEST_SCREEN=secondary` (or a screen name) places it there;
+    otherwise the window is left where Qt puts it.
+    """
+    want = os.environ.get("MDVIEWER_TEST_SCREEN", "").strip().lower()
+    if not want:
+        return
+    screens = QApplication.screens()
+    if want == "secondary":
+        target = next((s for s in screens if s is not QApplication.primaryScreen()), None)
+    else:
+        target = next((s for s in screens if s.name().lower() == want), None)
+    if target is None:
+        return
+    geo = target.availableGeometry()
+    size = widget.size()
+    widget.setGeometry(geo.x() + 20, geo.y() + 20, size.width(), size.height())
+
+
 def main() -> int:
     out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(tempfile.gettempdir()) / "mdviewer.png"
     with tempfile.TemporaryDirectory() as tmp:
@@ -98,6 +121,7 @@ def main() -> int:
         app = create_app()
         viewer = Viewer(source)
         viewer.resize(1000, 1500)
+        _place_off_primary(viewer)
         viewer.show()
         app.processEvents()
         image = viewer.grab().toImage()

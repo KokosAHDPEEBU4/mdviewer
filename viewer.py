@@ -45,12 +45,18 @@ from PyQt6.QtWidgets import (
 )
 
 from renderer import Heading, render_with_outline
+from syncsel import SourceMap
 from theme import (
-    EDIT_SPLIT,
-    EDIT_WIDTH,
+    EDITOR_HARD,
+    EDITOR_MIN,
+    EDITOR_PREF,
     EDITOR_SELECTION,
+    HYST,
     MIN_COLUMN,
+    PREVIEW_HARD,
     PREVIEW_SELECTION,
+    SCREEN_FALLBACK,
+    SPLIT_HANDLE,
     SURFACE,
     TEXT_MUTED,
     TOC_MIN_WIDTH,
@@ -97,6 +103,53 @@ def _newline_of(raw: bytes) -> str:
 def _normalized(text: str) -> str:
     """Qt text widgets hand back LF-only text, so compare like for like."""
     return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def layout_panes(avail: int, edit: bool, toc_visible: bool, toc_pref: int, editor_pref: int):
+    """Split `avail` px (splitter handles already removed) between the panes.
+
+    Returns `(toc, editor, preview)`. Pure, so the shrink policy can be traced in
+    tests. When space is short the panes yield in priority order TOC -> editor ->
+    preview: the outline shrinks first, then the editor through its soft minimum
+    down to its hard floor, and only then does the preview drop below
+    `MIN_COLUMN`. The preview is the residual pane, so any surplus goes to it.
+    """
+    avail = max(0, int(avail))
+    toc = max(TOC_MIN_WIDTH, int(toc_pref)) if toc_visible else 0
+    editor = int(editor_pref) if edit else 0
+    deficit = (toc + editor + MIN_COLUMN) - avail
+    if deficit > 0 and toc > 0:
+        take = min(deficit, max(0, toc - TOC_MIN_WIDTH))
+        toc -= take
+        deficit -= take
+    if deficit > 0 and editor > 0:
+        take = min(deficit, max(0, editor - EDITOR_MIN))
+        editor -= take
+        deficit -= take
+    if deficit > 0 and editor > 0:
+        take = min(deficit, max(0, editor - EDITOR_HARD))
+        editor -= take
+        deficit -= take
+    preview = avail - toc - editor
+    if preview < PREVIEW_HARD:
+        preview = PREVIEW_HARD
+        editor = max(0, avail - toc - preview)
+    return toc, editor, preview
+
+
+def toc_visible_for(main_avail: int, auto_hidden: bool, user_visible: bool, edit: bool) -> bool:
+    """Whether the outline should be shown, with hysteresis on the edge.
+
+    `main_avail` is the splitter content width minus the main panes' handles (so
+    it does not change when the outline itself appears — no feedback loop).
+    """
+    if not user_visible:
+        return False
+    main_min = (EDITOR_MIN + MIN_COLUMN + SPLIT_HANDLE) if edit else MIN_COLUMN
+    threshold = TOC_MIN_WIDTH + main_min
+    if auto_hidden:
+        return main_avail > threshold + HYST
+    return main_avail >= threshold
 
 
 # DwmSetWindowAttribute: the native caption is drawn light grey on Windows 10
@@ -200,10 +253,22 @@ class Viewer(QMainWindow):
         self._outline: list[Heading] = []
         self._history: list[Path] = []   # files visited before the current one
         self._selected_section = None    # outline row the user last clicked
+        # pane shrink policy state (see `_relayout`): the user's wish to see the
+        # outline is kept apart from the fact that it is auto-hidden on a narrow
+        # window, so widening can bring it back without overriding the user
+        self._toc_user_visible = True
+        self._toc_auto_hidden = False
+        self._editor_pref = EDITOR_PREF
+        self._in_relayout = False
         self._edit_anchor = None     # label of the visible section when editing starts
         self._edit_visible = ""      # text of the paragraph at the viewport top
         self._edit_fraction = None   # how far into the section the viewport top is
         self._preview_anchor = None  # preview character to keep pinned across relayout
+        self._hl_layers = {}          # per-pane extra selections (mutual highlighting)
+        self._map_source = None        # source text the position map is built for
+        self._source_map = None        # lazy SourceMap (source <-> rendered text)
+        self._map_failed = False
+        self._map_dirty = False        # editor edited since the last render
         self._toc_syncing = False
         self._wheel_accum = {}        # per-pane leftover wheel delta for smooth zoom
         # middle-click autoscroll: one pane at a time, tracked per pane
@@ -225,6 +290,9 @@ class Viewer(QMainWindow):
         self._browser.setOpenLinks(False)
         self._browser.setOpenExternalLinks(False)
         self._browser.anchorClicked.connect(self._open_link)
+        # hard floor (safety net for the shrink policy): the preview never
+        # collapses to a sliver, and this gives the window its minimum width
+        self._browser.setMinimumWidth(PREVIEW_HARD)
         self._browser.installEventFilter(self)
         # wheel and mouse events are delivered to the viewport of a scroll area,
         # not to the scroll area itself, so the filter has to sit there too:
@@ -237,6 +305,8 @@ class Viewer(QMainWindow):
 
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
         self._splitter.setChildrenCollapsible(False)
+        # a wide handle is much easier to catch with the mouse than the ~5 px default
+        self._splitter.setHandleWidth(SPLIT_HANDLE)
         self._splitter.addWidget(self._build_outline())
         self._splitter.addWidget(self._browser)
         self._splitter.setStretchFactor(0, 0)
@@ -244,10 +314,14 @@ class Viewer(QMainWindow):
         # the divider changes the preview width without resizing the window, so
         # no resizeEvent arrives and the insets would keep their old value
         self._splitter.splitterMoved.connect(self._on_splitter_moved)
+        # the splitter resizes a step after the window, so its own Resize event
+        # (which carries the final size) drives the pane layout
+        self._splitter.installEventFilter(self)
         self.setCentralWidget(self._splitter)
 
         self._edit_btn = None
         self._back_btn = None
+        self._toc_btn = None
         self._overlay = None
         self._find_bar = None
 
@@ -275,12 +349,16 @@ class Viewer(QMainWindow):
         if self._editor is not None:
             self._editor.setPlainText(self._text)
             self._editor.document().setModified(False)
+            self._map_dirty = False  # matches the render that just happened
         self._update_state()
         return True
 
     def _render(self, text: str) -> None:
         """Re-render the preview. Called only on load/convert/save, never on
         resize (that would cost hundreds of milliseconds per step)."""
+        # setHtml rebuilds the document, so any stored highlight cursor would
+        # dangle; drop the layers first
+        self._clear_highlights()
         self._rendered = _normalized(text)
         # the stylesheet has to be in place before the HTML: Qt matches CSS while
         # importing, not afterwards
@@ -290,6 +368,11 @@ class Viewer(QMainWindow):
         # relative links (`other.md`, `#anchor`) resolve against the current
         # file so the click handler can find the target on disk
         self._browser.document().setBaseUrl(QUrl.fromLocalFile(str(self._path)))
+        # the position map matches this render; built lazily on first selection
+        self._map_source = _normalized(text)
+        self._source_map = None
+        self._map_failed = False
+        self._map_dirty = False
         self._apply_preview_zoom()  # setHtml resets the document font
         self._populate_outline()
         self._set_margins()
@@ -315,12 +398,23 @@ class Viewer(QMainWindow):
             self._browser.setViewportMargins(side, 0, side, 0)
 
     def _on_splitter_moved(self, *_args) -> None:
+        """A user drag: remember the pane widths as the new preferences.
+
+        `setSizes` does not emit `splitterMoved`, so anything seen here came from
+        the mouse; the `_in_relayout` guard is belt-and-braces. The preview is the
+        residual pane and has no preference of its own — dragging the editor
+        boundary only moves `_editor_pref`.
+        """
         self._set_margins()
-        # remember a user-resized outline width so the next start keeps it
+        if self._in_relayout:
+            return
+        sizes = self._splitter.sizes()
+        if not sizes:
+            return
         if self._toc.isVisible():
-            sizes = self._splitter.sizes()
-            if sizes:
-                self._settings.setValue("toc_width", max(TOC_MIN_WIDTH, sizes[0]))
+            self._settings.setValue("toc_width", max(TOC_MIN_WIDTH, sizes[0]))
+        if self._editing() and self._panel is not None and self._panel.isVisible():
+            self._editor_pref = max(EDITOR_HARD, sizes[-1])
 
     # -- table of contents -------------------------------------------------
 
@@ -347,24 +441,40 @@ class Viewer(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, heading.anchor)
             item.setToolTip(heading.label)
             self._toc.addItem(item)
-        visible = self._settings.value("toc_visible", True, type=bool) and bool(self._outline)
-        self._set_outline_visible(visible)
-
-    def _set_outline_visible(self, visible: bool) -> None:
-        self._toc.setVisible(visible)
-        self._settings.setValue("toc_visible", visible)
-        self._apply_split()
-        QTimer.singleShot(0, self._set_margins)
+        self._toc_user_visible = (
+            self._settings.value("toc_visible", True, type=bool) and bool(self._outline)
+        )
+        self._toc_auto_hidden = False  # a freshly rendered document starts shown
+        self._relayout()
         QTimer.singleShot(0, self._sync_outline)
 
-    def _outline_width(self) -> int:
-        """Width the outline pane should take in the splitter (0 when hidden)."""
-        if not self._toc.isVisible():
-            return 0
+    def _toc_pref(self) -> int:
+        """Width the user wants the outline to have (default `TOC_WIDTH`)."""
         return max(TOC_MIN_WIDTH, int(self._settings.value("toc_width", TOC_WIDTH)))
 
+    def _set_outline_visible(self, visible: bool) -> None:
+        """User intent: show/hide the outline. Auto-hide never overrides this."""
+        self._toc_user_visible = bool(visible)
+        self._settings.setValue("toc_visible", self._toc_user_visible)
+        self._toc_auto_hidden = False
+        self._relayout()
+        QTimer.singleShot(0, self._sync_outline)
+
+    def _toc_can_toggle(self) -> bool:
+        """False when turning the outline on now would just auto-hide it again."""
+        if not self._outline:
+            return False
+        if self._toc.isVisible():
+            return True
+        edit = self._editing()
+        main_panes = 2 if edit else 1
+        main_avail = self._splitter.width() - SPLIT_HANDLE * (main_panes - 1)
+        return toc_visible_for(main_avail, True, True, edit)
+
     def _toggle_outline(self) -> None:
-        self._set_outline_visible(not self._toc.isVisible())
+        if not self._toc_can_toggle():
+            return
+        self._set_outline_visible(not self._toc_user_visible)
 
     def _outline_clicked(self, item: QListWidgetItem) -> None:
         self._selected_section = self._toc.row(item)
@@ -403,7 +513,12 @@ class Viewer(QMainWindow):
         is derived from the viewport cursor instead.
         """
         cursor = self._browser.cursorForPosition(self._browser.viewport().rect().topLeft())
-        block = cursor.block()
+        index = self._anchored_index(cursor.block())
+        return index if index is not None else 0
+
+    @staticmethod
+    def _anchored_index(block):
+        """Outline index of the nearest `md-hN` anchor at or above `block`."""
         while block.isValid():
             fragment = block.begin()
             while fragment != block.end():
@@ -414,7 +529,7 @@ class Viewer(QMainWindow):
                             return int(name[4:])
                 fragment += 1
             block = block.previous()
-        return 0
+        return None
 
     def _current_section_label(self) -> str | None:
         """Label of the section currently at the top of the preview."""
@@ -441,7 +556,7 @@ class Viewer(QMainWindow):
         if not self._dark_titled:
             self._dark_titled = True
             enable_dark_title_bar(self)
-        QTimer.singleShot(0, self._apply_split)
+        QTimer.singleShot(0, self._relayout)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -586,8 +701,10 @@ class Viewer(QMainWindow):
 
         self._editor = QPlainTextEdit()
         self._editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self._editor.setMinimumWidth(EDITOR_HARD)  # hard floor, see theme metrics
         self._editor.setPlaceholderText("Исходный Markdown — как в блокноте")
         self._editor.textChanged.connect(self._update_state)
+        self._editor.textChanged.connect(self._mark_map_dirty)
         self._editor.installEventFilter(self)
         self._editor.viewport().installEventFilter(self)  # wheel lands on the viewport
         self._editor.viewport().setMouseTracking(True)  # autoscroll follows the pointer
@@ -596,6 +713,10 @@ class Viewer(QMainWindow):
         layout.addWidget(self._editor, 1)
 
         self._panel = panel
+        # the header row of buttons wants ~450 px; without an explicit minimum
+        # the whole editor pane could not shrink below that and QSplitter would
+        # steal from the preview instead (see the shrink policy in `_relayout`)
+        panel.setMinimumWidth(EDITOR_HARD)
         self._splitter.addWidget(panel)
         self._splitter.setStretchFactor(1, 1)
         panel.setVisible(False)  # addWidget reveals the child; edit mode owns it
@@ -644,22 +765,28 @@ class Viewer(QMainWindow):
         self._editor.setPlainText(self._text)
         self._editor.document().setModified(False)
         self._baseline = _normalized(self._text)
+        self._map_dirty = False  # editor content matches the last render
         self._panel.setVisible(True)
 
-        # Keep the preview exactly where it was, and make the editor the same
-        # width instead of a fixed 1700 px that dwarfs it and squeezes the
-        # window. The window grows by at most that much.
-        screen = QGuiApplication.primaryScreen()
-        available = screen.availableGeometry().width() if screen else EDIT_WIDTH
-        editor_width = min(EDIT_WIDTH, self._preview_width)
-        toc_w = self._outline_width()
-        target = min(self._preview_width + editor_width + toc_w, int(available * 0.96))
+        # Grow the window enough for the outline, the current preview and the
+        # preferred editor width (+ handles), capped by the screen the window is
+        # already on (not the primary one: on a multi-monitor desk that would size
+        # for the wrong monitor and let the window spill off its own screen). If
+        # the cap bites, `_relayout` shrinks the editor first, preview staying put.
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        available = screen.availableGeometry().width() if screen else SCREEN_FALLBACK
+        toc_w = self._toc_pref() if self._toc.isVisible() else 0
+        panes = 2 + (1 if toc_w else 0)
+        target = min(
+            self._preview_width + self._editor_pref + toc_w + SPLIT_HANDLE * (panes - 1),
+            int(available * 0.96),
+        )
         if self.width() < target:
             # QByteArray, not QRect: this is what restoreGeometry expects
             self._view_geometry = self.saveGeometry()
             self.resize(target, self.height())
-        self._apply_split()
-        QTimer.singleShot(0, self._apply_split)  # once the layout knows the child
+        self._relayout()
+        QTimer.singleShot(0, self._relayout)  # once the layout knows the child
 
         self._edit_btn.setText("Выйти из правки")
         self._editor.setFocus()
@@ -842,18 +969,189 @@ class Viewer(QMainWindow):
     # -- mutual selection highlighting ------------------------------------
 
     def _highlight_editor_from_preview(self) -> None:
-        """Mirror the preview selection into the editor (same colour)."""
+        """Reflect the preview selection in the editor (preview's colour)."""
         if self._editor is None:  # read mode: the editor does not exist yet
             return
-        text = self._browser.textCursor().selectedText()
-        self._highlight_in(self._editor, text, PREVIEW_SELECTION)
+        self._highlight_from(self._browser)
 
     def _highlight_preview_from_editor(self) -> None:
-        """Mirror the editor selection into the preview (same colour)."""
-        text = self._editor.textCursor().selectedText()
-        self._highlight_in(self._browser, text, EDITOR_SELECTION)
+        """Reflect the editor selection in the preview (editor's colour)."""
+        self._highlight_from(self._editor)
+
+    def _highlight_from(self, source) -> None:
+        """Stack the newest selection on top in both panes.
+
+        Each pane keeps at most one layer per source: the other pane's latest
+        selection and its own. The pane that just changed is moved to the top,
+        so its colour wins on both sides while the other pane's earlier
+        selection stays visible underneath (it is not replaced).
+        """
+        colour = PREVIEW_SELECTION if source is self._browser else EDITOR_SELECTION
+        text = self._collapse(source.textCursor().selectedText())
+        target = self._editor if source is self._browser else self._browser
+        if target is not None:
+            cursor = self._mirror_cursor(source, target, text) if len(text) >= 2 else None
+            self._set_hl_layer(target, source, cursor, colour)
+        own = source.textCursor() if len(text) >= 2 else None
+        self._set_hl_layer(source, source, own, colour)
+
+    def _mirror_cursor(self, source, target, needle: str):
+        """Cursor for the same fragment in `target`.
+
+        The position map is exact and handles multi-line selections and repeated
+        phrases, so it is tried first. When there is no usable map (raw HTML the
+        aligner cannot follow), fall back to a text search bounded by the
+        selection's section — a plain whole-document search picked a duplicate in
+        another section.
+        """
+        source_map = self._ensure_map()
+        if source_map is not None and not self._map_dirty:
+            cursor = source.textCursor()
+            if source is self._editor:
+                span = source_map.to_render(cursor.selectionStart(), cursor.selectionEnd())
+            else:
+                span = source_map.to_source(cursor.selectionStart(), cursor.selectionEnd())
+            mirrored = self._range_cursor(target, span)
+            if mirrored is not None:
+                return mirrored
+        pattern = self._match_pattern(needle)
+        if pattern is None:
+            return None
+        bounds = self._section_bounds(source, source.textCursor())
+        if bounds is None:  # no section info: fall back to the whole document
+            return target.document().find(pattern)
+        document, start, end = bounds
+        return self._find_between(document, pattern, start, end)
+
+    def _ensure_map(self):
+        """Build (once per render) the source <-> rendered position map."""
+        if self._source_map is not None or self._map_failed or self._map_source is None:
+            return self._source_map
+        source_map = SourceMap(self._map_source, self._browser.document().toPlainText())
+        if not source_map:
+            self._map_failed = True
+            return None
+        self._source_map = source_map
+        return source_map
+
+    @staticmethod
+    def _range_cursor(pane, span):
+        """A selection cursor for a character `(start, end)` span, or None."""
+        if span is None:
+            return None
+        start, end = span
+        document = pane.document()
+        if start < 0 or end > document.characterCount() - 1:
+            return None
+        cursor = QTextCursor(document)
+        cursor.setPosition(start)
+        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+        return cursor if cursor.hasSelection() else None
+
+    def _section_bounds(self, source, cursor):
+        """`(document, start_block, end_block)` of `source`'s section, in `target`."""
+        if source is self._browser:
+            index = self._anchored_index(cursor.block())
+            if index is None or index >= len(self._outline):
+                return None
+            start = self._find_heading_block(self._outline[index].label)
+            if start is None:
+                return None
+            return self._editor.document(), start, self._next_editor_heading(start)
+        label = self._editor_section_label(cursor.block())
+        index = self._preview_index_for_label(label) if label else None
+        if index is None:
+            return None
+        start = self._block_for_anchor(self._outline[index].anchor)
+        if start is None:
+            return None
+        return self._browser.document(), start, self._next_preview_heading(start)
+
+    @staticmethod
+    def _find_between(document, pattern, start, end):
+        """First match at or after `start` and before `end` (exclusive)."""
+        found = document.find(pattern, QTextCursor(start))
+        if found.isNull():
+            return None
+        if end is not None and found.block().blockNumber() >= end.blockNumber():
+            return None
+        return found
+
+    @staticmethod
+    def _next_editor_heading(block):
+        block = block.next()
+        while block.isValid():
+            if block.text().lstrip().startswith("#"):
+                return block
+            block = block.next()
+        return None
+
+    def _next_preview_heading(self, block):
+        block = block.next()
+        while block.isValid():
+            fragment = block.begin()
+            while fragment != block.end():
+                piece = fragment.fragment()
+                if piece.isValid() and any(
+                    name.startswith("md-h") for name in piece.charFormat().anchorNames()
+                ):
+                    return block
+                fragment += 1
+            block = block.next()
+        return None
+
+    def _editor_section_label(self, block):
+        """Heading key of the editor section the selection starts in, or None."""
+        while block.isValid():
+            text = block.text()
+            if text.lstrip().startswith("#"):
+                return self._heading_key(text)
+            block = block.previous()
+        return None
+
+    def _preview_index_for_label(self, label: str):
+        key = self._heading_key(label)
+        for index, heading in enumerate(self._outline):
+            if self._heading_key(heading.label) == key:
+                return index
+        return None
+
+    @staticmethod
+    def _match_pattern(needle: str) -> QRegularExpression | None:
+        words = re.findall(r"\w+", needle, re.UNICODE)
+        if not words:
+            return None
+        if len(words) == 1:
+            body = re.escape(words[0])
+        else:
+            body = r"[^\w]{0,8}".join(re.escape(word) for word in words)
+        return QRegularExpression(
+            r"\b" + body + r"\b",
+            QRegularExpression.PatternOption.UseUnicodePropertiesOption,
+        )
+
+    def _set_hl_layer(self, pane, owner, cursor, colour: str) -> None:
+        """Replace `owner`'s layer in `pane` with `cursor` (or drop it).
+
+        The layer moves to the end of the list, i.e. on top: extra selections are
+        painted in order and over the pane's own native selection.
+        """
+        layers = [layer for layer in self._hl_layers.get(pane, []) if layer[0] is not owner]
+        if cursor is not None and not cursor.isNull() and cursor.hasSelection():
+            layers.append((owner, cursor, colour))
+        self._hl_layers[pane] = layers
+        pane.setExtraSelections([self._extra_selection(cursor, col) for _, cursor, col in layers])
+
+    @staticmethod
+    def _extra_selection(cursor, colour: str) -> QTextEdit.ExtraSelection:
+        selection = QTextEdit.ExtraSelection()
+        selection.cursor = cursor
+        selection.format.setBackground(QColor(colour))
+        selection.format.setForeground(QColor("#ffffff"))
+        return selection
 
     def _clear_highlights(self) -> None:
+        self._hl_layers = {}
         self._browser.setExtraSelections([])
         if self._editor is not None:
             self._editor.setExtraSelections([])
@@ -863,28 +1161,6 @@ class Viewer(QMainWindow):
         """Whitespace is collapsed on the HTML side, so collapse both sides."""
         return re.sub(r"\s+", " ", text.replace("\u2029", " ")).strip()
 
-    def _highlight_in(self, target, text: str, colour: str) -> None:
-        """Highlight the same text in `target` without moving its caret.
-
-        Best-effort: HTML strips markup and collapses whitespace, so a fragment
-        copied from one pane may not exist verbatim in the other; then the
-        highlight is simply dropped.
-        """
-        needle = self._collapse(text)
-        if len(needle) < 2:
-            target.setExtraSelections([])
-            return
-        pattern = QRegularExpression(QRegularExpression.escape(needle).replace("\\ ", r"\s+"))
-        cursor = target.document().find(pattern)
-        if cursor.isNull():
-            target.setExtraSelections([])
-            return
-        selection = QTextEdit.ExtraSelection()
-        selection.cursor = cursor
-        selection.format.setBackground(QColor(colour))
-        selection.format.setForeground(QColor("#ffffff"))
-        target.setExtraSelections([selection])
-
     def _leave_edit(self) -> None:
         if not self._confirm_discard():
             return
@@ -893,7 +1169,7 @@ class Viewer(QMainWindow):
         self._edit_mode = False
         self._panel.setVisible(False)
         self._clear_highlights()  # the editor is gone; drop its mirror
-        self._apply_split()
+        self._relayout()
         QTimer.singleShot(0, self._set_margins)
         if _normalized(self._text) != self._rendered:
             # the preview showed a converted but unsaved draft: go back to disk
@@ -908,36 +1184,62 @@ class Viewer(QMainWindow):
         self._show_overlay()  # back over the full-width preview
         self._update_state()
 
-    def _apply_split(self) -> None:
-        """Lay out the splitter according to what is currently visible:
+    def _relayout(self, content: int | None = None) -> None:
+        """Lay the panes out for the current splitter width and mode.
 
-            read mode:  [toc?] [preview]
-            edit mode:  [toc?] [preview] [editor]
+        The policy itself lives in `layout_panes` / `toc_visible_for`; this only
+        feeds them the real geometry and applies the result. Called on splitter
+        resize, mode change and outline toggle. `content` is the splitter width
+        (passed in from the Resize event so it is never stale).
         """
-        total = self.width()
-        editor = self._editor is not None and self._panel.isVisible()
-        toc = self._toc.isVisible()
-        toc_w = self._outline_width()
-        if editor:
-            rest = total - toc_w
-            if self._preview_width:
-                preview = min(self._preview_width, max(MIN_COLUMN, rest - MIN_COLUMN))
-            else:
-                preview = int(rest * EDIT_SPLIT)
-            sizes = ([toc_w] if toc else []) + [preview, rest - preview]
-        else:
-            sizes = ([toc_w] if toc else []) + [total - toc_w]
-        self._splitter.setSizes(sizes)
-        if getattr(self, "_overlay", None) is not None and self._overlay.isVisible():
-            self._place_overlay()
-        # setSizes is relative to the splitter's *current* total; once the window
-        # has its real size, lay it out again with the absolute numbers
-        QTimer.singleShot(0, self._apply_split_settled)
+        if self._in_relayout:
+            return
+        self._in_relayout = True
+        try:
+            if content is None:
+                content = self._splitter.width()
+            edit = self._editing()
+            main_panes = 2 if edit else 1
+            # the outline's own visibility must not feed back into this number,
+            # so only the handles of the main panes are removed here
+            main_avail = content - SPLIT_HANDLE * (main_panes - 1)
+            user_visible = self._toc_user_visible and bool(self._outline)
+            toc_visible = toc_visible_for(main_avail, self._toc_auto_hidden, user_visible, edit)
+            self._toc_auto_hidden = user_visible and not toc_visible
+            if not user_visible:
+                self._toc_auto_hidden = False
+            self._toc.setVisible(toc_visible)
+            panes = main_panes + (1 if toc_visible else 0)
+            avail = max(0, content - SPLIT_HANDLE * (panes - 1))
+            toc, editor, preview = layout_panes(
+                avail, edit, toc_visible, self._toc_pref(), self._editor_pref
+            )
+            # `setSizes` indexes *children*, hidden ones included, so always pass
+            # a full list (0 for a hidden pane) or the widths land on the wrong
+            # widgets
+            sizes = [toc if toc_visible else 0, preview, editor if edit else 0]
+            self._splitter.setSizes(sizes)
+            self._update_toc_toggle(toc_visible, main_avail)
+            if getattr(self, "_overlay", None) is not None and self._overlay.isVisible():
+                self._place_overlay()
+        finally:
+            self._in_relayout = False
         QTimer.singleShot(0, self._set_margins)
         # keep the reader where they were: the column width (and the viewport
         # margins) just changed, so a table-heavy document rewraps and the same
         # scroll pixel lands on a different section. Runs after `_set_margins`.
         QTimer.singleShot(0, self._restore_preview_anchor)
+
+    def _update_toc_toggle(self, toc_visible: bool, main_avail: int) -> None:
+        """Disable the outline toggle when it would just auto-hide again."""
+        button = getattr(self, "_toc_btn", None)
+        if button is None:
+            return
+        if not self._outline:
+            button.setEnabled(False)
+            return
+        fits = toc_visible_for(main_avail, True, True, self._editing())
+        button.setEnabled(toc_visible or fits)
 
     def _restore_preview_anchor(self) -> None:
         if self._preview_anchor is not None:
@@ -945,12 +1247,6 @@ class Viewer(QMainWindow):
 
     def _clear_preview_anchor(self) -> None:
         self._preview_anchor = None
-
-    def _apply_split_settled(self) -> None:
-        total = self._splitter.width()
-        if total <= 0 or total == self.width():
-            return
-        self._apply_split()
 
     def _convert(self) -> None:
         if not self._editing():
@@ -997,6 +1293,10 @@ class Viewer(QMainWindow):
         if answer == QMessageBox.StandardButton.Save:
             return self._save()
         return True
+
+    def _mark_map_dirty(self) -> None:
+        """The editor changed, so its offsets no longer match the last render."""
+        self._map_dirty = True
 
     def _update_state(self) -> None:
         """Title bullet, and which of the two buttons make sense right now."""
@@ -1086,6 +1386,7 @@ class Viewer(QMainWindow):
         self._toc_btn = QToolButton()
         self._toc_btn.setText("☰")
         self._toc_btn.clicked.connect(self._toggle_outline)
+        self._toc_btn.setEnabled(self._toc_can_toggle())
 
         search_btn = QToolButton()
         search_btn.setText("🔍")
@@ -1154,7 +1455,8 @@ class Viewer(QMainWindow):
         return None
 
     def eventFilter(self, obj, event):
-        """Per-pane chrome: Ctrl+wheel zooms, middle-click autoscrolls.
+        """Per-pane chrome: Ctrl+wheel zooms, middle-click autoscrolls, and the
+        splitter's own resize drives the pane shrink policy.
 
         The filter is installed on both the pane and its viewport: a scroll area
         delivers wheel and mouse events to the viewport, so filtering only the
@@ -1162,6 +1464,11 @@ class Viewer(QMainWindow):
         font moved but `_zoom` and the label stayed at 100%). Autoscroll is
         tracked separately per pane, so starting it in one never moves the other.
         """
+        if obj is self._splitter and event.type() == QEvent.Type.Resize:
+            # the splitter resizes a step after the window, so its Resize carries
+            # the final width; laying out here avoids a stale-width pass
+            self._relayout(event.size().width())
+            return False
         pane = self._pane_for(obj)
         if pane is None:
             return super().eventFilter(obj, event)

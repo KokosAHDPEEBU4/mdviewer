@@ -17,7 +17,17 @@ from PyQt6.QtWidgets import QApplication, QTextBrowser
 
 import viewer as viewer_mod
 from main import create_app
-from theme import EDITOR_SELECTION, MEASURE, MIN_COLUMN, PREVIEW_SELECTION, side_margin
+from theme import (
+    EDITOR_HARD,
+    EDITOR_SELECTION,
+    MEASURE,
+    MIN_COLUMN,
+    PREVIEW_HARD,
+    PREVIEW_SELECTION,
+    SPLIT_HANDLE,
+    side_margin,
+)
+from viewer import layout_panes, toc_visible_for
 from version import APP_NAME, APP_VERSION
 
 SOURCE = "# Title\r\n\r\nHello.\r\n"
@@ -32,8 +42,36 @@ def check(label, got, want):
     print(f"{'ok  ' if ok else 'FAIL'} {label}: {got!r}" + ("" if ok else f" (want {want!r})"))
 
 
+def _install_test_screen_placement() -> None:
+    """Optionally keep the automated test windows off the primary monitor.
+
+    Set `MDVIEWER_TEST_SCREEN=secondary` (or a screen name) to place every
+    Viewer on that screen; otherwise nothing changes.
+    """
+    want = os.environ.get("MDVIEWER_TEST_SCREEN", "").strip().lower()
+    if not want:
+        return
+    screens = QApplication.screens()
+    if want == "secondary":
+        target = next((s for s in screens if s is not QApplication.primaryScreen()), None)
+    else:
+        target = next((s for s in screens if s.name().lower() == want), None)
+    if target is None:
+        return
+    geo = target.availableGeometry()
+    original_show = viewer_mod.Viewer.show
+
+    def show_on_target(self):
+        size = self.size()
+        self.setGeometry(geo.x() + 20, geo.y() + 20, size.width(), size.height())
+        original_show(self)
+
+    viewer_mod.Viewer.show = show_on_target
+
+
 def main() -> int:
     app = create_app()
+    _install_test_screen_placement()
 
     # --- column policy, independent of any window
     check("narrow window keeps minimal insets", side_margin(1000), 20)
@@ -41,6 +79,35 @@ def main() -> int:
     check("wide window grows the bars", side_margin(3440), 1072)
     check("column never exceeds MEASURE", 3440 - 2 * side_margin(3440) <= MEASURE, True)
     check("text column stays readable", 3440 - 2 * side_margin(3440) >= MIN_COLUMN, True)
+
+    # --- pane shrink policy, pure function traces (avail excludes handles)
+    check("read: TOC yields to keep the column", layout_panes(586, False, True, 240, 520), (166, 0, 420))
+    check("read: TOC hidden, column takes all", layout_panes(500, False, False, 240, 520), (0, 0, 500))
+    check("edit: TOC yields first", layout_panes(954, True, True, 240, 520), (120, 414, 420))
+    check("edit: editor yields before the preview", layout_panes(700, True, False, 240, 520), (0, 280, 420))
+    check("edit: editor reaches its soft floor", layout_panes(600, True, False, 240, 520), (0, 220, 380))
+    check("edit: editor at its hard floor", layout_panes(500, True, False, 240, 520), (0, 220, 280))
+    check("edit: surplus goes to the preview", layout_panes(1400, True, True, 240, 520), (240, 520, 640))
+    # hidden panes are zero and must not creep back into the layout
+    check("hidden TOC stays zero", layout_panes(1000, True, False, 240, 520)[0], 0)
+    check("no editor in read mode", layout_panes(1000, False, True, 240, 520)[1], 0)
+
+    # --- auto-hide hysteresis (main_avail excludes only the main handles)
+    check("read: outline hidden when tight", toc_visible_for(500, False, True, False), False)
+    check("read: outline shown when it fits", toc_visible_for(586, False, True, False), True)
+    check("hysteresis: stays hidden below the show edge", toc_visible_for(560, True, True, False), False)
+    check("hysteresis: returns above the show edge", toc_visible_for(590, True, True, False), True)
+    check("user-hidden outline never auto-returns", toc_visible_for(2000, True, False, False), False)
+    check("edit: outline hide threshold", toc_visible_for(900, False, True, True), False)
+    check("edit: outline shown when comfortable", toc_visible_for(954, False, True, True), True)
+
+    # --- mutual-highlight search survives markdown markup
+    pattern = viewer_mod.Viewer._match_pattern("bold text")
+    check("matching skips inline markup", bool(pattern.match("а **bold** text тут").hasMatch()), True)
+    pattern = viewer_mod.Viewer._match_pattern("привет мир")
+    check("matching works for Cyrillic", bool(pattern.match("сказал **привет** мир!").hasMatch()), True)
+    pattern = viewer_mod.Viewer._match_pattern("app/main.py")
+    check("matching skips inline code", bool(pattern.match("в `app/main.py` всё").hasMatch()), True)
 
     with tempfile.TemporaryDirectory() as folder:
         path = Path(folder) / "sample.md"
@@ -97,27 +164,43 @@ def main() -> int:
         check("accumulated wheel delta zooms once", win._editor_zoom, before_wheel + 2)
         win._set_editor_zoom(0)
         check("editor zoom reset restores the font", win._editor.font().pointSizeF(), base_font)
-        # mutual highlighting: the mirror takes the colour of the pane the
-        # selection was made in, so both ends read as one highlight
+        # mutual highlighting: each pane shows the newest selection on top, and
+        # the other pane's earlier selection stays underneath
         editor_cursor = win._editor.textCursor()
         editor_cursor.setPosition(9)
         editor_cursor.setPosition(14, QTextCursor.MoveMode.KeepAnchor)
         win._editor.setTextCursor(editor_cursor)
         win._highlight_preview_from_editor()
-        mirrored = win._browser.extraSelections()
-        check("editor selection mirrors into the preview", len(mirrored), 1)
-        check("preview mirror uses the editor colour", mirrored[0].format.background().color().name(), EDITOR_SELECTION)
+        browser_layers = win._browser.extraSelections()
+        check("editor selection mirrors into the preview", len(browser_layers), 1)
+        check("preview mirror uses the editor colour", browser_layers[-1].format.background().color().name(), EDITOR_SELECTION)
+        check("editor draws its own selection layer", len(win._editor.extraSelections()), 1)
+
         preview_cursor = win._browser.document().find("Hello")
         win._browser.setTextCursor(preview_cursor)
         win._highlight_editor_from_preview()
-        mirrored = win._editor.extraSelections()
-        check("preview selection mirrors into the editor", len(mirrored), 1)
-        check("editor mirror uses the preview colour", mirrored[0].format.background().color().name(), PREVIEW_SELECTION)
+        editor_layers = win._editor.extraSelections()
+        check("editor keeps both layers", len(editor_layers), 2)
+        check("newest layer wins in the editor", editor_layers[-1].format.background().color().name(), PREVIEW_SELECTION)
+        check("older editor layer stays underneath", editor_layers[0].format.background().color().name(), EDITOR_SELECTION)
+        browser_layers = win._browser.extraSelections()
+        check("preview keeps both layers", len(browser_layers), 2)
+        check("newest layer wins in the preview", browser_layers[-1].format.background().color().name(), PREVIEW_SELECTION)
+
+        # select in the editor again: its colour returns on top, preview stays
+        win._editor.setTextCursor(editor_cursor)
+        win._highlight_preview_from_editor()
+        editor_layers = win._editor.extraSelections()
+        check("editor colour wins after re-selecting", editor_layers[-1].format.background().color().name(), EDITOR_SELECTION)
+        check("preview layer remains underneath", editor_layers[0].format.background().color().name(), PREVIEW_SELECTION)
         win._clear_highlights()
+        check("clearing drops both highlights",
+              len(win._browser.extraSelections()) + len(win._editor.extraSelections()), 0)
         check("window widened", win.width() > 1000, True)
         check("editor panel visible", win._panel.isVisible(), True)
         sizes = win._splitter.sizes()
         check("outline, preview and editor are three panes", len(sizes), 3 if win._toc.isVisible() else 2)
+        check("splitter handle is wide enough to grab", win._splitter.handleWidth(), SPLIT_HANDLE)
         check("preview gets the middle", sizes[-2] > 400, True)
         check("editor gets the right part", sizes[-1] > 400, True)
         # setViewportMargins shrinks the viewport itself, so its width *is* the column
@@ -487,6 +570,137 @@ def main() -> int:
             app.processEvents()
         after = win._browser.cursorForPosition(win._browser.viewport().rect().topLeft()).block().blockNumber()
         check("zoom keeps the top section in place", abs(after - before) <= 1, True)
+        win.close()
+        app.processEvents()
+
+    # --- window shrink: outline yields first, auto-hides, then returns to pref
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "shrink.md"
+        body = "# Doc\n\n" + "\n\n".join(f"## Section {i}\n\n" + "text line\n" * 6 for i in range(20))
+        path.write_text(body, encoding="utf-8")
+        win = viewer_mod.Viewer(path, QSettings(tempfile.mkdtemp(), "shrink_check"))
+        win._ensure_overlay()
+        win.resize(1100, 500)
+        win.show()
+        for _ in range(4):
+            app.processEvents()
+
+        win._settings.setValue("toc_width", 380)  # a user-dragged outline
+        win.resize(1500, 500)
+        for _ in range(4):
+            app.processEvents()
+        check("wide window: outline at the preferred width", abs(win._splitter.sizes()[0] - 380) <= 2, True)
+        check("wide window: outline visible", win._toc.isVisible(), True)
+
+        win.resize(520, 500)
+        for _ in range(4):
+            app.processEvents()
+        check("narrow window: outline auto-hides", win._toc.isVisible(), False)
+        check("narrow window: preview keeps its hard floor", win._browser.width() >= PREVIEW_HARD, True)
+        check("narrow window: outline toggle is disabled", win._toc_btn.isEnabled(), False)
+
+        win.resize(1500, 500)
+        for _ in range(4):
+            app.processEvents()
+        check("widened again: outline returns", win._toc.isVisible(), True)
+        check("widened again: returns to the preferred width", abs(win._splitter.sizes()[0] - 380) <= 2, True)
+        check("widened again: toggle is enabled", win._toc_btn.isEnabled(), True)
+
+        # edit mode: outline yields first, then the editor, and the preview is
+        # protected down to MIN_COLUMN before the editor reaches its hard floor
+        win._enter_edit()
+        for _ in range(4):
+            app.processEvents()
+        win.resize(1000, 500)
+        for _ in range(4):
+            app.processEvents()
+        check("edit: preview protected at MIN_COLUMN", win._browser.width() >= MIN_COLUMN - 2, True)
+        win.resize(650, 500)
+        for _ in range(4):
+            app.processEvents()
+        # the header row of buttons is ~450 px wide; the editor reaching its hard
+        # floor proves that minimum no longer leaks into the splitter
+        check("edit: editor reaches its hard floor", win._panel.width() <= EDITOR_HARD + 2, True)
+        check("edit: preview never drops below its hard floor", win._browser.width() >= PREVIEW_HARD, True)
+
+        win._confirm_discard = lambda: True
+        win._leave_edit()
+
+        win.close()
+        app.processEvents()
+
+    # --- mutual highlight is scoped to the section, not the whole document
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "dup.md"
+        path.write_text(
+            "# Doc\n\n## A\n\nдубль текст тут.\n\n## B\n\nдубль текст тут.\n",
+            encoding="utf-8",
+        )
+        win = viewer_mod.Viewer(path, QSettings(tempfile.mkdtemp(), "dup_check"))
+        win.resize(900, 600)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+        win._enter_edit()
+        for _ in range(3):
+            app.processEvents()
+
+        # select the *second* duplicate in the preview (section B)
+        preview = win._browser.document()
+        second = preview.find("дубль", preview.find("дубль").position() + 1)
+        win._browser.setTextCursor(second)
+        win._highlight_editor_from_preview()
+        layers = win._editor.extraSelections()
+        check("scoped mirror produced a highlight", len(layers), 1)
+        first_in_editor = win._editor.document().find("дубль").position()
+        check("preview mirror lands in the same section, not the first copy",
+              layers and layers[0].cursor.selectionStart() > first_in_editor, True)
+
+        # and the reverse: select the second duplicate in the editor
+        editor_doc = win._editor.document()
+        second_editor = editor_doc.find("дубль", editor_doc.find("дубль").position() + 1)
+        win._editor.setTextCursor(second_editor)
+        win._highlight_preview_from_editor()
+        browser_layers = win._browser.extraSelections()
+        preview_first = preview.find("дубль").position()
+        preview_mirror = [l for l in browser_layers if l.cursor.selectionStart() > preview_first]
+        check("editor mirror lands in the same section too", len(preview_mirror) >= 1, True)
+
+        win._confirm_discard = lambda: True
+        win._leave_edit()
+        win.close()
+        app.processEvents()
+
+    # --- a multi-line preview selection mirrors the whole source span
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "multi.md"
+        path.write_text(
+            "# D\n\n- alpha one\n- beta two\n- gamma three\n\nEnd.\n",
+            encoding="utf-8",
+        )
+        win = viewer_mod.Viewer(path, QSettings(tempfile.mkdtemp(), "multi_check"))
+        win.resize(900, 600)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+        win._enter_edit()
+        for _ in range(3):
+            app.processEvents()
+        preview = win._browser.document()
+        first = preview.find("alpha")
+        last = preview.find("three")
+        cursor = QTextCursor(preview)
+        cursor.setPosition(first.selectionStart())
+        cursor.setPosition(last.selectionEnd(), QTextCursor.MoveMode.KeepAnchor)
+        win._browser.setTextCursor(cursor)
+        win._highlight_editor_from_preview()
+        layers = win._editor.extraSelections()
+        check("multi-line selection yields one mirror", len(layers), 1)
+        mirrored = layers[0].cursor.selectedText() if layers else ""
+        check("mirror covers every selected line",
+              all(word in mirrored for word in ("alpha", "beta", "gamma")), True)
+        win._confirm_discard = lambda: True
+        win._leave_edit()
         win.close()
         app.processEvents()
 

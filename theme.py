@@ -56,14 +56,25 @@ MONO = '"Cascadia Mono", "Cascadia Code", Consolas, "Courier New", monospace'
 MEASURE = 1300          # widest the text column is allowed to get
 GUTTER_MIN = 20         # inset when the window is too narrow for MEASURE
 MARGIN_STEP = 8         # don't re-layout the document for sub-step resizes
-MIN_COLUMN = 420        # never let the insets squeeze the text below this
-EDIT_WIDTH = 1700       # upper bound for the editor pane (matched to the preview)
-EDIT_SPLIT = 0.55       # preview share when there is no preview width to keep
+MIN_COLUMN = 420        # soft minimum of the reading column / preview pane
+PREVIEW_HARD = 260      # hard floor: the window cannot squeeze the preview below it
 IMAGE_MAX = 860         # widest an <img> is emitted at (renderer._image)
-TOC_WIDTH = 240         # default table-of-contents pane width (px)
-TOC_MIN_WIDTH = 120     # narrowest the outline may be dragged
+SCREEN_FALLBACK = 1700  # assumed screen width when QGuiApplication reports none
+
+# Pane shrink policy (viewer.layout_panes). When the window is too narrow the
+# panes give width up in priority order TOC -> editor -> preview, each down to
+# its hard floor; the preview is the residual pane and keeps MIN_COLUMN as long
+# as possible. Preferred widths are plain constants (never derived from the
+# window) so opening edit once on a narrow window cannot bake in a bad layout.
+TOC_WIDTH = 240         # default / preferred outline width (px)
+TOC_MIN_WIDTH = 120     # outline shrinks to this, then auto-hides
 TOC_STEP = 14           # indent per heading level
 TOC_ROW = "#0f0f0f"     # current section highlight in the outline
+EDITOR_PREF = 520       # preferred editor width; the preview is residual by design
+EDITOR_MIN = 360        # editor yields to this before the preview drops below MIN_COLUMN
+EDITOR_HARD = 220       # hard floor for the editor
+SPLIT_HANDLE = 14       # splitter grab width (px): the panes' edges are easier to catch
+HYST = 40               # auto-hide hysteresis: no flicker at the show/hide threshold
 
 
 def side_margin(width: int) -> int:
@@ -233,6 +244,17 @@ dd {{ margin-left: 20px; color: {TEXT}; }}
 APP_QSS = f"""
 QMainWindow {{
     background-color: {BG};
+}}
+/* The splitter handle is the pane divider: keep it wide enough to grab easily
+   and light it up under the pointer so the movable edge is obvious. */
+QSplitter::handle {{
+    background-color: {BG};
+}}
+QSplitter::handle:hover {{
+    background-color: {ACCENT_DIM};
+}}
+QSplitter::handle:pressed {{
+    background-color: {ACCENT};
 }}
 QTextBrowser {{
     background-color: {BG};
