@@ -11,8 +11,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from PyQt6.QtCore import QEvent, QPoint, QPointF, QSettings, Qt
-from PyQt6.QtGui import QMouseEvent, QPalette, QWheelEvent
+from PyQt6.QtCore import QEvent, QPoint, QPointF, QSettings, Qt, QUrl
+from PyQt6.QtGui import QMouseEvent, QPalette, QTextCursor, QWheelEvent
 from PyQt6.QtWidgets import QApplication, QTextBrowser
 
 import viewer as viewer_mod
@@ -71,8 +71,6 @@ def main() -> int:
         win._set_editor_zoom(2)
         check("editor zoom scales only the editor", win._editor.font().pointSizeF() > base_font, True)
         check("preview zoom untouched by editor zoom", win._zoom, preview_zoom)
-        win._set_editor_zoom(0)
-        check("editor zoom reset restores the font", win._editor.font().pointSizeF(), base_font)
         # Ctrl+wheel over the editor must zoom it, not scroll it
         wheel = QWheelEvent(
             QPointF(10, 10), QPointF(10, 10), QPoint(0, 0), QPoint(0, 120),
@@ -82,7 +80,40 @@ def main() -> int:
         before_wheel = win._editor_zoom
         win.eventFilter(win._editor, wheel)
         check("Ctrl+wheel zooms the editor", win._editor_zoom, before_wheel + 1)
+        # a fine trackpad delta must accumulate, not step on its own
+        fine = QWheelEvent(
+            QPointF(10, 10), QPointF(10, 10), QPoint(0, 5), QPoint(0, 0),
+            Qt.MouseButton.NoButton, Qt.KeyboardModifier.ControlModifier,
+            Qt.ScrollPhase.NoScrollPhase, False,
+        )
+        win.eventFilter(win._editor, fine)
+        check("a fine wheel delta does not zoom yet", win._editor_zoom, before_wheel + 1)
+        big = QWheelEvent(
+            QPointF(10, 10), QPointF(10, 10), QPoint(0, 40), QPoint(0, 0),
+            Qt.MouseButton.NoButton, Qt.KeyboardModifier.ControlModifier,
+            Qt.ScrollPhase.NoScrollPhase, False,
+        )
+        win.eventFilter(win._editor, big)
+        check("accumulated wheel delta zooms once", win._editor_zoom, before_wheel + 2)
         win._set_editor_zoom(0)
+        check("editor zoom reset restores the font", win._editor.font().pointSizeF(), base_font)
+        # mutual highlighting: the mirror takes the colour of the pane the
+        # selection was made in, so both ends read as one highlight
+        editor_cursor = win._editor.textCursor()
+        editor_cursor.setPosition(9)
+        editor_cursor.setPosition(14, QTextCursor.MoveMode.KeepAnchor)
+        win._editor.setTextCursor(editor_cursor)
+        win._highlight_preview_from_editor()
+        mirrored = win._browser.extraSelections()
+        check("editor selection mirrors into the preview", len(mirrored), 1)
+        check("preview mirror uses the editor colour", mirrored[0].format.background().color().name(), EDITOR_SELECTION)
+        preview_cursor = win._browser.document().find("Hello")
+        win._browser.setTextCursor(preview_cursor)
+        win._highlight_editor_from_preview()
+        mirrored = win._editor.extraSelections()
+        check("preview selection mirrors into the editor", len(mirrored), 1)
+        check("editor mirror uses the preview colour", mirrored[0].format.background().color().name(), PREVIEW_SELECTION)
+        win._clear_highlights()
         check("window widened", win.width() > 1000, True)
         check("editor panel visible", win._panel.isVisible(), True)
         sizes = win._splitter.sizes()
@@ -165,6 +196,7 @@ def main() -> int:
             app.processEvents()
         check("outline has every heading", win._toc.count(), 41)
         check("outline visible when there are headings", win._toc.isVisible(), True)
+        check("outline wraps long headings instead of eliding", win._toc.wordWrap(), True)
         check("anchors injected", win._browser.toHtml().count("<a name=\"md-h"), 41)
         # the outline has its own zoom, independent of the other panes
         toc_base = win._toc_base_font.pointSizeF()
@@ -191,6 +223,28 @@ def main() -> int:
         check("zoom label follows the factor", win._zoom_label.text(), "110%")
         win._reset_zoom()
         check("zoom resets to 100%", win._zoom_label.text(), "100%")
+        # "100%" has to return to the exact base size; `zoomIn/zoomOut` drifted
+        base_doc_font = win._browser.document().defaultFont().pointSizeF()
+        base_doc_height = win._browser.document().size().height()
+        win._set_zoom(2)
+        check("preview font scales with zoom", win._browser.document().defaultFont().pointSizeF() > base_doc_font, True)
+        check("preview document grows with zoom", win._browser.document().size().height() > base_doc_height, True)
+        win._reset_zoom()
+        check("100% restores the exact base font", win._browser.document().defaultFont().pointSizeF(), base_doc_font)
+        check("100% restores the exact document height", abs(win._browser.document().size().height() - base_doc_height) < 1.0, True)
+        # Qt delivers wheel events to the viewport, so the filter must live
+        # there too; otherwise the built-in Ctrl+wheel zoom moves the font while
+        # `_zoom` and the "100%" label never change
+        preview_wheel = QWheelEvent(
+            QPointF(10, 10), QPointF(10, 10), QPoint(0, 0), QPoint(0, 120),
+            Qt.MouseButton.NoButton, Qt.KeyboardModifier.ControlModifier,
+            Qt.ScrollPhase.NoScrollPhase, False,
+        )
+        QApplication.sendEvent(win._browser.viewport(), preview_wheel)
+        check("preview wheel reaches the handler", win._zoom, 1)
+        check("preview zoom label tracks the wheel", win._zoom_label.text(), "110%")
+        check("preview font follows the label", win._browser.document().defaultFont().pointSizeF() > base_doc_font, True)
+        win._reset_zoom()
         last = win._toc.item(win._toc.count() - 1)
         win._outline_clicked(last)
         for _ in range(6):
@@ -238,6 +292,19 @@ def main() -> int:
         for _ in range(3):
             app.processEvents()
 
+        # --- entering edit opens the source at the preview's current zoom
+        win._set_zoom(4)
+        win._enter_edit()
+        for _ in range(3):
+            app.processEvents()
+        check("editor opens at the preview zoom", win._editor_zoom, 4)
+        check("editor font reflects that zoom", win._editor.font().pointSizeF() > win._editor_base_font.pointSizeF(), True)
+        win._confirm_discard = lambda: True
+        win._leave_edit()
+        win._set_zoom(0)
+        for _ in range(3):
+            app.processEvents()
+
         # --- entering edit puts the caret on the section on screen, not line 0
         target = win._toc.count() // 2
         win._toc.setCurrentRow(target)
@@ -245,12 +312,21 @@ def main() -> int:
         for _ in range(8):
             app.processEvents()
         win._sync_outline()
-        wanted = win._outline[win._current_section_index()].label
+        # the row the user picked in the outline is honoured, even when the
+        # section at the top viewport pixel differs
+        wanted = win._outline[target].label
+        preview_top = win._browser.cursorForPosition(win._browser.viewport().rect().topLeft()).block()
         win._enter_edit()
         for _ in range(4):
             app.processEvents()
         caret = win._editor.textCursor().block().text()
-        check("caret lands on the visible section", win._heading_key(caret), win._heading_key(wanted))
+        check("caret lands on the selected section", win._heading_key(caret), win._heading_key(wanted))
+        check("entering edit keeps the preview in place",
+              win._browser.cursorForPosition(win._browser.viewport().rect().topLeft()).block().blockNumber(),
+              preview_top.blockNumber())
+        check("target sits at the top of the editor",
+              win._editor.cursorForPosition(win._editor.viewport().rect().topLeft()).block().blockNumber(),
+              win._editor.textCursor().block().blockNumber())
 
         # --- middle-click autoscroll, independently per pane
         def middle_press(pane, x, y):
@@ -263,7 +339,7 @@ def main() -> int:
 
         editor_bar = win._editor.verticalScrollBar()
         preview_before = win._browser.verticalScrollBar().value()
-        middle_press(win._editor, 200, 200)
+        middle_press(win._editor.viewport(), 200, 200)
         check("middle-click arms the editor", win._autoscroll_pane is win._editor, True)
         win._move_autoscroll(QPointF(200, 300).toPoint())
         for _ in range(20):
@@ -286,6 +362,131 @@ def main() -> int:
         for _ in range(3):
             app.processEvents()
 
+        win.close()
+        app.processEvents()
+
+    # --- entering edit lands on the visible paragraph, not just the heading
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "paragraphs.md"
+        lines = ["# Doc", ""]
+        for i in range(40):
+            lines.append(f"## Section {i}")
+            lines.append("")
+            for j in range(6):
+                lines.append(f"Paragraph {i}-{j} with unique trailing words.")
+                lines.append("")
+        path.write_text("\n".join(lines), encoding="utf-8")
+
+        win = viewer_mod.Viewer(path, QSettings(tempfile.mkdtemp(), "para_check"))
+        win.resize(1000, 600)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+
+        wanted = "Paragraph 20-3 with unique trailing words."
+        block = win._browser.document().find(wanted).block()
+        top = win._browser.document().documentLayout().blockBoundingRect(block).top()
+        win._browser.verticalScrollBar().setValue(int(top))
+        for _ in range(3):
+            app.processEvents()
+        visible = win._visible_paragraph()
+        check("a paragraph sits at the viewport top", visible.startswith("Paragraph"), True)
+
+        win._enter_edit()
+        for _ in range(4):
+            app.processEvents()
+        caret = win._editor.textCursor().block().text()
+        check("caret lands on the visible paragraph", win._plain_key(caret), win._plain_key(visible))
+        check("caret is not merely the section heading", caret.lstrip().startswith("#"), False)
+
+        win._confirm_discard = lambda: True
+        win._leave_edit()
+        win.close()
+        app.processEvents()
+
+    # --- linked markdown opens in this window, with a working "Назад"
+    with tempfile.TemporaryDirectory() as folder:
+        first = Path(folder) / "first.md"
+        second = Path(folder) / "second.md"
+        first.write_text("# Первый\r\n\r\nСмотри [второй](second.md).\r\n", encoding="utf-8")
+        second.write_text("# Второй\r\n\r\n## Раздел\r\n\r\nтело второго.\r\n", encoding="utf-8")
+
+        win = viewer_mod.Viewer(first, QSettings(tempfile.mkdtemp(), "nav_check"))
+        win.resize(900, 700)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+        check("Qt's own link handling is off", win._browser.openLinks(), False)
+        win._show_overlay()
+        check("back is disabled at the start", win._back_btn.isEnabled(), False)
+
+        # follow the link exactly as a click would
+        win._browser.anchorClicked.emit(QUrl.fromLocalFile(str(second)))
+        for _ in range(3):
+            app.processEvents()
+        check("linked file opened in the same window", win._path, second.resolve())
+        check("linked file rendered with the theme", "тело второго." in win._browser.toPlainText(), True)
+        check("outline rebuilt for the linked file", win._toc.count(), 2)
+        check("back is enabled after following a link", win._back_btn.isEnabled(), True)
+
+        win._go_back()
+        for _ in range(3):
+            app.processEvents()
+        check("back returns to the previous file", win._path, first.resolve())
+        check("previous file is rendered again", "Смотри" in win._browser.toPlainText(), True)
+        check("back is disabled once history is empty", win._back_btn.isEnabled(), False)
+
+        win.close()
+        app.processEvents()
+
+    # --- code cards hit-test correctly (a table cell would jump to its last line)
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "code.md"
+        body = "# Doc\n\n```\n" + "\n".join(f"line {i:02d} payload" for i in range(40)) + "\n```\n\nAfter.\n"
+        path.write_text(body, encoding="utf-8")
+        win = viewer_mod.Viewer(path, QSettings(tempfile.mkdtemp(), "code_check"))
+        win.resize(700, 300)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+        doc = win._browser.document()
+        lay = doc.documentLayout()
+        first = doc.find("line 00").block()
+        check("code block is not wrapped in a table", QTextCursor(first).currentTable(), None)
+        win._browser.verticalScrollBar().setValue(int(lay.blockBoundingRect(first).top()))
+        for _ in range(2):
+            app.processEvents()
+        spacing = lay.blockBoundingRect(doc.find("line 01").block()).top() - lay.blockBoundingRect(first).top()
+        hit = win._browser.cursorForPosition(QPoint(8, int(spacing * 1.5))).block().text()
+        check("click inside a code block maps to that line", hit.startswith("line 01"), True)
+        win.close()
+        app.processEvents()
+
+    # --- Ctrl+wheel keeps the top of the preview in place
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "long.md"
+        body = "# Doc\n\n" + "\n\n".join(f"## Section {i}\n\n" + "text line\n" * 6 for i in range(30))
+        path.write_text(body, encoding="utf-8")
+        win = viewer_mod.Viewer(path, QSettings(tempfile.mkdtemp(), "zoom_check"))
+        win.resize(800, 400)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+        bar = win._browser.verticalScrollBar()
+        bar.setValue(bar.maximum() // 2)
+        for _ in range(2):
+            app.processEvents()
+        before = win._browser.cursorForPosition(win._browser.viewport().rect().topLeft()).block().blockNumber()
+        wheel = QWheelEvent(
+            QPointF(10, 10), QPointF(10, 10), QPoint(0, 0), QPoint(0, 120),
+            Qt.MouseButton.NoButton, Qt.KeyboardModifier.ControlModifier,
+            Qt.ScrollPhase.NoScrollPhase, False,
+        )
+        QApplication.sendEvent(win._browser.viewport(), wheel)
+        for _ in range(3):
+            app.processEvents()
+        after = win._browser.cursorForPosition(win._browser.viewport().rect().topLeft()).block().blockNumber()
+        check("zoom keeps the top section in place", abs(after - before) <= 1, True)
         win.close()
         app.processEvents()
 

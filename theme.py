@@ -40,8 +40,9 @@ SUCCESS = "#7fd8a8"
 MARK_BG = "#5c4a17"     # ==highlighted==
 MARK_TEXT = "#ffe9a8"
 SELECTION = "#2f5f9e"   # generic selection (find hits, line edits)
-# Selection is colour-coded per pane so it is obvious where the highlight lives:
-# warm orange in the rendered preview, teal in the markdown source.
+# Selection is colour-coded by the pane it started in, and the mirror in the
+# other pane keeps that colour (mutual highlighting): pick in the preview and
+# both panes show warm orange; pick in the markdown source and both show teal.
 PREVIEW_SELECTION = "#b5712a"
 EDITOR_SELECTION = "#2f8f8f"
 SCROLL_HANDLE = "#3d3d3d"
@@ -135,7 +136,7 @@ h5, h6 {{
 }}
 h1 + p, h2 + p, h3 + p, h4 + p {{ margin-top: 0; }}
 
-p {{ margin-top: 12px; margin-bottom: 12px; }}
+p {{ margin-top: 18px; margin-bottom: 18px; }}
 
 a {{
     color: {ACCENT};
@@ -180,33 +181,35 @@ code {{
     color: {CODE_INLINE_TEXT};
     background-color: {CODE_INLINE_BG};
 }}
-pre {{
+
+/* Code cards. `text-indent` is the only inset Qt honours on a block (padding is
+   ignored), so it stands in for the left padding; the vertical breathing room
+   comes from the line-height leading. Do NOT wrap the code in a table: Qt's
+   hit-testing inside a multi-line cell is broken, so clicking one code line
+   selected from the bottom of the card. */
+p.code-lang {{
+    background-color: {CODE_BG};
+    color: {TEXT_MUTED};
+    font-family: {SANS};
+    font-size: 11px;
+    line-height: 150%;
+    margin-top: 16px;
+    margin-bottom: 0;
+    text-indent: 14px;
+}}
+
+pre.code-body {{
     font-family: {MONO};
     font-size: 0.9em;
     line-height: 158%;
     color: {CODE_TEXT};
     background-color: {CODE_BG};
     white-space: pre-wrap;
-    margin-top: 0;
-    margin-bottom: 0;
+    margin-top: 16px;
+    margin-bottom: 16px;
+    text-indent: 14px;
 }}
-pre code {{
-    font-size: 1em;
-    color: {CODE_TEXT};
-    background-color: transparent;
-}}
-
-/* code cards: one-cell tables give real inner padding (blocks have none) */
-table.code {{ margin-top: 16px; margin-bottom: 16px; }}
-table.code td {{ background-color: {CODE_BG}; border: none; }}
-table.code td.code-lang {{
-    background-color: {CODE_BG};
-    color: {TEXT_MUTED};
-    font-family: {SANS};
-    font-size: 11px;
-    line-height: 130%;
-}}
-table.code td.code-body {{ color: {CODE_TEXT}; }}
+pre.code-body.has-lang {{ margin-top: 0; }}
 
 table.md {{ margin-top: 16px; margin-bottom: 16px; }}
 table.md th {{

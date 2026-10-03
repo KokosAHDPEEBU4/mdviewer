@@ -67,21 +67,20 @@ _TASK_OPEN, _TASK_DONE = '<span class="task-box">&#9744;</span> ', (
 
 
 def _code_block(lang: str | None, body: str) -> str:
-    """Fenced code -> single-cell table (real padding) + language caption."""
+    """Fenced code -> a card laid out with plain blocks.
+
+    It used to be a single-cell table so ``td`` padding would pad the code, but
+    Qt's hit-testing inside a multi-line table cell is broken: clicking between
+    two code lines jumps to the cell's *last* line, so selecting one word
+    selected from the bottom of the block. A plain ``<pre>`` hit-tests
+    correctly, and `text-indent` (which Qt honours, unlike `padding`) supplies
+    the left inset; the line-height leading acts as the vertical padding.
+    """
     label = f"{(lang or '').removeprefix('language-').strip()}"
-    head = (
-        f'<tr><td class="code-lang">{label}</td></tr>' if label else ""
-    )
-    inner = (
-        f'<pre><code class="{lang}">{body}</code></pre>'
-        if lang
-        else f"<pre>{body}</pre>"
-    )
-    return (
-        '<table class="code">'
-        f'{head}<tr><td class="code-body">{inner}</td></tr>'
-        "</table>"
-    )
+    caption = f'<p class="code-lang">{label}</p>' if label else ""
+    klass = "code-body has-lang" if label else "code-body"
+    code = f'<pre class="{klass}">{body}</pre>'
+    return caption + code
 
 
 def _checkbox(match: re.Match) -> str:

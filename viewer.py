@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSplitter,
     QTextBrowser,
+    QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -47,7 +48,9 @@ from renderer import Heading, render_with_outline
 from theme import (
     EDIT_SPLIT,
     EDIT_WIDTH,
+    EDITOR_SELECTION,
     MIN_COLUMN,
+    PREVIEW_SELECTION,
     SURFACE,
     TEXT_MUTED,
     TOC_MIN_WIDTH,
@@ -165,6 +168,7 @@ class ScrollIndicator(QWidget):
 
 class Viewer(QMainWindow):
     SCROLL_DEAD_ZONE = 12   # px the pointer must move before autoscroll kicks in
+    WHEEL_STEP = 40.0       # accumulated wheel units that make one zoom level
 
     def __init__(self, path: Path, settings: QSettings | None = None):
         super().__init__()
@@ -194,8 +198,14 @@ class Viewer(QMainWindow):
         self._dark_titled = False
         self._preview_width = 0      # preview width to preserve when editing
         self._outline: list[Heading] = []
+        self._history: list[Path] = []   # files visited before the current one
+        self._selected_section = None    # outline row the user last clicked
         self._edit_anchor = None     # label of the visible section when editing starts
+        self._edit_visible = ""      # text of the paragraph at the viewport top
+        self._edit_fraction = None   # how far into the section the viewport top is
+        self._preview_anchor = None  # preview character to keep pinned across relayout
         self._toc_syncing = False
+        self._wheel_accum = {}        # per-pane leftover wheel delta for smooth zoom
         # middle-click autoscroll: one pane at a time, tracked per pane
         self._autoscroll_pane = None
         self._autoscroll_origin = QPoint(0, 0)
@@ -209,10 +219,21 @@ class Viewer(QMainWindow):
 
         self._browser = QTextBrowser()
         self._browser.setFrameShape(QTextBrowser.Shape.NoFrame)
-        self._browser.setOpenExternalLinks(True)
+        # Let every click come through `anchorClicked`: Qt's own handling would
+        # either `setSource` the raw markdown (no styling) or hand the file to
+        # another program. We navigate inside the window instead.
+        self._browser.setOpenLinks(False)
+        self._browser.setOpenExternalLinks(False)
         self._browser.anchorClicked.connect(self._open_link)
-        self._browser.installEventFilter(self)  # Ctrl+wheel zooms the preview
+        self._browser.installEventFilter(self)
+        # wheel and mouse events are delivered to the viewport of a scroll area,
+        # not to the scroll area itself, so the filter has to sit there too:
+        # otherwise Qt's built-in Ctrl+wheel zoom moved the font behind our back
+        self._browser.viewport().installEventFilter(self)
+        self._browser.viewport().setMouseTracking(True)  # autoscroll follows the pointer
         self._browser.verticalScrollBar().valueChanged.connect(self._sync_outline)
+        self._browser.selectionChanged.connect(self._highlight_editor_from_preview)
+        self._preview_base_font = QFont(self._browser.document().defaultFont())
 
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
         self._splitter.setChildrenCollapsible(False)
@@ -226,6 +247,7 @@ class Viewer(QMainWindow):
         self.setCentralWidget(self._splitter)
 
         self._edit_btn = None
+        self._back_btn = None
         self._overlay = None
         self._find_bar = None
 
@@ -242,16 +264,19 @@ class Viewer(QMainWindow):
 
     # -- content ----------------------------------------------------------
 
-    def load(self) -> None:
+    def load(self) -> bool:
         if not self._confirm_discard():
-            return
+            return False
         self._text, self._encoding, self._newline = read_document(self._path)
+        self._clear_highlights()
+        self._selected_section = None  # the outline is rebuilt for this file
         self._render(self._text)
         self._baseline = _normalized(self._text)
         if self._editor is not None:
             self._editor.setPlainText(self._text)
             self._editor.document().setModified(False)
         self._update_state()
+        return True
 
     def _render(self, text: str) -> None:
         """Re-render the preview. Called only on load/convert/save, never on
@@ -262,6 +287,10 @@ class Viewer(QMainWindow):
         self._browser.document().setDefaultStyleSheet(content_css())
         html, self._outline = render_with_outline(text, self._path.parent)
         self._browser.setHtml(html)
+        # relative links (`other.md`, `#anchor`) resolve against the current
+        # file so the click handler can find the target on disk
+        self._browser.document().setBaseUrl(QUrl.fromLocalFile(str(self._path)))
+        self._apply_preview_zoom()  # setHtml resets the document font
         self._populate_outline()
         self._set_margins()
         self._browser.verticalScrollBar().setValue(0)
@@ -301,8 +330,11 @@ class Viewer(QMainWindow):
         self._toc.setUniformItemSizes(False)
         self._toc.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._toc.setMinimumWidth(TOC_MIN_WIDTH)
+        # long headings wrap onto the next line instead of being elided with "…"
+        self._toc.setWordWrap(True)
         self._toc.itemClicked.connect(self._outline_clicked)
-        self._toc.installEventFilter(self)  # Ctrl+wheel zooms the outline
+        self._toc.installEventFilter(self)
+        self._toc.viewport().installEventFilter(self)  # wheel lands on the viewport
         self._toc_base_font = self._toc.font()
         self._toc.setVisible(False)  # shown once a document has headings
         return self._toc
@@ -335,9 +367,32 @@ class Viewer(QMainWindow):
         self._set_outline_visible(not self._toc.isVisible())
 
     def _outline_clicked(self, item: QListWidgetItem) -> None:
+        self._selected_section = self._toc.row(item)
         anchor = item.data(Qt.ItemDataRole.UserRole)
         self._browser.scrollToAnchor(anchor)
         self._sync_outline()
+
+    def _remembered_section(self):
+        """Outline row the user last jumped to, while it is still on screen.
+
+        Relying only on the top viewport pixel dropped the reader into the
+        enclosing section when the wanted sub-heading sat a little below the
+        edge. The row the user picked (usually in the outline) is the stronger
+        signal; it is ignored once its heading has scrolled out of view.
+        """
+        if self._selected_section is None or not self._outline:
+            return None
+        if not 0 <= self._selected_section < len(self._outline):
+            return None
+        block = self._block_for_anchor(self._outline[self._selected_section].anchor)
+        if block is None:
+            return None
+        rect = self._browser.document().documentLayout().blockBoundingRect(block)
+        top = self._browser.verticalScrollBar().value()
+        bottom = top + self._browser.viewport().height()
+        if rect.bottom() >= top and rect.top() <= bottom:
+            return self._selected_section
+        return None
 
     def _current_section_index(self) -> int:
         """Index of the heading on screen, from a cursor at the top of the
@@ -408,9 +463,81 @@ class Viewer(QMainWindow):
         super().closeEvent(event)
 
     def _open_link(self, url: QUrl) -> None:
-        if url.isRelative():
+        """Route a link click: markdown files open in this window, everything
+        else goes to the system.
+
+        `setOpenLinks(False)` means this is the only place a click is handled,
+        so a linked ``.md`` is rendered with the full theme (Qt's fallback would
+        show it as plain text) and the visit is remembered for "Назад".
+        """
+        target = self._link_target(url)
+        if target is not None:
+            if target == self._path:
+                if url.hasFragment():  # an in-document anchor
+                    self._browser.scrollToAnchor(url.fragment())
+            elif not target.is_file():
+                return  # a broken local link: nothing sensible to open
+            elif self._viewable(target):
+                fragment = url.fragment()
+                self._navigate(target)
+                if fragment:  # e.g. other.md#section
+                    QTimer.singleShot(0, lambda: self._browser.scrollToAnchor(fragment))
+            else:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+            return
+        if url.hasFragment() and not url.path():
+            self._browser.scrollToAnchor(url.fragment())
             return
         QDesktopServices.openUrl(url)
+
+    def _link_target(self, url: QUrl) -> Path | None:
+        """Local path a link points at, or None for a remote/non-file URL."""
+        if url.isLocalFile():
+            return Path(url.toLocalFile())
+        if not url.scheme() and url.path():
+            return (self._path.parent / url.path()).resolve()
+        return None
+
+    @staticmethod
+    def _viewable(path: Path) -> bool:
+        return path.suffix.lower() in {".md", ".markdown", ".txt"}
+
+    # -- history (linked files, "Назад") ----------------------------------
+
+    def _navigate(self, path: Path) -> None:
+        """Open `path` in this window, remembering where we came from."""
+        target = Path(path).resolve()
+        if target == self._path:
+            return
+        previous = self._path
+        if not self._load_path(target):
+            return
+        self._history.append(previous)
+        self._update_nav()
+
+    def _go_back(self) -> None:
+        """Return to the previously visited file."""
+        if not self._history:
+            return
+        if not self._load_path(self._history[-1]):
+            return
+        self._history.pop()
+        self._update_nav()
+
+    def _load_path(self, path: Path) -> bool:
+        """Point the window at `path`; False and no change when the user cancels."""
+        previous = self._path
+        self._path = Path(path).resolve()
+        self.setWindowTitle(self._title(False))
+        if self.load():
+            return True
+        self._path = previous
+        self.setWindowTitle(self._title(False))
+        return False
+
+    def _update_nav(self) -> None:
+        if self._back_btn is not None:
+            self._back_btn.setEnabled(bool(self._history))
 
     # -- edit mode --------------------------------------------------------
 
@@ -461,7 +588,10 @@ class Viewer(QMainWindow):
         self._editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self._editor.setPlaceholderText("Исходный Markdown — как в блокноте")
         self._editor.textChanged.connect(self._update_state)
-        self._editor.installEventFilter(self)  # Ctrl+wheel zooms the editor
+        self._editor.installEventFilter(self)
+        self._editor.viewport().installEventFilter(self)  # wheel lands on the viewport
+        self._editor.viewport().setMouseTracking(True)  # autoscroll follows the pointer
+        self._editor.selectionChanged.connect(self._highlight_preview_from_editor)
         self._editor_base_font = self._editor.font()
         layout.addWidget(self._editor, 1)
 
@@ -481,10 +611,30 @@ class Viewer(QMainWindow):
 
     def _enter_edit(self) -> None:
         self._ensure_overlay()
-        # remember the section on screen *before* the layout changes below: the
-        # window resize re-wraps the preview, so re-reading the viewport after
-        # the resize would land on a different section
-        self._edit_anchor = self._current_section_label()
+        # the preview column shrinks a little when the editor opens (the window
+        # may be capped by the screen), which rewraps the whole document; pin the
+        # character at the top so the reader is not thrown to another section
+        self._preview_anchor = self._browser.cursorForPosition(
+            self._browser.viewport().rect().topLeft()
+        ).position()
+        QTimer.singleShot(200, self._clear_preview_anchor)
+        # remember the target *before* the layout changes below: the window
+        # resize re-wraps the preview, so re-reading the viewport after the
+        # resize would land elsewhere. A section the user picked in the outline
+        # wins over the section at the top pixel (see `_remembered_section`).
+        remembered = self._remembered_section()
+        if remembered is not None:
+            self._edit_anchor = self._outline[remembered].label
+            self._edit_visible = self._edit_anchor
+            self._edit_fraction = None
+        else:
+            self._edit_anchor = self._current_section_label()
+            # the section alone is too coarse: inside a long section the caret
+            # would jump to the heading. Capture the visible paragraph and how
+            # far into the section the viewport sits, so the editor opens on the
+            # same text.
+            self._edit_visible = self._visible_paragraph()
+            self._edit_fraction = self._section_fraction()
         # measure the preview before anything is added to the splitter: adding
         # the (still hidden) editor panel already hands it space
         self._preview_width = max(self._browser.width(), MIN_COLUMN)
@@ -513,28 +663,89 @@ class Viewer(QMainWindow):
 
         self._edit_btn.setText("Выйти из правки")
         self._editor.setFocus()
-        self._set_editor_zoom(self._editor_zoom)
+        # open the source at the same zoom the preview is at right now
+        self._set_editor_zoom(self._zoom)
         self._move_editor_to_preview()
         self._update_hits(self._find_edit.text())  # search now targets the editor
+        self._highlight_editor_from_preview()  # keep an existing preview selection in view
         self._show_overlay()  # move it over the (now narrower) preview at once
         self._update_state()
 
-    def _move_editor_to_preview(self) -> None:
-        """Put the editor caret on the section the preview was showing.
+    def _visible_paragraph(self) -> str:
+        """Rendered text of the paragraph at the top of the preview viewport."""
+        corner = self._browser.viewport().rect().topLeft()
+        return self._browser.cursorForPosition(corner).block().text().strip()
 
-        The label is captured in `_enter_edit` before the window resizes; a
-        plain `find(label)` would fail anyway because the label has markdown
-        markup stripped (`` `app/main.py` `` becomes ``app/main.py``), so each
-        heading line is normalised before comparing.
+    def _section_fraction(self):
+        """How far the viewport top is into the current section (0..1).
+
+        Markdown and HTML do not share offsets, but the *relative* position
+        within a section is comparable: it is used to land the caret near the
+        same place when the visible paragraph cannot be matched by text.
         """
-        label = self._edit_anchor
-        if not label:
-            self._editor.moveCursor(QTextCursor.MoveOperation.Start)
-            return
-        block = self._find_heading_block(label)
+        if not self._outline:
+            return None
+        index = self._current_section_index()
+        first = self._block_for_anchor(self._outline[index].anchor)
+        if first is None:
+            return None
+        layout = self._browser.document().documentLayout()
+        top = layout.blockBoundingRect(first).top()
+        if index + 1 < len(self._outline):
+            following = self._block_for_anchor(self._outline[index + 1].anchor)
+        else:
+            following = None
+        bottom = (
+            layout.blockBoundingRect(following).top()
+            if following is not None
+            else self._browser.document().size().height()
+        )
+        scroll = self._browser.verticalScrollBar().value()
+        span = max(1.0, float(bottom - top))
+        return max(0.0, min(1.0, (scroll - top) / span))
+
+    def _block_for_anchor(self, anchor: str):
+        """Block carrying the heading anchor `md-hN`, or None."""
+        block = self._browser.document().begin()
+        while block.isValid():
+            fragment = block.begin()
+            while fragment != block.end():
+                piece = fragment.fragment()
+                if piece.isValid() and anchor in piece.charFormat().anchorNames():
+                    return block
+                fragment += 1
+            block = block.next()
+        return None
+
+    def _move_editor_to_preview(self) -> None:
+        """Put the editor caret on the paragraph the preview was showing.
+
+        The exact section is captured in `_enter_edit` before the window
+        resizes. The visible paragraph is matched first (markdown markup and
+        wraplines make the raw lines differ), then the section heading, then the
+        relative position inside the section.
+        """
+        block = None
+        if self._edit_visible:
+            block = self._find_block_by_text(self._edit_visible)
+        if block is None and self._edit_anchor:
+            block = self._find_heading_block(self._edit_anchor)
+        if block is None:
+            block = self._find_block_at_fraction()
         if block is not None:
             self._editor.setTextCursor(QTextCursor(block))
+            # `centerCursor` forces the editor to lay out, so `cursorRect` is
+            # valid; only then can the target be lifted to the top. Reading
+            # `blockBoundingRect` straight after `setPlainText` returns 0 (the
+            # editor is not laid out yet), which parked the view on line 1.
+            # The vertical scrollbar counts *lines*, `cursorRect` is pixels, so
+            # the offset is divided by the line height before scrolling.
             self._editor.centerCursor()
+            line_height = max(1, self._editor.fontMetrics().lineSpacing())
+            delta = round(self._editor.cursorRect().top() / line_height)
+            bar = self._editor.verticalScrollBar()
+            if delta > 0:
+                bar.setValue(bar.value() + delta)
         else:
             self._editor.moveCursor(QTextCursor.MoveOperation.Start)
 
@@ -545,6 +756,77 @@ class Viewer(QMainWindow):
         for char in ("`", "*", "_", "[", "]", "\\"):
             stripped = stripped.replace(char, "")
         return re.sub(r"\s+", " ", stripped).strip()
+
+    @staticmethod
+    def _plain_key(text: str) -> str:
+        """Source line reduced to its visible text: markup and links removed,
+        whitespace collapsed. Lets a preview paragraph match its source line."""
+        stripped = text.strip()
+        stripped = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", stripped)
+        stripped = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", stripped)
+        stripped = re.sub(r"^(#{1,6}\s+|>\s*|[-*+]\s+|\d+\.\s+)", "", stripped)
+        stripped = re.sub(r"`([^`]*)`", r"\1", stripped)
+        stripped = re.sub(r"(\*\*|__)(.+?)\1", r"\2", stripped)
+        stripped = re.sub(r"(\*|_)(.+?)\1", r"\2", stripped)
+        for char in ("`", "*", "_", "[", "]", "\\", "|", "#", ">"):
+            stripped = stripped.replace(char, "")
+        return re.sub(r"\s+", " ", stripped).strip()
+
+    def _section_blocks(self):
+        """Editor blocks of the captured section, heading included.
+
+        Scoping the text search to the section stops an identical paragraph in
+        a later section from matching before the one that is actually on screen.
+        """
+        if not self._edit_anchor:
+            blocks = []
+            block = self._editor.document().begin()
+            while block.isValid():
+                blocks.append(block)
+                block = block.next()
+            return blocks
+        start = self._find_heading_block(self._edit_anchor)
+        if start is None:
+            return []
+        blocks = []
+        block = start
+        while block.isValid():
+            if block is not start and block.text().lstrip().startswith("#"):
+                break
+            blocks.append(block)
+            block = block.next()
+        return blocks
+
+    def _find_block_by_text(self, text: str):
+        """Block whose visible text matches the preview paragraph.
+
+        Exact match first; then a prefix match, because the preview merges
+        wrapped source lines and drops markup, so the two sides rarely agree
+        word for word.
+        """
+        want = self._plain_key(text)
+        if len(want) < 2:
+            return None
+        blocks = self._section_blocks()
+        for block in blocks:
+            if self._plain_key(block.text()) == want:
+                return block
+        if len(want) >= 6:
+            for block in blocks:
+                key = self._plain_key(block.text())
+                if len(key) >= 6 and (key.startswith(want[:32]) or want.startswith(key[:32])):
+                    return block
+        return None
+
+    def _find_block_at_fraction(self):
+        """Block at roughly `_edit_fraction` into the captured section."""
+        if self._edit_fraction is None or not self._edit_anchor:
+            return None
+        lines = self._section_blocks()
+        if not lines:
+            return None
+        index = int(round(self._edit_fraction * (len(lines) - 1)))
+        return lines[index]
 
     def _find_heading_block(self, label: str):
         """Block whose heading text matches `label` (markup ignored)."""
@@ -557,12 +839,60 @@ class Viewer(QMainWindow):
             block = block.next()
         return None
 
+    # -- mutual selection highlighting ------------------------------------
+
+    def _highlight_editor_from_preview(self) -> None:
+        """Mirror the preview selection into the editor (same colour)."""
+        if self._editor is None:  # read mode: the editor does not exist yet
+            return
+        text = self._browser.textCursor().selectedText()
+        self._highlight_in(self._editor, text, PREVIEW_SELECTION)
+
+    def _highlight_preview_from_editor(self) -> None:
+        """Mirror the editor selection into the preview (same colour)."""
+        text = self._editor.textCursor().selectedText()
+        self._highlight_in(self._browser, text, EDITOR_SELECTION)
+
+    def _clear_highlights(self) -> None:
+        self._browser.setExtraSelections([])
+        if self._editor is not None:
+            self._editor.setExtraSelections([])
+
+    @staticmethod
+    def _collapse(text: str) -> str:
+        """Whitespace is collapsed on the HTML side, so collapse both sides."""
+        return re.sub(r"\s+", " ", text.replace("\u2029", " ")).strip()
+
+    def _highlight_in(self, target, text: str, colour: str) -> None:
+        """Highlight the same text in `target` without moving its caret.
+
+        Best-effort: HTML strips markup and collapses whitespace, so a fragment
+        copied from one pane may not exist verbatim in the other; then the
+        highlight is simply dropped.
+        """
+        needle = self._collapse(text)
+        if len(needle) < 2:
+            target.setExtraSelections([])
+            return
+        pattern = QRegularExpression(QRegularExpression.escape(needle).replace("\\ ", r"\s+"))
+        cursor = target.document().find(pattern)
+        if cursor.isNull():
+            target.setExtraSelections([])
+            return
+        selection = QTextEdit.ExtraSelection()
+        selection.cursor = cursor
+        selection.format.setBackground(QColor(colour))
+        selection.format.setForeground(QColor("#ffffff"))
+        target.setExtraSelections([selection])
+
     def _leave_edit(self) -> None:
         if not self._confirm_discard():
             return
         self._ensure_overlay()
+        self._preview_anchor = None  # entering-edit pin must not outlive the edit
         self._edit_mode = False
         self._panel.setVisible(False)
+        self._clear_highlights()  # the editor is gone; drop its mirror
         self._apply_split()
         QTimer.singleShot(0, self._set_margins)
         if _normalized(self._text) != self._rendered:
@@ -604,6 +934,17 @@ class Viewer(QMainWindow):
         # has its real size, lay it out again with the absolute numbers
         QTimer.singleShot(0, self._apply_split_settled)
         QTimer.singleShot(0, self._set_margins)
+        # keep the reader where they were: the column width (and the viewport
+        # margins) just changed, so a table-heavy document rewraps and the same
+        # scroll pixel lands on a different section. Runs after `_set_margins`.
+        QTimer.singleShot(0, self._restore_preview_anchor)
+
+    def _restore_preview_anchor(self) -> None:
+        if self._preview_anchor is not None:
+            self._scroll_preview_to(self._preview_anchor)
+
+    def _clear_preview_anchor(self) -> None:
+        self._preview_anchor = None
 
     def _apply_split_settled(self) -> None:
         total = self._splitter.width()
@@ -737,6 +1078,11 @@ class Viewer(QMainWindow):
         row.setContentsMargins(10, 6, 10, 6)
         row.setSpacing(4)
 
+        self._back_btn = QToolButton()
+        self._back_btn.setText("←")
+        self._back_btn.clicked.connect(self._go_back)
+        self._back_btn.setEnabled(bool(self._history))
+
         self._toc_btn = QToolButton()
         self._toc_btn.setText("☰")
         self._toc_btn.clicked.connect(self._toggle_outline)
@@ -762,6 +1108,7 @@ class Viewer(QMainWindow):
         zoom_in.clicked.connect(lambda: self._set_zoom(self._zoom + 1))
 
         for widget in (
+            self._back_btn,
             self._toc_btn,
             self._edit_btn,
             self._find_bar,
@@ -796,37 +1143,76 @@ class Viewer(QMainWindow):
         super().enterEvent(event)
         self._show_overlay()
 
+    def _pane_for(self, obj):
+        """The pane a filtered object belongs to (the widget or its viewport)."""
+        if obj is self._browser or obj is self._browser.viewport():
+            return self._browser
+        if obj is self._toc or obj is self._toc.viewport():
+            return self._toc
+        if self._editor is not None and (obj is self._editor or obj is self._editor.viewport()):
+            return self._editor
+        return None
+
     def eventFilter(self, obj, event):
         """Per-pane chrome: Ctrl+wheel zooms, middle-click autoscrolls.
 
-        Autoscroll is tracked separately for the preview and the editor, so
-        starting it in one never moves the other.
+        The filter is installed on both the pane and its viewport: a scroll area
+        delivers wheel and mouse events to the viewport, so filtering only the
+        widget would let Qt's built-in Ctrl+wheel zoom run unnoticed (then the
+        font moved but `_zoom` and the label stayed at 100%). Autoscroll is
+        tracked separately per pane, so starting it in one never moves the other.
         """
+        pane = self._pane_for(obj)
+        if pane is None:
+            return super().eventFilter(obj, event)
         etype = event.type()
-        if obj in (self._browser, self._editor):
+        if pane in (self._browser, self._editor):
             if etype == QEvent.Type.Wheel:
                 if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                    up = event.angleDelta().y() > 0
-                    if obj is self._editor:
-                        self._set_editor_zoom(self._editor_zoom + (1 if up else -1))
-                    else:
-                        self._set_zoom(self._zoom + (1 if up else -1))
+                    self._wheel_zoom(pane, event)
                     return True
                 self._stop_autoscroll()
             elif etype == QEvent.Type.MouseButtonPress:
                 if event.button() == Qt.MouseButton.MiddleButton:
-                    self._start_autoscroll(obj, event.position().toPoint())
+                    self._start_autoscroll(pane, event.position().toPoint())
                     return True
                 self._stop_autoscroll()
-            elif etype == QEvent.Type.MouseMove and self._autoscroll_pane is obj:
+            elif etype == QEvent.Type.MouseMove and self._autoscroll_pane is pane:
                 self._move_autoscroll(event.position().toPoint())
                 return True
-        elif obj is self._toc and etype == QEvent.Type.Wheel:
+        elif pane is self._toc and etype == QEvent.Type.Wheel:
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                up = event.angleDelta().y() > 0
-                self._set_toc_zoom(self._toc_zoom + (1 if up else -1))
+                self._wheel_zoom(self._toc, event)
                 return True
         return super().eventFilter(obj, event)
+
+    # -- zoom (shared by wheel, buttons and shortcuts) ---------------------
+
+    def _wheel_delta(self, event) -> float:
+        """Wheel movement as a signed amount in `WHEEL_STEP` units.
+
+        Trackpads report a fine `pixelDelta`; a mouse wheel reports `angleDelta`
+        in eighths of a degree (120 per notch). Normalising both keeps the zoom
+        responsive and even, instead of one level per event.
+        """
+        delta = event.pixelDelta().y()
+        if delta:
+            return float(delta)
+        return event.angleDelta().y() / 120.0 * self.WHEEL_STEP
+
+    def _wheel_zoom(self, pane, event) -> None:
+        """Zoom `pane` by whole levels, carrying the rest to the next event."""
+        accum = self._wheel_accum.get(pane, 0.0) + self._wheel_delta(event)
+        step = int(accum / self.WHEEL_STEP)
+        self._wheel_accum[pane] = accum - step * self.WHEEL_STEP
+        if not step:
+            return
+        if pane is self._editor:
+            self._set_editor_zoom(self._editor_zoom + step)
+        elif pane is self._toc:
+            self._set_toc_zoom(self._toc_zoom + step)
+        else:
+            self._set_zoom(self._zoom + step)
 
     # -- middle-click autoscroll ------------------------------------------
 
@@ -973,6 +1359,7 @@ class Viewer(QMainWindow):
             "F5": self.load,
             "Ctrl+R": self.load,
             "Ctrl+O": self._open_file,
+            "Alt+Left": self._go_back,
             "Ctrl+E": self._toggle_edit,
             "Ctrl+B": self._toggle_outline,
             "Ctrl+Return": self._convert,
@@ -998,13 +1385,48 @@ class Viewer(QMainWindow):
             self._set_zoom(target)
 
     def _set_zoom(self, level: int) -> None:
-        """Preview zoom only; the editor has its own (`_set_editor_zoom`)."""
-        level = max(-8, min(20, level))
-        delta = level - self._zoom
-        for _ in range(abs(delta)):
-            self._browser.zoomIn(1 if delta > 0 else -1)
-        self._zoom = level
+        """Preview zoom only; scale the document font, not `zoomIn/Out`.
+
+        `zoomIn` multiplies the current size, so repeated steps drift and
+        "100%" never returns to the real base. Scaling from the saved base font
+        keeps every level exact.
+
+        The font change rewraps the document, so the same scrollbar pixel value
+        would now point at different text and the view appeared to scroll. The
+        character at the top of the viewport is captured first and re-pinned
+        after the relayout, so zooming keeps the reader in place.
+        """
+        anchor = self._browser.cursorForPosition(
+            self._browser.viewport().rect().topLeft()
+        ).position()
+        self._zoom = max(-8, min(20, level))
+        self._apply_preview_zoom()
         self._update_zoom_label()
+        self._scroll_preview_to(anchor)
+
+    def _scroll_preview_to(self, position: int) -> None:
+        """Scroll the preview so document `position` sits at the viewport top."""
+        document = self._browser.document()
+        cursor = QTextCursor(document)
+        cursor.setPosition(position)
+        block = cursor.block()
+        offset = 0.0
+        layout = block.layout()
+        if layout is not None:
+            line = layout.lineForTextPosition(cursor.positionInBlock())
+            if line.isValid():
+                offset = line.y()
+        top = document.documentLayout().blockBoundingRect(block).top()
+        self._browser.verticalScrollBar().setValue(max(0, round(top + offset)))
+
+    def _apply_preview_zoom(self) -> None:
+        if self._preview_base_font is None:
+            return
+        font = QFont(self._preview_base_font)  # QFont is mutable: copy it
+        if self._zoom:
+            size = font.pointSizeF() * (1.0 + 0.1 * self._zoom)
+            font.setPointSizeF(max(6.0, size))
+        self._browser.document().setDefaultFont(font)
 
     def _update_zoom_label(self) -> None:
         if self._zoom_label is None:
@@ -1054,6 +1476,4 @@ class Viewer(QMainWindow):
         )
         if not name:
             return
-        self._path = Path(name).resolve()
-        self.setWindowTitle(self._title(False))
-        self.load()
+        self._navigate(Path(name))
