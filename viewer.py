@@ -1964,6 +1964,24 @@ TAB_MIME = "application/x-mdviewer-tab"
 # plain base `QMimeData` wrapper, dropping the Python subclass and its `.view`.
 _DRAG_VIEW: DocumentView | None = None
 
+# Live `MainWindow`s, in creation order. The session snapshot concatenates the
+# tabs of every registered window; a window registers itself in `__init__` and
+# is dropped in `closeEvent` (before its `deleteLater` runs, so a torn-off or
+# merged window never leaves a dangling entry behind).
+_WINDOWS: list["MainWindow"] = []
+
+
+def _live_windows() -> list["MainWindow"]:
+    """Registered windows whose C++ object has not been destroyed yet."""
+    live = []
+    for window in _WINDOWS:
+        try:
+            if window._tabs is not None:
+                live.append(window)
+        except RuntimeError:
+            continue
+    return live
+
 
 class _TabMimeData(QMimeData):
     """Drag payload: the `DocumentView` being moved between tab bars.
@@ -2158,6 +2176,7 @@ class MainWindow(QMainWindow):
         object.__setattr__(self, "_tabs", tabs)
         self.setCentralWidget(tabs)
         self._build_window_shortcuts()
+        _WINDOWS.append(self)  # two windows exist after tear-off / merge
 
     # -- compatibility: the window proxies the current document ------------
 
@@ -2214,6 +2233,7 @@ class MainWindow(QMainWindow):
         self._tabs.setTabToolTip(index, str(view._path))
         self._tabs.setCurrentIndex(index)
         self._on_current_changed(self._tabs.currentIndex())
+        self._save_session()
         return view
 
     # -- tear-off / merge --------------------------------------------------
@@ -2324,6 +2344,7 @@ class MainWindow(QMainWindow):
             return
         self._tabs.removeTab(index)
         view.deleteLater()
+        self._save_session()
         if self._tabs.count() == 0:
             self.close()
 
@@ -2369,6 +2390,61 @@ class MainWindow(QMainWindow):
         """Remember the user's tab order (restoring it is a later stage)."""
         order = [str(self._tabs.widget(i)._path) for i in range(self._tabs.count())]
         self._settings.setValue("tab_order", order)
+        self._save_session()
+
+    # -- session save / restore -------------------------------------------
+
+    def _save_session(self, settings: QSettings | None = None) -> None:
+        """Snapshot every open window's tabs when session restore is enabled.
+
+        The snapshot is the concatenation of the registered windows' tabs in
+        registry (creation) order; only files that still exist are kept. The
+        recorded active tab is the current tab of the window that was last
+        active (`QApplication.activeWindow()`), falling back to the last
+        registered window when no window reports itself active — a simple,
+        deterministic rule that works headless too.
+        """
+        settings = settings or self._settings
+        if not settings.value("restore_session", False, type=bool):
+            return
+        windows = _live_windows()
+        active_window = QApplication.activeWindow()
+        chosen = active_window if active_window in windows else (windows[-1] if windows else None)
+        paths: list[str] = []
+        active = ""
+        for window in windows:
+            for index in range(window._tabs.count()):
+                view = window._tabs.widget(index)
+                if view is None:
+                    continue
+                path = Path(view._path)
+                if not path.is_file():
+                    continue
+                paths.append(str(path))
+                if window is chosen and index == window._tabs.currentIndex():
+                    active = str(path)
+        settings.setValue("session_paths", paths)
+        settings.setValue("session_active", active)
+
+    def _restore_session(self) -> bool:
+        """Reopen the tabs of the saved session; returns True if any opened.
+
+        `session_active` (if it is among the reopened files) becomes the current
+        tab. Missing files are skipped, so a stale snapshot degrades gracefully.
+        """
+        settings = self._settings
+        raw = settings.value("session_paths", [], type=list) or []
+        active = settings.value("session_active", "", type=str) or ""
+        paths = [Path(item) for item in raw if Path(item).is_file()]
+        if not paths:
+            return False
+        self._open_paths(paths)
+        if active:
+            index = self._find_tab(Path(active))
+            if index >= 0:
+                self._tabs.setCurrentIndex(index)
+        self._save_session()
+        return self._tabs.count() > 0
 
     # -- window chrome -----------------------------------------------------
 
@@ -2430,6 +2506,18 @@ class MainWindow(QMainWindow):
             self._settings.setValue("geometry", self.saveGeometry())
         if view is not None:
             self._settings.setValue("last_dir", str(view._path.parent))
+        # Session bookkeeping. When other windows stay open, this one leaves the
+        # session (it is being closed on purpose). When it is the last window,
+        # the app is quitting, so its tabs are kept in the snapshot for the next
+        # launch before the entry is dropped.
+        if self in _WINDOWS:
+            remaining = [window for window in _live_windows() if window is not self]
+            if remaining:
+                _WINDOWS.remove(self)
+                self._save_session()
+            else:
+                self._save_session()
+                _WINDOWS.remove(self)
         super().closeEvent(event)
 
     def enterEvent(self, event):
