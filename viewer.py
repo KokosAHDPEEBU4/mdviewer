@@ -2043,6 +2043,46 @@ class TabBar(QTabBar):
             window._tear_off(view, QCursor.pos())
         return True
 
+    # -- accepting a tab dropped onto this bar -----------------------------
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat(TAB_MIME):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasFormat(TAB_MIME):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        if not event.mimeData().hasFormat(TAB_MIME):
+            super().dropEvent(event)
+            return
+        view = getattr(event.mimeData(), "view", None)
+        window = self._window
+        if view is None or window is None:
+            event.ignore()
+            return
+        source = view.window()
+        if source is window:
+            # same-window reorder is Qt's job; never hijack it with a drag
+            event.ignore()
+            return
+        index = self.tabAt(event.position().toPoint())
+        if isinstance(source, MainWindow):
+            source._take_view(view)
+        window._adopt_view(view, index)
+        if (
+            isinstance(source, MainWindow)
+            and source is not window
+            and source._tabs.count() == 0
+        ):
+            source.close()
+        event.acceptProposedAction()
+
 
 class MainWindow(QMainWindow):
     """The application shell: hosts a `QTabWidget`, one `DocumentView` per tab.
