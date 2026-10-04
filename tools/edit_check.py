@@ -193,6 +193,15 @@ def main() -> int:
         editor_layers = win._editor.extraSelections()
         check("editor colour wins after re-selecting", editor_layers[-1].format.background().color().name(), EDITOR_SELECTION)
         check("preview layer remains underneath", editor_layers[0].format.background().color().name(), PREVIEW_SELECTION)
+        # Qt paints the native selection over extraSelections, so the newest
+        # mirror is drawn by hand on top of the widget
+        check("panes draw a custom selection overlay",
+              callable(win._browser.overlay_painter), True)
+        mirror_cursor = win._browser.extraSelections()[-1].cursor
+        check("overlay computes rectangles to paint",
+              len(win._cursor_rects(win._browser, mirror_cursor)) > 0, True)
+        check("newest layer in the preview is the editor mirror",
+              win._hl_layers[win._browser][-1][0] is win._editor, True)
         win._clear_highlights()
         check("clearing drops both highlights",
               len(win._browser.extraSelections()) + len(win._editor.extraSelections()), 0)

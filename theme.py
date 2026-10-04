@@ -45,6 +45,9 @@ SELECTION = "#2f5f9e"   # generic selection (find hits, line edits)
 # both panes show warm orange; pick in the markdown source and both show teal.
 PREVIEW_SELECTION = "#b5712a"
 EDITOR_SELECTION = "#2f8f8f"
+# Qt paints the native selection *over* extraSelections, so a mirrored highlight
+# is drawn by hand on top of the widget; this alpha keeps the text readable.
+HL_OVERLAY_ALPHA = 130
 SCROLL_HANDLE = "#3d3d3d"
 SCROLL_HANDLE_HOVER = "#4d4d4d"
 

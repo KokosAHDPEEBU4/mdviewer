@@ -52,6 +52,7 @@ from theme import (
     EDITOR_PREF,
     EDITOR_SELECTION,
     HYST,
+    HL_OVERLAY_ALPHA,
     MIN_COLUMN,
     PREVIEW_HARD,
     PREVIEW_SELECTION,
@@ -175,6 +176,33 @@ def enable_dark_title_bar(widget) -> bool:
     return False
 
 
+class _OverlayMixin:
+    """Draws a custom overlay *after* the widget's own painting.
+
+    Qt paints the native selection **over** `extraSelections`, so a mirrored
+    highlight would sit under the pane's own selection and lose the "newest on
+    top" rule. Painting it by hand in `paintEvent`, after `super()`, puts it
+    genuinely on top. `overlay_painter` is `callable(widget, painter)`.
+    """
+
+    overlay_painter = None
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.overlay_painter is not None:
+            painter = QPainter(self.viewport())
+            self.overlay_painter(self, painter)
+            painter.end()
+
+
+class OverlayTextBrowser(_OverlayMixin, QTextBrowser):
+    pass
+
+
+class OverlayPlainTextEdit(_OverlayMixin, QPlainTextEdit):
+    pass
+
+
 class ScrollIndicator(QWidget):
     """The little anchor circle shown where a middle-click starts autoscroll.
 
@@ -282,7 +310,8 @@ class Viewer(QMainWindow):
         self.setWindowTitle(self._title(False))
         self.resize(1000, 800)
 
-        self._browser = QTextBrowser()
+        self._browser = OverlayTextBrowser()
+        self._browser.overlay_painter = self._paint_selection_overlay
         self._browser.setFrameShape(QTextBrowser.Shape.NoFrame)
         # Let every click come through `anchorClicked`: Qt's own handling would
         # either `setSource` the raw markdown (no styling) or hand the file to
@@ -699,7 +728,8 @@ class Viewer(QMainWindow):
             header.addWidget(widget)
         layout.addLayout(header)
 
-        self._editor = QPlainTextEdit()
+        self._editor = OverlayPlainTextEdit()
+        self._editor.overlay_painter = self._paint_selection_overlay
         self._editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self._editor.setMinimumWidth(EDITOR_HARD)  # hard floor, see theme metrics
         self._editor.setPlaceholderText("Исходный Markdown — как в блокноте")
@@ -992,8 +1022,18 @@ class Viewer(QMainWindow):
         if target is not None:
             cursors = self._mirror_cursors(source, target, text) if len(text) >= 2 else []
             self._set_hl_layer(target, source, cursors, colour)
-        own = [source.textCursor()] if len(text) >= 2 else []
+        own = self._own_cursors(source) if len(text) >= 2 else []
         self._set_hl_layer(source, source, own, colour)
+
+    def _own_cursors(self, source):
+        """The source's own selection, one cursor per block.
+
+        A single cursor crossing table cells is painted by Qt as a whole-cell
+        range and can cover the other pane's mirror; slicing per block keeps the
+        newest colour strictly on top.
+        """
+        cursor = source.textCursor()
+        return self._range_cursors(source, (cursor.selectionStart(), cursor.selectionEnd()))
 
     def _mirror_cursors(self, source, target, needle: str):
         """Extra-selection cursors for the same fragment in `target`.
@@ -1183,6 +1223,59 @@ class Viewer(QMainWindow):
         self._browser.setExtraSelections([])
         if self._editor is not None:
             self._editor.setExtraSelections([])
+
+    def _paint_selection_overlay(self, widget, painter) -> None:
+        """Draw the newest mirror on top of `widget` (Qt paints native over extra).
+
+        Only the mirror needs this: when the pane's own selection is newest it is
+        already the native one, painted above everything.
+        """
+        other = self._editor if widget is self._browser else self._browser
+        layers = self._hl_layers.get(widget, [])
+        if not layers or other is None:
+            return
+        owner, cursors, colour = layers[-1]
+        if owner is not other:
+            return
+        tint = QColor(colour)
+        tint.setAlpha(HL_OVERLAY_ALPHA)
+        for cursor in cursors:
+            for rect in self._cursor_rects(widget, cursor):
+                painter.fillRect(rect, tint)
+
+    @staticmethod
+    def _cursor_rects(widget, cursor):
+        """Viewport rectangles a cursor's selection covers (one per line)."""
+        document = widget.document()
+        start, end = cursor.selectionStart(), cursor.selectionEnd()
+        rects = []
+        block = document.findBlock(start)
+        while block.isValid() and block.position() < end:
+            layout = block.layout()
+            base = block.position()
+            if layout is not None:
+                for index in range(layout.lineCount()):
+                    line = layout.lineAt(index)
+                    line_start = base + line.textStart()
+                    line_end = line_start + line.textLength()
+                    segment_start = max(start, line_start)
+                    segment_end = min(end, line_end)
+                    if segment_end <= segment_start:
+                        continue
+                    first = QTextCursor(document)
+                    first.setPosition(segment_start)
+                    last = QTextCursor(document)
+                    last.setPosition(segment_end)
+                    left_rect = widget.cursorRect(first)
+                    right_rect = widget.cursorRect(last)
+                    left = min(left_rect.left(), right_rect.left())
+                    right = max(left_rect.left(), right_rect.left())
+                    top = min(left_rect.top(), right_rect.top())
+                    bottom = max(left_rect.bottom(), right_rect.bottom())
+                    if right > left and bottom > top:
+                        rects.append(QRect(left, top, right - left, bottom - top))
+            block = block.next()
+        return rects
 
     @staticmethod
     def _collapse(text: str) -> str:
