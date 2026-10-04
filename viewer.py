@@ -11,7 +11,17 @@ import ctypes
 import re
 import sys
 
-from PyQt6.QtCore import QEvent, QPoint, QRegularExpression, QRect, QSettings, QTimer, QUrl, Qt
+from PyQt6.QtCore import (
+    QEvent,
+    QPoint,
+    QRegularExpression,
+    QRect,
+    QSettings,
+    QTimer,
+    QUrl,
+    Qt,
+    pyqtSignal,
+)
 from PyQt6.QtGui import (
     QColor,
     QDesktopServices,
@@ -37,6 +47,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSplitter,
+    QTabWidget,
     QTextBrowser,
     QTextEdit,
     QToolButton,
@@ -251,10 +262,17 @@ class DocumentView(QWidget):
     SCROLL_DEAD_ZONE = 12   # px the pointer must move before autoscroll kicks in
     WHEEL_STEP = 40.0       # accumulated wheel units that make one zoom level
 
+    # `state_changed` fires whenever the dirty state may have moved (the tab
+    # label and the window title follow it); `link_requested` asks the host
+    # window to open a markdown link in a *new* tab (Ctrl/middle click).
+    state_changed = pyqtSignal()
+    link_requested = pyqtSignal(object)
+
     def __init__(self, path: Path, settings: QSettings | None = None):
         super().__init__()
         self._path = Path(path).resolve()
         self._settings = settings or QSettings()
+        self._unsaved = False
         self._side = -1
         self._zoom = 0
         self._editor_zoom = 0
@@ -580,14 +598,23 @@ class DocumentView(QWidget):
         finally:
             self._toc_syncing = False
 
-    def _open_link(self, url: QUrl) -> None:
+    def _open_link(self, url: QUrl, new_tab: bool | None = None) -> None:
         """Route a link click: markdown files open in this window, everything
         else goes to the system.
 
         `setOpenLinks(False)` means this is the only place a click is handled,
         so a linked ``.md`` is rendered with the full theme (Qt's fallback would
         show it as plain text) and the visit is remembered for "Назад".
+
+        Browser semantics: a plain click navigates *this* tab (history intact),
+        while Ctrl+click (or a middle click, handled in `eventFilter`) asks the
+        host window for a new tab. `anchorClicked` carries no modifier, so it is
+        read from `QApplication.keyboardModifiers()` at handling time.
         """
+        if new_tab is None:
+            new_tab = bool(
+                QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier
+            )
         target = self._link_target(url)
         if target is not None:
             if target == self._path:
@@ -596,6 +623,9 @@ class DocumentView(QWidget):
             elif not target.is_file():
                 return  # a broken local link: nothing sensible to open
             elif self._viewable(target):
+                if new_tab:
+                    self.link_requested.emit(target)
+                    return
                 fragment = url.fragment()
                 self._navigate(target)
                 if fragment:  # e.g. other.md#section
@@ -619,6 +649,20 @@ class DocumentView(QWidget):
     @staticmethod
     def _viewable(path: Path) -> bool:
         return path.suffix.lower() in {".md", ".markdown", ".txt"}
+
+    def _middle_click_link(self, viewport_point: QPoint) -> bool:
+        """Open the link under a middle click in a new tab. False when none.
+
+        `anchorClicked` is not emitted for the middle button, so the anchor is
+        looked up directly and resolved against the document's base URL (which
+        `_render` points at the current file).
+        """
+        anchor = self._browser.anchorAt(viewport_point)
+        if not anchor:
+            return False
+        url = self._browser.document().baseUrl().resolved(QUrl(anchor))
+        self._open_link(url, new_tab=True)
+        return True
 
     # -- history (linked files, "Назад") ----------------------------------
 
@@ -1397,15 +1441,13 @@ class DocumentView(QWidget):
         """The version is in the title on purpose: it tells builds apart when
         an old copy is still installed somewhere else.
 
-        The title belongs to MainWindow; when the view is not hosted in one
-        (legacy standalone use), fall back to the widget's own title.
+        The title belongs to the host window, which listens for `state_changed`
+        and only reflects the *active* tab's bullet. When this view is not
+        hosted (legacy standalone use), fall back to the widget's own title.
         """
         window = self.window()
-        if window is not self:
-            update = getattr(window, "_update_title", None)
-            if update is not None:
-                update(unsaved)
-                return
+        if window is not self and getattr(window, "_update_title", None) is not None:
+            return  # MainWindow decides from the active tab; see state_changed
         self.setWindowTitle(
             f"{self._path.name}{' •' if unsaved else ''} — {APP_NAME} {APP_VERSION}"
         )
@@ -1415,11 +1457,15 @@ class DocumentView(QWidget):
         editing = self._editing()
         text = self._editor.toPlainText() if editing else self._text
         unsaved = editing and text != self._baseline
-        self._update_window_title(unsaved)
+        self._unsaved = unsaved
         if self._convert_btn is not None:
             self._convert_btn.setEnabled(editing and text != self._rendered)
         if self._save_btn is not None:
             self._save_btn.setEnabled(unsaved)
+        # the host redraws the tab label and (if this is the active tab) the
+        # window title; it needs to know the moment the dirty state moved
+        self.state_changed.emit()
+        self._update_window_title(unsaved)
 
     def _handle_esc(self) -> None:
         if self._autoscroll_timer.isActive():
@@ -1589,6 +1635,10 @@ class DocumentView(QWidget):
                 self._stop_autoscroll()
             elif etype == QEvent.Type.MouseButtonPress:
                 if event.button() == Qt.MouseButton.MiddleButton:
+                    # a middle click over a link is a browser-style "open in a
+                    # new tab"; anywhere else it starts the autoscroll ring
+                    if pane is self._browser and self._middle_click_link(event.position().toPoint()):
+                        return True
                     self._start_autoscroll(pane, event.position().toPoint())
                     return True
                 self._stop_autoscroll()
@@ -1757,16 +1807,21 @@ class DocumentView(QWidget):
     # -- shortcuts --------------------------------------------------------
 
     def _build_shortcuts(self) -> None:
+        """Per-document shortcuts, active only while this view holds focus.
+
+        They use `WidgetWithChildrenShortcut` on purpose: two tabs would each
+        register the same key, and two `WindowShortcut`s on one key in a single
+        window make Qt fire `Ambiguous shortcut overload`. Scoping each set to
+        its own view keeps them unambiguous. Window-level keys (Ctrl+W/Q/O,
+        Ctrl+Tab, Ctrl+1..9) live on `MainWindow` instead.
+        """
         actions = {
-            "Ctrl+W": self._close_window,
-            "Ctrl+Q": self._close_window,
             "Esc": self._handle_esc,
             "Ctrl+F": self._toggle_find,
             "F3": self._find_next,
             "Shift+F3": lambda: self._find_next(backward=True),
             "F5": self.load,
             "Ctrl+R": self.load,
-            "Ctrl+O": self._open_file,
             "Alt+Left": self._go_back,
             "Ctrl+E": self._toggle_edit,
             "Ctrl+B": self._toggle_outline,
@@ -1778,13 +1833,12 @@ class DocumentView(QWidget):
             "Ctrl+0": lambda: self._zoom_step(0),
         }
         for keys, slot in actions.items():
-            QShortcut(QKeySequence(keys), self, slot)
+            shortcut = QShortcut(QKeySequence(keys), self, slot)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
 
-    def _close_window(self) -> None:
-        """Close the host window, not just this pane (Ctrl+W / Ctrl+Q)."""
-        window = self.window()
-        if window is not None:
-            window.close()
+    def _tab_title(self) -> str:
+        """Tab label: the file name, with a bullet while there are edits."""
+        return f"{self._path.name}{' •' if self._is_unsaved() else ''}"
 
     def _zoom_step(self, step: int) -> None:
         """Zoom the pane the user is working in. All three are independent."""
@@ -1882,6 +1936,11 @@ class DocumentView(QWidget):
         self._toc.setFont(font)
 
     def _open_file(self) -> None:
+        """The overlay's open button: ask the host for new tabs (Ctrl+O)."""
+        window = self.window()
+        if window is not self and getattr(window, "_open_files_dialog", None) is not None:
+            window._open_files_dialog()
+            return
         if not self._confirm_discard():
             return
         start = self._settings.value("last_dir", str(Path.home()))
@@ -1894,19 +1953,32 @@ class DocumentView(QWidget):
 
 
 class MainWindow(QMainWindow):
-    """The application shell: hosts one `DocumentView` and owns window chrome.
+    """The application shell: hosts a `QTabWidget`, one `DocumentView` per tab.
 
-    Window-level concerns (title, geometry, DWM dark caption, resize/close
-    handling) live here; everything about the document lives in `DocumentView`.
-    Unknown attributes are proxied to the current view so the existing tools
-    (which drive `viewer.Viewer` directly) keep working unchanged.
+    Window-level concerns (title, geometry, DWM dark caption, close handling,
+    Ctrl+W/Q/O, Ctrl+Tab and Ctrl+1..9) live here; everything about a document
+    lives in `DocumentView`. Unknown attributes are proxied to the *current*
+    view so the existing tools (which drive `viewer.Viewer` directly) keep
+    working unchanged.
+
+    Shortcuts are split by scope on purpose: per-document keys live in
+    `DocumentView` with `WidgetWithChildrenShortcut`, window keys here with the
+    default `WindowShortcut`. Two `WindowShortcut`s for the same key in one
+    window would fire Qt's `Ambiguous shortcut overload`.
     """
 
-    _OWN_ATTRS = {"_view", "_settings", "_view_geometry", "_dark_titled"}
+    _OWN_ATTRS = {
+        "_view",
+        "_tabs",
+        "_settings",
+        "_view_geometry",
+        "_dark_titled",
+    }
 
     def __init__(self, settings: QSettings | None = None):
         super().__init__()
         object.__setattr__(self, "_view", None)
+        object.__setattr__(self, "_tabs", None)
         object.__setattr__(self, "_settings", settings or QSettings())
         object.__setattr__(self, "_view_geometry", None)  # QByteArray (invariant 14)
         object.__setattr__(self, "_dark_titled", False)
@@ -1916,6 +1988,19 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(geometry)
         else:
             self.resize(1000, 800)
+
+        tabs = QTabWidget(self)
+        tabs.setTabsClosable(True)
+        tabs.setMovable(True)
+        tabs.setDocumentMode(True)
+        tabs.setCornerWidget(None)  # no "+" button: tabs come only from files
+        tabs.tabCloseRequested.connect(self._close_tab)
+        tabs.tabBar().tabMoved.connect(self._on_tab_moved)
+        tabs.tabBar().installEventFilter(self)  # middle click closes a tab
+        tabs.currentChanged.connect(self._on_current_changed)
+        object.__setattr__(self, "_tabs", tabs)
+        self.setCentralWidget(tabs)
+        self._build_window_shortcuts()
 
     # -- compatibility: the window proxies the current document ------------
 
@@ -1940,80 +2025,213 @@ class MainWindow(QMainWindow):
         """Kept on the window class: tools call `viewer.Viewer._match_pattern`."""
         return DocumentView._match_pattern(needle)
 
-    # -- documents ---------------------------------------------------------
+    def _current_view(self) -> DocumentView | None:
+        tabs = self._tabs
+        if tabs is not None:
+            widget = tabs.currentWidget()
+            if widget is not None:
+                return widget
+        return self._view
+
+    # -- documents / tabs --------------------------------------------------
+
+    def _find_tab(self, path: Path) -> int:
+        """Index of the tab already showing `path` (resolve()d), or -1."""
+        target = Path(path).resolve()
+        for index in range(self._tabs.count()):
+            view = self._tabs.widget(index)
+            if view is not None and view._path == target:
+                return index
+        return -1
+
+    def _add_tab(self, path: Path) -> DocumentView:
+        """Open `path` in a tab, or focus the tab that already shows it."""
+        index = self._find_tab(path)
+        if index >= 0:
+            self._tabs.setCurrentIndex(index)
+            return self._tabs.widget(index)
+        view = DocumentView(Path(path).resolve(), self._settings)
+        view.state_changed.connect(lambda v=view: self._on_view_state_changed(v))
+        view.link_requested.connect(self._add_tab)  # Ctrl/middle click -> new tab
+        index = self._tabs.addTab(view, view._tab_title())
+        self._tabs.setTabToolTip(index, str(view._path))
+        self._tabs.setCurrentIndex(index)
+        self._on_current_changed(self._tabs.currentIndex())
+        return view
+
+    def _open_paths(self, paths) -> None:
+        for path in paths:
+            path = Path(path)
+            if path.is_file():
+                self._add_tab(path)
 
     def open_document(self, path: Path) -> None:
-        """Open one markdown file (tabs are a later task)."""
-        view = DocumentView(path, self._settings)
-        self._view = view
-        self.setCentralWidget(view)
-        self._update_title(view._is_unsaved())
+        """Open one markdown file as a tab (or focus its existing tab)."""
+        self._add_tab(path)
+
+    def _open_files_dialog(self) -> None:
+        """Ctrl+O: pick one or more files, one tab each."""
+        start = self._settings.value("last_dir", str(Path.home()))
+        names, _ = QFileDialog.getOpenFileNames(
+            self, APP_NAME, start, "Markdown (*.md *.markdown *.txt);;All files (*)"
+        )
+        if not names:
+            return
+        self._settings.setValue("last_dir", str(Path(names[0]).parent))
+        self._open_paths([Path(name) for name in names])
+
+    # -- closing / switching ----------------------------------------------
+
+    def _close_tab(self, index: int) -> None:
+        """Close a tab, confirming unsaved edits; the last one closes the window."""
+        if self._tabs is None or index < 0:
+            return
+        view = self._tabs.widget(index)
+        if view is None:
+            return
+        if not view._confirm_discard():
+            return
+        self._tabs.removeTab(index)
+        view.deleteLater()
+        if self._tabs.count() == 0:
+            self.close()
+
+    def _close_current_tab(self) -> None:
+        if self._tabs.count() == 0:
+            self.close()
+            return
+        self._close_tab(self._tabs.currentIndex())
+
+    def _select_tab(self, index: int) -> None:
+        """Ctrl+1..9: jump to the n-th tab (no-op when it does not exist)."""
+        if 0 <= index < self._tabs.count():
+            self._tabs.setCurrentIndex(index)
+
+    def _cycle_tab(self, step: int) -> None:
+        """Ctrl+Tab / Ctrl+Shift+Tab: wrap around to the neighbour."""
+        count = self._tabs.count()
+        if count < 2:
+            return
+        self._tabs.setCurrentIndex((self._tabs.currentIndex() + step) % count)
+
+    def _on_current_changed(self, index: int) -> None:
+        view = self._tabs.widget(index) if self._tabs is not None else None
+        object.__setattr__(self, "_view", view)
+        self._update_title(view._is_unsaved() if view is not None else False)
+        if view is not None:
+            QTimer.singleShot(0, view._relayout)
+
+    def _on_view_state_changed(self, view: DocumentView) -> None:
+        """A tab's dirty state moved: refresh its label; title if it is active."""
+        self._refresh_tab(view)
+        if view is self._current_view():
+            self._update_title(view._is_unsaved())
+
+    def _refresh_tab(self, view: DocumentView) -> None:
+        index = self._tabs.indexOf(view)
+        if index < 0:
+            return
+        self._tabs.setTabText(index, view._tab_title())
+        self._tabs.setTabToolTip(index, str(view._path))
+
+    def _on_tab_moved(self, *_args) -> None:
+        """Remember the user's tab order (restoring it is a later stage)."""
+        order = [str(self._tabs.widget(i)._path) for i in range(self._tabs.count())]
+        self._settings.setValue("tab_order", order)
 
     # -- window chrome -----------------------------------------------------
 
     def _title(self, unsaved: bool) -> str:
         """The version is part of the title on purpose: it tells builds apart."""
-        name = self._view._path.name if self._view is not None else ""
+        view = self._tabs.currentWidget() if self._tabs is not None else None
+        name = view._path.name if view is not None else ""
         return f"{name}{' •' if unsaved else ''} — {APP_NAME} {APP_VERSION}"
 
     def _update_title(self, unsaved: bool) -> None:
         self.setWindowTitle(self._title(unsaved))
+
+    def _build_window_shortcuts(self) -> None:
+        """Window-level keys, created once for the whole window."""
+        actions = {
+            "Ctrl+W": self._close_current_tab,
+            "Ctrl+Q": self.close,
+            "Ctrl+O": self._open_files_dialog,
+            "Ctrl+Tab": lambda: self._cycle_tab(1),
+            "Ctrl+Shift+Tab": lambda: self._cycle_tab(-1),
+        }
+        for number in range(1, 10):
+            actions[f"Ctrl+{number}"] = lambda index=number - 1: self._select_tab(index)
+        for keys, slot in actions.items():
+            QShortcut(QKeySequence(keys), self, slot)
 
     def showEvent(self, event):
         super().showEvent(event)
         if not self._dark_titled:
             self._dark_titled = True
             enable_dark_title_bar(self)
-        if self._view is not None:
-            QTimer.singleShot(0, self._view._relayout)
+        view = self._current_view()
+        if view is not None:
+            QTimer.singleShot(0, view._relayout)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self._view is None:
+        view = self._current_view()
+        if view is None:
             return
-        self._view._set_margins()
-        overlay = self._view._overlay
+        view._set_margins()
+        overlay = view._overlay
         if overlay is not None and overlay.isVisible():
-            self._view._place_overlay()
+            view._place_overlay()
 
     def closeEvent(self, event):
-        view = self._view
-        if view is None:
-            super().closeEvent(event)
-            return
-        if not view._confirm_discard():
-            event.ignore()
-            return
+        # every tab must pass its unsaved check, not just the active one
+        for index in range(self._tabs.count()):
+            view = self._tabs.widget(index)
+            if view is not None and not view._confirm_discard():
+                event.ignore()
+                return
+        view = self._current_view()
         # Closing in edit mode must not remember the widened split window,
         # otherwise the next start looks wide but has no editor.
-        if view._editing() and self._view_geometry is not None:
+        if view is not None and view._editing() and self._view_geometry is not None:
             self._settings.setValue("geometry", self._view_geometry)
         else:
             self._settings.setValue("geometry", self.saveGeometry())
-        self._settings.setValue("last_dir", str(view._path.parent))
+        if view is not None:
+            self._settings.setValue("last_dir", str(view._path.parent))
         super().closeEvent(event)
 
     def enterEvent(self, event):
         super().enterEvent(event)
-        if self._view is not None:
-            self._view._show_overlay()
+        view = self._current_view()
+        if view is not None:
+            view._show_overlay()
 
     def leaveEvent(self, event):
         super().leaveEvent(event)
         # hide only when the pointer really left the window, not just the
         # central widget (the overlay itself counts as inside)
-        if (
-            not self.underMouse()
-            and self._view is not None
-            and self._view._overlay is not None
-        ):
-            self._view._overlay.setVisible(False)
+        view = self._current_view()
+        if view is not None and not self.underMouse() and view._overlay is not None:
+            view._overlay.setVisible(False)
 
     def eventFilter(self, obj, event):
-        """Route filter events to the view (tools call `win.eventFilter`)."""
-        if self._view is not None:
-            return self._view.eventFilter(obj, event)
+        """Tab-bar middle click, then route filter events to the current view."""
+        if (
+            self._tabs is not None
+            and obj is self._tabs.tabBar()
+            and event.type() == QEvent.Type.MouseButtonPress
+            and event.button() == Qt.MouseButton.MiddleButton
+        ):
+            index = self._tabs.tabBar().tabAt(event.position().toPoint())
+            if index >= 0:
+                self._close_tab(index)
+                return True
+        view = self._current_view()
+        if view is not None:
+            return view.eventFilter(obj, event)
         return super().eventFilter(obj, event)
+
 
 
 class Viewer(MainWindow):

@@ -248,6 +248,42 @@ APP_QSS = f"""
 QMainWindow {{
     background-color: {BG};
 }}
+/* Tabs follow the dark chrome: the bar sits on the window colour, the active
+   tab blends into the page while the others read as raised cards. */
+QTabWidget::pane {{
+    border: none;
+    background-color: {BG};
+}}
+QTabWidget::tab-bar {{
+    left: 0;
+}}
+QTabBar {{
+    background-color: {BG};
+    qproperty-drawBase: 0;
+}}
+QTabBar::tab {{
+    background-color: {SURFACE};
+    color: {TEXT_MUTED};
+    border: 1px solid {BORDER};
+    border-bottom: none;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    padding: 5px 12px;
+    margin-right: 2px;
+    min-width: 90px;
+}}
+QTabBar::tab:selected {{
+    background-color: {PAGE_BG};
+    color: {TEXT_HEAD};
+    border-color: {BORDER};
+}}
+QTabBar::tab:hover:!selected {{
+    background-color: {SURFACE_2};
+    color: {TEXT};
+}}
+QTabBar::close-button {{
+    subcontrol-position: right;
+}}
 /* The splitter handle is the pane divider: keep it wide enough to grab easily
    and light it up under the pointer so the movable edge is obvious. */
 QSplitter::handle {{

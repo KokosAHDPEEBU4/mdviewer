@@ -1,7 +1,7 @@
 ﻿"""MD Viewer вЂ” a fast, self-contained markdown viewer for Windows.
 
 Usage:
-    MDViewer [file.md ...]      open files (one window each)
+    MDViewer [file.md ...]      open files in tabs (one window)
     MDViewer --install-default  install + make the default handler for .md
     MDViewer --uninstall-default
 """
@@ -11,18 +11,18 @@ from pathlib import Path
 
 from PyQt6.QtCore import QSettings
 from PyQt6.QtGui import QIcon
-from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PyQt6.QtWidgets import QApplication, QMessageBox
 
 import winassoc
 from theme import APP_QSS
 from version import APP_NAME, APP_VERSION
-from viewer import Viewer
+from viewer import MainWindow
 
 ICON_PATH = Path(__file__).with_name("assets") / "icon.ico"
 
 USAGE = f"""\
 {APP_NAME} {APP_VERSION}
-  MDViewer [файл ...]            открыть markdown-файлы, каждому — своё окно
+  MDViewer [файл ...]            открыть markdown-файлы вкладками в одном окне
   MDViewer --install-default     установить и назначить обработчиком .md
   MDViewer --no-prompt           ... без диалога «Открыть с помощью»
   MDViewer --uninstall-default   удалить регистрацию
@@ -55,12 +55,20 @@ def main(argv: list[str]) -> int:
         files.append(Path(arg))
 
     app = create_app()
+    window = MainWindow(QSettings())
     paths = [path for path in files if path.is_file()]
-    if not files:
-        paths = ask_for_files(app, QSettings())
-    for path in paths:
-        Viewer(path).show()
-    return app.exec() if paths else 0
+    if paths:
+        window._open_paths(paths)
+        window.show()
+        return app.exec()
+    if files:
+        return 0  # CLI paths were given, but none of them is a file
+    # no paths on the command line: ask, and quit if the user picked nothing
+    window._open_files_dialog()
+    if window._tabs.count() == 0:
+        return 0
+    window.show()
+    return app.exec()
 
 
 def report(result: tuple[int, str]) -> int:
@@ -81,16 +89,8 @@ def create_app() -> QApplication:
     app.setOrganizationName("MDViewer")
     app.setWindowIcon(QIcon(str(ICON_PATH)))
     app.setStyleSheet(APP_QSS)
+    app.setQuitOnLastWindowClosed(True)  # closing the last tab closes the app
     return app
-
-
-def ask_for_files(app: QApplication, settings: QSettings) -> list[Path]:
-    start = settings.value("last_dir", str(Path.home()))
-    names, _ = QFileDialog.getOpenFileNames(
-        app, APP_NAME, start, "Markdown (*.md *.markdown *.txt);;All files (*)"
-    )
-    settings.setValue("last_dir", start)
-    return [Path(name) for name in names]
 
 
 if __name__ == "__main__":
