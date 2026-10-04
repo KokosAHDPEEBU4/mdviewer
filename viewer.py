@@ -1959,18 +1959,35 @@ class DocumentView(QWidget):
 
 TAB_MIME = "application/x-mdviewer-tab"
 
+# The tab currently being dragged. `QDrag` is synchronous and in-process, so a
+# module global is a reliable second channel: Qt may hand the drop handler a
+# plain base `QMimeData` wrapper, dropping the Python subclass and its `.view`.
+_DRAG_VIEW: DocumentView | None = None
+
 
 class _TabMimeData(QMimeData):
     """Drag payload: the `DocumentView` being moved between tab bars.
 
-    A plain module-level variable would work too (a drag is synchronous and
-    in-process), but a subclass keeps the pointer with the data the drop
-    handler actually receives.
+    The Python attribute is the primary channel; `_DRAG_VIEW` is the fallback
+    (see `_resolve_drag_view`), and `TAB_MIME` is always set as the token that
+    marks a drag as ours.
     """
 
     def __init__(self, view: "DocumentView | None" = None):
         super().__init__()
         self.view = view
+
+
+def _resolve_drag_view(mime) -> "DocumentView | None":
+    """The `DocumentView` a drop carries, tolerating a base `QMimeData` wrapper.
+
+    Prefers the payload's own `.view`; falls back to the global set by
+    `TabBar._start_drag`, which survives even when Qt loses the subclass.
+    """
+    view = getattr(mime, "view", None)
+    if view is None:
+        view = _DRAG_VIEW
+    return view
 
 
 class TabBar(QTabBar):
@@ -2019,6 +2036,7 @@ class TabBar(QTabBar):
         super().mouseReleaseEvent(event)
 
     def _start_drag(self) -> bool:
+        global _DRAG_VIEW
         window = self._window
         tabs = getattr(window, "_tabs", None)
         if window is None or tabs is None:
@@ -2033,9 +2051,13 @@ class TabBar(QTabBar):
         drag = QDrag(self)
         drag.setMimeData(mime)
         self._dragging = True
+        _DRAG_VIEW = view  # fallback channel while the drag is in flight
         try:
             result = drag.exec(Qt.DropAction.MoveAction)
         finally:
+            # clear before any post-drag action; `_tear_off` uses the local
+            # `view`, so the global never outlives the drag
+            _DRAG_VIEW = None
             self._dragging = False
         # no bar accepted the drop: the tab was let go outside every strip,
         # which is the tear-off gesture — give it a window at the pointer
@@ -2061,7 +2083,7 @@ class TabBar(QTabBar):
         if not event.mimeData().hasFormat(TAB_MIME):
             super().dropEvent(event)
             return
-        view = getattr(event.mimeData(), "view", None)
+        view = _resolve_drag_view(event.mimeData())
         window = self._window
         if view is None or window is None:
             event.ignore()
