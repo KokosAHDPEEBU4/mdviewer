@@ -12,7 +12,9 @@ import re
 import sys
 
 from PyQt6.QtCore import (
+    QByteArray,
     QEvent,
+    QMimeData,
     QPoint,
     QRegularExpression,
     QRect,
@@ -24,7 +26,9 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QColor,
+    QCursor,
     QDesktopServices,
+    QDrag,
     QFont,
     QGuiApplication,
     QKeySequence,
@@ -47,6 +51,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSplitter,
+    QTabBar,
     QTabWidget,
     QTextBrowser,
     QTextEdit,
@@ -1952,6 +1957,93 @@ class DocumentView(QWidget):
         self._navigate(Path(name))
 
 
+TAB_MIME = "application/x-mdviewer-tab"
+
+
+class _TabMimeData(QMimeData):
+    """Drag payload: the `DocumentView` being moved between tab bars.
+
+    A plain module-level variable would work too (a drag is synchronous and
+    in-process), but a subclass keeps the pointer with the data the drop
+    handler actually receives.
+    """
+
+    def __init__(self, view: "DocumentView | None" = None):
+        super().__init__()
+        self.view = view
+
+
+class TabBar(QTabBar):
+    """A tab bar that can tear a tab off and pull one in from another window.
+
+    Reordering *inside* the strip is left to Qt (`setMovable`): a `QDrag` is
+    started only once the pointer leaves the bar's rectangle, so the ordinary
+    "slide a tab sideways" gesture keeps working exactly as before.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._window = None
+        self._press_index = -1
+        self._press_pos = QPoint()
+        self._dragging = False
+        self.setAcceptDrops(True)
+
+    # -- dragging a tab out of the bar -------------------------------------
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press_index = self.tabAt(event.position().toPoint())
+            self._press_pos = event.position().toPoint()
+            self._dragging = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            not self._dragging
+            and self._press_index >= 0
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            pos = event.position().toPoint()
+            if not self.rect().contains(pos):
+                moved = (pos - self._press_pos).manhattanLength()
+                if moved >= QApplication.startDragDistance():
+                    if self._start_drag():
+                        return
+        # still over the strip: hand the move to Qt so it reorders the tab
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._press_index = -1
+        self._dragging = False
+        super().mouseReleaseEvent(event)
+
+    def _start_drag(self) -> bool:
+        window = self._window
+        tabs = getattr(window, "_tabs", None)
+        if window is None or tabs is None:
+            return False
+        if not 0 <= self._press_index < tabs.count():
+            return False
+        view = tabs.widget(self._press_index)
+        if view is None:
+            return False
+        mime = _TabMimeData(view)
+        mime.setData(TAB_MIME, QByteArray(b"tab"))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        self._dragging = True
+        try:
+            result = drag.exec(Qt.DropAction.MoveAction)
+        finally:
+            self._dragging = False
+        # no bar accepted the drop: the tab was let go outside every strip,
+        # which is the tear-off gesture — give it a window at the pointer
+        if result == Qt.DropAction.IgnoreAction:
+            window._tear_off(view, QCursor.pos())
+        return True
+
+
 class MainWindow(QMainWindow):
     """The application shell: hosts a `QTabWidget`, one `DocumentView` per tab.
 
@@ -1994,6 +2086,9 @@ class MainWindow(QMainWindow):
         tabs.setMovable(True)
         tabs.setDocumentMode(True)
         tabs.setCornerWidget(None)  # no "+" button: tabs come only from files
+        bar = TabBar(tabs)
+        bar._window = self
+        tabs.setTabBar(bar)  # tear-off + cross-window drops live in TabBar
         tabs.tabCloseRequested.connect(self._close_tab)
         tabs.tabBar().tabMoved.connect(self._on_tab_moved)
         tabs.tabBar().installEventFilter(self)  # middle click closes a tab
@@ -2058,6 +2153,80 @@ class MainWindow(QMainWindow):
         self._tabs.setCurrentIndex(index)
         self._on_current_changed(self._tabs.currentIndex())
         return view
+
+    # -- tear-off / merge --------------------------------------------------
+
+    def _take_view(self, view: DocumentView) -> bool:
+        """Detach a tab's widget from this window without deleting it.
+
+        `removeTab` alone leaves the page parented to the tab widget's internal
+        stack; `setParent(None)` fully detaches it so the receiving window can
+        adopt it cleanly.
+        """
+        index = self._tabs.indexOf(view)
+        if index < 0:
+            return False
+        self._tabs.removeTab(index)
+        view.setParent(None)
+        return True
+
+    def _adopt_view(self, view: DocumentView, index: int = -1) -> bool:
+        """Host an existing `DocumentView` (arriving from another window).
+
+        Signals were hooked to the previous window, so they are disconnected
+        and re-connected here; the widget itself is never recreated, therefore
+        all of its state (text, dirty, zoom, history, `_hl_layers`,
+        `_source_map`) travels along unchanged.
+
+        Returns False when the file is already open in this window (the
+        duplicate is deleted instead).
+        """
+        if view is None:
+            return False
+        target = Path(view._path).resolve()
+        for i in range(self._tabs.count()):
+            other = self._tabs.widget(i)
+            if (
+                other is not None
+                and other is not view
+                and Path(other._path).resolve() == target
+            ):
+                self._tabs.setCurrentIndex(i)
+                view.deleteLater()
+                return False
+        # a transferred view still carries the old host's slots; a view that
+        # has never been hosted has none of them, hence the guard
+        for signal in (view.state_changed, view.link_requested):
+            try:
+                signal.disconnect()
+            except TypeError:
+                pass
+        view.state_changed.connect(lambda v=view: self._on_view_state_changed(v))
+        view.link_requested.connect(self._add_tab)
+        view.setParent(self._tabs)
+        if 0 <= index <= self._tabs.count():
+            index = self._tabs.insertTab(index, view, view._tab_title())
+        else:
+            index = self._tabs.addTab(view, view._tab_title())
+        self._tabs.setTabToolTip(index, str(view._path))
+        self._tabs.setCurrentIndex(index)
+        self._on_current_changed(self._tabs.currentIndex())
+        self._on_tab_moved()
+        return True
+
+    def _tear_off(self, view: DocumentView, global_pos: QPoint) -> None:
+        """Move a tab into a fresh window placed at the pointer."""
+        if view is None or self._tabs.indexOf(view) < 0:
+            return
+        if not self._take_view(view):
+            return
+        new = MainWindow(self._settings)
+        new._adopt_view(view)
+        new.resize(self.size())
+        new.show()
+        new.move(global_pos.x() - 60, global_pos.y() - 20)
+        if self._tabs.count() == 0:
+            self.close()
 
     def _open_paths(self, paths) -> None:
         for path in paths:
