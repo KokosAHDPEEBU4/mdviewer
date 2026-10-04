@@ -15,6 +15,13 @@
   внешние ссылки открываются в браузере;
 - ссылки на другие `.md`/`.markdown`/`.txt` открываются в этом же окне с полным
   оформлением, кнопка «←» в панели (или `Alt+Left`) возвращает в предыдущий файл;
+  обычный клик навигирует текущую вкладку, `Ctrl`+клик (или средняя кнопка) —
+  открывает новую;
+- вкладки: одно окно держит несколько файлов, вкладки переставляются
+  перетаскиванием, вынимаются в отдельное окно и переносятся между окнами;
+  `Ctrl+O` открывает несколько файлов, `Ctrl+W` закрывает вкладку,
+  `Ctrl+Tab`/`Ctrl+1..9` переключают; восстановление прошлой сессии — по опции
+  (ПКМ по полосе вкладок или `--restore-session`, по умолчанию выключено);
 - поиск `Ctrl+F`, перезагрузка `F5`, масштаб `Ctrl`/`+`/`-`/`0`;
 - режим правки: `Ctrl+E` открывает справа исходный Markdown (окно расширяется,
   колонки делит `QSplitter`), кнопки «Конвертировать» (`Ctrl+Enter`) и
@@ -78,7 +85,9 @@ dist\MDViewer\MDViewer.exe --uninstall-default
 
 ```
 main.py        CLI, QApplication, диалог открытия файла
-viewer.py      окно: превью, оглавление, редактор, оверлей, поиск, shortcuts
+viewer.py      DocumentView (файл: превью, оглавление, редактор, оверлей,
+               поиск, подсветка) + MainWindow (QTabWidget, заголовок,
+               геометрия, tear-off/merge) + TabBar + совместимый Viewer
 renderer.py    mistune -> HTML (код, картинки, чекбоксы, якоря заголовков)
 theme.py       палитра, CSS для Qt rich text, размеры колонки, QSS приложения
 winassoc.py    регистрация обработчика .md в HKCU
@@ -86,7 +95,8 @@ version.py     версия, имя, ProgID, расширения
 MDViewer.spec  PyInstaller: onedir, иконка, версия, вырезание лишнего Qt
 tools/         make_icon.py (генерация assets/icon.ico), render_check.py,
                debug_html.py (быстрый просмотр HTML),
-               edit_check.py (правка/оглавление/оверлей без пользователя)
+               edit_check.py (правка/оглавление/оверлей без пользователя),
+               tabs_check.py (вкладки: дедуп, закрытие, tear-off/merge)
 ```
 
 ## Ограничения Qt, на которые заточен код
@@ -94,9 +104,10 @@ tools/         make_icon.py (генерация assets/icon.ico), render_check.p
 `QTextBrowser` понимает лишь подмножество CSS: не работают переменные,
 `max-width`, `margin: auto`, `padding`/`border` у блочных элементов,
 `::before`, переходы. Поэтому отступы колонки задаются через
-`viewport().setContentsMargins()`, а блоки кода оборачиваются в `<table>`
-(у ячеек padding работает). Таблица приложения должна быть установлена до
-первого `setHtml()`, иначе Qt не применит стили к документу.
+`viewport().setContentsMargins()`, а блоки кода — обычный `<pre class="code-body">`
+(отступ слева даёт `text-indent`, т.к. `padding` у `<pre>` Qt игнорирует).
+Таблица приложения должна быть установлена до первого `setHtml()`, иначе Qt
+не применит стили к документу.
 
 Второй подвох Qt — `QPlainTextEdit.toPlainText()` всегда возвращает текст с
 `\n`, даже если в файле `\r\n`. Поэтому сравнение «правился ли файл»
@@ -109,5 +120,6 @@ tools/         make_icon.py (генерация assets/icon.ico), render_check.p
 .venv\Scripts\python tools\render_check.py   # рендер всех стилей -> PNG
 .venv\Scripts\python tools\debug_html.py    # HTML без запуска GUI
 .venv\Scripts\python tools\edit_check.py    # правка/конвертация/сохранение
+.venv\Scripts\python tools\tabs_check.py    # вкладки: дедуп/закрытие/tear-off
 .venv\Scripts\python -m py_compile *.py
 ```
