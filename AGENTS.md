@@ -7,10 +7,16 @@
 ## Структура
 
 ```
-main.py         CLI (файлы, --install-default/--uninstall-default/--assoc-status),
-                QApplication, диалог открытия файла
-viewer.py       окно: превью + оглавление + QPlainTextEdit, оверлей, поиск,
-                shortcuts, zoom, QSettings, dirty-state
+main.py         CLI (файлы, --install-default/--uninstall-default/--assoc-status/
+                --restore-session), QApplication, диалог открытия файла; создаёт
+                один MainWindow, CLI-пути открываются вкладками
+viewer.py       DocumentView(QWidget) — содержимое одного файла: превью +
+                оглавление + QPlainTextEdit, оверлей, поиск, подсветка, zoom,
+                история, QSettings, dirty-state;
+                MainWindow(QMainWindow) — оболочка: QTabWidget, заголовок,
+                геометрия, closeEvent по всем вкладкам, реестр _WINDOWS;
+                TabBar(QTabBar) — tear-off/merge вкладок; совместимый
+                Viewer(MainWindow) для tools/
 renderer.py     mistune -> HTML: код, картинки, чекбоксы, сноски, якоря заголовков
                 и оглавление (render_with_outline)
 theme.py        палитра, CSS для Qt rich text, MEASURE/side_margin, QSS приложения
@@ -19,7 +25,8 @@ winassoc.py     регистрация .md в HKCU (ProgID, OpenWithProgids, Reg
 version.py      APP_NAME, APP_VERSION, PROG_ID, EXTENSIONS — общий источник истины
 MDViewer.spec   PyInstaller: иконка, версия, excludes, вырезание лишнего Qt
 build.bat       venv + pip + PyInstaller, флаг --run
-tools/          make_icon.py, render_check.py, debug_html.py, edit_check.py
+tools/          make_icon.py, render_check.py, debug_html.py, edit_check.py,
+                tabs_check.py
 ```
 
 ## Команды
@@ -30,6 +37,8 @@ build.bat                                       # сборка dist\MDViewer
 .venv\Scripts\python tools\render_check.py      # визуальная проверка темы
 .venv\Scripts\python tools\edit_check.py        # правка/конвертация/сохранение,
                                                 # оглавление, оверлей
+.venv\Scripts\python tools\tabs_check.py        # вкладки: дедуп/закрытие,
+                                                # tear-off/merge, сессия
 .venv\Scripts\python -m py_compile *.py
 ```
 
@@ -320,6 +329,45 @@ build.bat                                       # сборка dist\MDViewer
     К `_overlay`, `_find_bar`, `_edit_btn` до постройки обращаться нельзя —
     `_ensure_overlay` вызывается из `_show_overlay`, `_enter_edit`, `_leave_edit`.
     Горячие клавиши (`_build_shortcuts`) создаются в `__init__`, они дешёвые.
+
+26. **Вкладки: одна вкладка = один `DocumentView`, состояние изолировано.**
+    `MainWindow` держит `QTabWidget` (`setTabsClosable(True)`, `setMovable(True)`,
+    `setDocumentMode(True)`, corner-widget «+» намеренно `None` — вкладки берутся
+    только из файлов). Подпись вкладки — `DocumentView._tab_title()` (имя файла +
+    ` •` при несохранённых), tooltip — полный путь; дедуп по `Path.resolve()`
+    (`_find_tab`) фокусирует уже открытый файл. Страница вкладки — `DocumentView`;
+    его зум/правка/история/`_hl_layers`/`_source_map` не «текут» между вкладками.
+
+    - **Хоткеи разведены по контексту.** Per-document (`Ctrl+E/F/B`, `F5`, `Ctrl+S`,
+      `Ctrl+Enter`, `Alt+Left`, зум) создаются в `DocumentView._build_shortcuts` с
+      `WidgetWithChildrenShortcut`: при `WindowShortcut` две вкладки дали бы
+      `Ambiguous shortcut overload`. Оконные (`Ctrl+W`/`Ctrl+Q`/`Ctrl+O`,
+      `Ctrl+Tab`/`Ctrl+Shift+Tab`, `Ctrl+1..9`) — один раз на `MainWindow`
+      (`_build_window_shortcuts`) и маршрутизируются в активную вкладку.
+    - **Сигналы `DocumentView`:** `state_changed` (перерисовать подпись вкладки и,
+      если она активна, заголовок окна) и `link_requested` (Ctrl+клик или средняя
+      кнопка — открыть `.md` в новой вкладке; обычный клик навигирует текущую).
+      При переносе вкладки между окнами сигналы **переподключаются** в
+      `MainWindow._adopt_view` (`disconnect` + `connect`), сам виджет не
+      пересоздаётся, поэтому состояние едет целиком.
+    - **tear-off/merge.** `TabBar._start_drag` запускает `QDrag` только когда
+      указатель вышел за `rect()` (иначе ломается `setMovable`). Payload —
+      `TAB_MIME` + `_TabMimeData.view`; `_resolve_drag_view` падает на
+      module-global `_DRAG_VIEW`, т.к. Qt может отдать базовый `QMimeData` без
+      Python-подкласса. Drop вне любой полосы → `_tear_off` (новое окно в точке
+      курсора, `_take_view` с `setParent(None)`), drop на чужую полосу →
+      `_adopt_view` (merge); окно-источник закрывается, если вкладок не осталось.
+      Перестановка внутри полосы — забота Qt (`setMovable`), свои QDrag её не
+      перехватывают.
+    - **Сессия.** Флаг `QSettings("restore_session")` (по умолчанию выключен),
+      снимок — `session_paths` + `session_active` (`_save_session` всех окон из
+      реестра `_WINDOWS`), восстановление — `_restore_session`. Тумблер — ПКМ по
+      полосе вкладок (`_show_tab_menu`), CLI — `--restore-session`. Открытие
+      файлов идёт через `MainWindow._open_paths`/`_add_tab`/`_open_files_dialog`.
+    - **Совместимость `tools/`.** `tools/edit_check.py` и `render_check.py`
+      используют `viewer.Viewer(path, settings)` (подкласс `MainWindow`) и
+      проксирование `MainWindow.__getattr__`/`__setattr__` в текущий `DocumentView`.
+      Не ломать: инструменты обращаются к атрибутам окна напрямую.
 
 Максимум контента — до `MEASURE` px, оглавление фиксируется по `TOC_WIDTH`,
 отступы уровней — `TOC_STEP`; всё в `theme.py`.
