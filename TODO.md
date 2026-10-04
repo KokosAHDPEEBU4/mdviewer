@@ -114,7 +114,7 @@
 
 ### 1.8 Этапы
 
-- [ ] 1. Рефактор: `Viewer` → `DocumentView(QWidget)` + `MainWindow(QMainWindow)`.
+- [x] 1. Рефактор: `Viewer` → `DocumentView(QWidget)` + `MainWindow(QMainWindow)`.
 - [ ] 2. `QTabWidget`: добавление/закрытие вкладок, подписи, дедуп, CLI,
       `Ctrl+O` (несколько), `Ctrl+W`, ссылки (клик/`Ctrl`+клик).
 - [ ] 3. Хоткеи на активную вкладку, заголовок окна, `closeEvent` по всем вкладкам.
