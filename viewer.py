@@ -47,6 +47,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -2172,6 +2173,8 @@ class MainWindow(QMainWindow):
         tabs.tabCloseRequested.connect(self._close_tab)
         tabs.tabBar().tabMoved.connect(self._on_tab_moved)
         tabs.tabBar().installEventFilter(self)  # middle click closes a tab
+        tabs.tabBar().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        tabs.tabBar().customContextMenuRequested.connect(self._show_tab_menu)
         tabs.currentChanged.connect(self._on_current_changed)
         object.__setattr__(self, "_tabs", tabs)
         self.setCentralWidget(tabs)
@@ -2445,6 +2448,23 @@ class MainWindow(QMainWindow):
                 self._tabs.setCurrentIndex(index)
         self._save_session()
         return self._tabs.count() > 0
+
+    # -- "restore session" toggle (tab context menu) -----------------------
+
+    def _show_tab_menu(self, pos: QPoint) -> None:
+        """Right-click on the tab strip: toggle session restore (in Russian)."""
+        menu = QMenu(self)
+        action = menu.addAction("Восстанавливать прошлую сессию")
+        action.setCheckable(True)
+        action.setChecked(self._settings.value("restore_session", False, type=bool))
+        action.toggled.connect(self._set_restore_session)
+        menu.exec(self._tabs.tabBar().mapToGlobal(pos))
+
+    def _set_restore_session(self, enabled: bool) -> None:
+        """Persist the flag; turning it on snapshots the current session at once."""
+        self._settings.setValue("restore_session", bool(enabled))
+        if enabled:
+            self._save_session()
 
     # -- window chrome -----------------------------------------------------
 

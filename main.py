@@ -27,6 +27,7 @@ USAGE = f"""\
   MDViewer --no-prompt           ... без диалога «Открыть с помощью»
   MDViewer --uninstall-default   удалить регистрацию
   MDViewer --assoc-status        показать, что зарегистрировано в Windows
+  MDViewer --restore-session     восстановить вкладки прошлой сессии
   MDViewer -h | -v
 """
 
@@ -36,6 +37,7 @@ def main(argv: list[str]) -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     prompt = "--no-prompt" not in argv
+    force_restore = "--restore-session" in argv
     files = []
     for arg in argv:
         if arg in ("-h", "--help"):
@@ -50,12 +52,13 @@ def main(argv: list[str]) -> int:
             return report(winassoc.uninstall())
         if arg == "--assoc-status":
             return report(winassoc.status())
-        if arg == "--no-prompt":
+        if arg in ("--no-prompt", "--restore-session"):
             continue
         files.append(Path(arg))
 
     app = create_app()
-    window = MainWindow(QSettings())
+    settings = QSettings()
+    window = MainWindow(settings)
     paths = [path for path in files if path.is_file()]
     if paths:
         window._open_paths(paths)
@@ -63,7 +66,12 @@ def main(argv: list[str]) -> int:
         return app.exec()
     if files:
         return 0  # CLI paths were given, but none of them is a file
-    # no paths on the command line: ask, and quit if the user picked nothing
+    # no paths on the command line: restore the previous session if asked (flag
+    # or the Settings toggle), otherwise ask, and quit if nothing was picked
+    if force_restore or settings.value("restore_session", False, type=bool):
+        if window._restore_session():
+            window.show()
+            return app.exec()
     window._open_files_dialog()
     if window._tabs.count() == 0:
         return 0
