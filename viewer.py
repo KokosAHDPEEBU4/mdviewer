@@ -247,7 +247,7 @@ class ScrollIndicator(QWidget):
         painter.drawEllipse(centre + self._dot, 4, 4)
 
 
-class Viewer(QMainWindow):
+class DocumentView(QWidget):
     SCROLL_DEAD_ZONE = 12   # px the pointer must move before autoscroll kicks in
     WHEEL_STEP = 40.0       # accumulated wheel units that make one zoom level
 
@@ -307,8 +307,7 @@ class Viewer(QMainWindow):
         self._autoscroll_timer = QTimer(self)
         self._autoscroll_timer.timeout.connect(self._autoscroll_tick)
 
-        self.setWindowTitle(self._title(False))
-        self.resize(1000, 800)
+        # the window title and geometry belong to MainWindow (see below)
 
         self._browser = OverlayTextBrowser()
         self._browser.overlay_painter = self._paint_selection_overlay
@@ -346,17 +345,18 @@ class Viewer(QMainWindow):
         # the splitter resizes a step after the window, so its own Resize event
         # (which carries the final size) drives the pane layout
         self._splitter.installEventFilter(self)
-        self.setCentralWidget(self._splitter)
+        # DocumentView is the central widget now, so the splitter needs a layout
+        # to fill it (previously the splitter was the window's central widget).
+        shell = QVBoxLayout(self)
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(0)
+        shell.addWidget(self._splitter)
 
         self._edit_btn = None
         self._back_btn = None
         self._toc_btn = None
         self._overlay = None
         self._find_bar = None
-
-        geometry = self._settings.value("geometry")
-        if geometry:
-            self.restoreGeometry(geometry)
 
         self.load()
         QTimer.singleShot(0, self._set_margins)
@@ -580,32 +580,6 @@ class Viewer(QMainWindow):
         finally:
             self._toc_syncing = False
 
-    def showEvent(self, event):
-        super().showEvent(event)
-        if not self._dark_titled:
-            self._dark_titled = True
-            enable_dark_title_bar(self)
-        QTimer.singleShot(0, self._relayout)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._set_margins()
-        if getattr(self, "_overlay", None) is not None and self._overlay.isVisible():
-            self._place_overlay()
-
-    def closeEvent(self, event):
-        if not self._confirm_discard():
-            event.ignore()
-            return
-        # Closing in edit mode must not remember the widened split window,
-        # otherwise the next start looks wide but has no editor.
-        if self._editing() and self._view_geometry is not None:
-            self._settings.setValue("geometry", self._view_geometry)
-        else:
-            self._settings.setValue("geometry", self.saveGeometry())
-        self._settings.setValue("last_dir", str(self._path.parent))
-        super().closeEvent(event)
-
     def _open_link(self, url: QUrl) -> None:
         """Route a link click: markdown files open in this window, everything
         else goes to the system.
@@ -672,11 +646,11 @@ class Viewer(QMainWindow):
         """Point the window at `path`; False and no change when the user cancels."""
         previous = self._path
         self._path = Path(path).resolve()
-        self.setWindowTitle(self._title(False))
+        self._update_window_title(False)
         if self.load():
             return True
         self._path = previous
-        self.setWindowTitle(self._title(False))
+        self._update_window_title(False)
         return False
 
     def _update_nav(self) -> None:
@@ -688,11 +662,6 @@ class Viewer(QMainWindow):
     def _build_edit_button(self) -> None:
         self._edit_btn = QPushButton("Редактировать")
         self._edit_btn.clicked.connect(self._toggle_edit)
-
-    def _title(self, unsaved: bool) -> str:
-        """The version is in the title on purpose: it tells builds apart when
-        an old copy is still installed somewhere else."""
-        return f"{self._path.name}{' •' if unsaved else ''} — {APP_NAME} {APP_VERSION}"
 
     def _build_editor(self) -> None:
         panel = QWidget()
@@ -803,7 +772,8 @@ class Viewer(QMainWindow):
         # already on (not the primary one: on a multi-monitor desk that would size
         # for the wrong monitor and let the window spill off its own screen). If
         # the cap bites, `_relayout` shrinks the editor first, preview staying put.
-        screen = self.screen() or QGuiApplication.primaryScreen()
+        window = self.window()
+        screen = window.screen() or QGuiApplication.primaryScreen()
         available = screen.availableGeometry().width() if screen else SCREEN_FALLBACK
         toc_w = self._toc_pref() if self._toc.isVisible() else 0
         panes = 2 + (1 if toc_w else 0)
@@ -811,10 +781,10 @@ class Viewer(QMainWindow):
             self._preview_width + self._editor_pref + toc_w + SPLIT_HANDLE * (panes - 1),
             int(available * 0.96),
         )
-        if self.width() < target:
+        if window.width() < target:
             # QByteArray, not QRect: this is what restoreGeometry expects
-            self._view_geometry = self.saveGeometry()
-            self.resize(target, self.height())
+            window._view_geometry = window.saveGeometry()
+            window.resize(target, window.height())
         self._relayout()
         QTimer.singleShot(0, self._relayout)  # once the layout knows the child
 
@@ -1296,9 +1266,10 @@ class Viewer(QMainWindow):
             # the preview showed a converted but unsaved draft: go back to disk
             self._render(self._text)
             self._baseline = _normalized(self._text)
-        if self._view_geometry is not None:
-            self.restoreGeometry(self._view_geometry)
-            self._view_geometry = None
+        window = self.window()
+        if getattr(window, "_view_geometry", None) is not None:
+            window.restoreGeometry(window._view_geometry)
+            window._view_geometry = None
         self._edit_btn.setText("Редактировать")
         self._browser.setFocus()
         self._update_hits(self._find_edit.text())  # search back to the preview
@@ -1419,12 +1390,32 @@ class Viewer(QMainWindow):
         """The editor changed, so its offsets no longer match the last render."""
         self._map_dirty = True
 
+    def _is_unsaved(self) -> bool:
+        return self._editing() and self._editor.toPlainText() != self._baseline
+
+    def _update_window_title(self, unsaved: bool) -> None:
+        """The version is in the title on purpose: it tells builds apart when
+        an old copy is still installed somewhere else.
+
+        The title belongs to MainWindow; when the view is not hosted in one
+        (legacy standalone use), fall back to the widget's own title.
+        """
+        window = self.window()
+        if window is not self:
+            update = getattr(window, "_update_title", None)
+            if update is not None:
+                update(unsaved)
+                return
+        self.setWindowTitle(
+            f"{self._path.name}{' •' if unsaved else ''} — {APP_NAME} {APP_VERSION}"
+        )
+
     def _update_state(self) -> None:
         """Title bullet, and which of the two buttons make sense right now."""
         editing = self._editing()
         text = self._editor.toPlainText() if editing else self._text
         unsaved = editing and text != self._baseline
-        self.setWindowTitle(self._title(unsaved))
+        self._update_window_title(unsaved)
         if self._convert_btn is not None:
             self._convert_btn.setEnabled(editing and text != self._rendered)
         if self._save_btn is not None:
@@ -1561,10 +1552,6 @@ class Viewer(QMainWindow):
         self._overlay.resize(width, self._overlay.sizeHint().height())
         self._overlay.move(x, top_left.y() + 12)
 
-    def enterEvent(self, event):
-        super().enterEvent(event)
-        self._show_overlay()
-
     def _pane_for(self, obj):
         """The pane a filtered object belongs to (the widget or its viewport)."""
         if obj is self._browser or obj is self._browser.viewport():
@@ -1686,13 +1673,6 @@ class Viewer(QMainWindow):
             bar = pane.verticalScrollBar()
             bar.setValue(bar.value() + step)
 
-    def leaveEvent(self, event):
-        super().leaveEvent(event)
-        # hide only when the pointer really left the window, not just the
-        # central widget (the overlay itself counts as inside)
-        if not self.underMouse() and self._overlay is not None:
-            self._overlay.setVisible(False)
-
     def _toggle_find(self) -> None:
         self._show_overlay()
         self._find_edit.setFocus()
@@ -1778,8 +1758,8 @@ class Viewer(QMainWindow):
 
     def _build_shortcuts(self) -> None:
         actions = {
-            "Ctrl+W": self.close,
-            "Ctrl+Q": self.close,
+            "Ctrl+W": self._close_window,
+            "Ctrl+Q": self._close_window,
             "Esc": self._handle_esc,
             "Ctrl+F": self._toggle_find,
             "F3": self._find_next,
@@ -1799,6 +1779,12 @@ class Viewer(QMainWindow):
         }
         for keys, slot in actions.items():
             QShortcut(QKeySequence(keys), self, slot)
+
+    def _close_window(self) -> None:
+        """Close the host window, not just this pane (Ctrl+W / Ctrl+Q)."""
+        window = self.window()
+        if window is not None:
+            window.close()
 
     def _zoom_step(self, step: int) -> None:
         """Zoom the pane the user is working in. All three are independent."""
@@ -1905,3 +1891,134 @@ class Viewer(QMainWindow):
         if not name:
             return
         self._navigate(Path(name))
+
+
+class MainWindow(QMainWindow):
+    """The application shell: hosts one `DocumentView` and owns window chrome.
+
+    Window-level concerns (title, geometry, DWM dark caption, resize/close
+    handling) live here; everything about the document lives in `DocumentView`.
+    Unknown attributes are proxied to the current view so the existing tools
+    (which drive `viewer.Viewer` directly) keep working unchanged.
+    """
+
+    _OWN_ATTRS = {"_view", "_settings", "_view_geometry", "_dark_titled"}
+
+    def __init__(self, settings: QSettings | None = None):
+        super().__init__()
+        object.__setattr__(self, "_view", None)
+        object.__setattr__(self, "_settings", settings or QSettings())
+        object.__setattr__(self, "_view_geometry", None)  # QByteArray (invariant 14)
+        object.__setattr__(self, "_dark_titled", False)
+        self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
+        geometry = self._settings.value("geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+        else:
+            self.resize(1000, 800)
+
+    # -- compatibility: the window proxies the current document ------------
+
+    def __getattr__(self, name):
+        view = self.__dict__.get("_view")
+        if view is not None:
+            return getattr(view, name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        if name in MainWindow._OWN_ATTRS:
+            object.__setattr__(self, name, value)
+            return
+        view = self.__dict__.get("_view")
+        if view is not None:
+            setattr(view, name, value)
+        else:
+            object.__setattr__(self, name, value)
+
+    @staticmethod
+    def _match_pattern(needle: str):
+        """Kept on the window class: tools call `viewer.Viewer._match_pattern`."""
+        return DocumentView._match_pattern(needle)
+
+    # -- documents ---------------------------------------------------------
+
+    def open_document(self, path: Path) -> None:
+        """Open one markdown file (tabs are a later task)."""
+        view = DocumentView(path, self._settings)
+        self._view = view
+        self.setCentralWidget(view)
+        self._update_title(view._is_unsaved())
+
+    # -- window chrome -----------------------------------------------------
+
+    def _title(self, unsaved: bool) -> str:
+        """The version is part of the title on purpose: it tells builds apart."""
+        name = self._view._path.name if self._view is not None else ""
+        return f"{name}{' •' if unsaved else ''} — {APP_NAME} {APP_VERSION}"
+
+    def _update_title(self, unsaved: bool) -> None:
+        self.setWindowTitle(self._title(unsaved))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._dark_titled:
+            self._dark_titled = True
+            enable_dark_title_bar(self)
+        if self._view is not None:
+            QTimer.singleShot(0, self._view._relayout)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._view is None:
+            return
+        self._view._set_margins()
+        overlay = self._view._overlay
+        if overlay is not None and overlay.isVisible():
+            self._view._place_overlay()
+
+    def closeEvent(self, event):
+        view = self._view
+        if view is None:
+            super().closeEvent(event)
+            return
+        if not view._confirm_discard():
+            event.ignore()
+            return
+        # Closing in edit mode must not remember the widened split window,
+        # otherwise the next start looks wide but has no editor.
+        if view._editing() and self._view_geometry is not None:
+            self._settings.setValue("geometry", self._view_geometry)
+        else:
+            self._settings.setValue("geometry", self.saveGeometry())
+        self._settings.setValue("last_dir", str(view._path.parent))
+        super().closeEvent(event)
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        if self._view is not None:
+            self._view._show_overlay()
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        # hide only when the pointer really left the window, not just the
+        # central widget (the overlay itself counts as inside)
+        if (
+            not self.underMouse()
+            and self._view is not None
+            and self._view._overlay is not None
+        ):
+            self._view._overlay.setVisible(False)
+
+    def eventFilter(self, obj, event):
+        """Route filter events to the view (tools call `win.eventFilter`)."""
+        if self._view is not None:
+            return self._view.eventFilter(obj, event)
+        return super().eventFilter(obj, event)
+
+
+class Viewer(MainWindow):
+    """Backwards-compatible single-window view (used by tools/)."""
+
+    def __init__(self, path: Path, settings: QSettings | None = None):
+        super().__init__(settings)
+        self.open_document(path)
