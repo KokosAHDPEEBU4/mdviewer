@@ -742,6 +742,32 @@ def main() -> int:
         win.close()
         app.processEvents()
 
+    # --- tabs: multi-open, dedup and closing share one window
+    with tempfile.TemporaryDirectory() as folder:
+        tab_a = Path(folder) / "tab_a.md"
+        tab_b = Path(folder) / "tab_b.md"
+        tab_a.write_text("# A\n", encoding="utf-8")
+        tab_b.write_text("# B\n", encoding="utf-8")
+        win = viewer_mod.Viewer(tab_a, QSettings(tempfile.mkdtemp(), "tabs_check"))
+        win._open_paths([tab_b])
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+        check("tabs: two files share one window", win._tabs.count(), 2)
+        check("tabs: labels are the file names",
+              (win._tabs.tabText(0), win._tabs.tabText(1)), ("tab_a.md", "tab_b.md"))
+        check("tabs: drag-reorder is enabled", win._tabs.isMovable(), True)
+        check("tabs: close buttons are enabled", win._tabs.tabsClosable(), True)
+        win._open_paths([tab_a])  # already open: focus, never duplicate
+        check("tabs: reopening focuses the existing tab", win._tabs.count(), 2)
+        check("tabs: the existing tab becomes active", win._tabs.currentWidget()._path, tab_a.resolve())
+        win._close_tab(1)
+        check("tabs: closing one leaves the other", win._tabs.count(), 1)
+        win._close_tab(0)
+        check("tabs: closing the last empties the window", win._tabs.count(), 0)
+        for _ in range(2):
+            app.processEvents()
+
     print("all checks passed" if not failures else f"{len(failures)} failure(s)")
     return 1 if failures else 0
 

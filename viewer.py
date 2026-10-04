@@ -2163,13 +2163,16 @@ class MainWindow(QMainWindow):
             self.resize(1000, 800)
 
         tabs = QTabWidget(self)
-        tabs.setTabsClosable(True)
-        tabs.setMovable(True)
         tabs.setDocumentMode(True)
         tabs.setCornerWidget(None)  # no "+" button: tabs come only from files
         bar = TabBar(tabs)
         bar._window = self
         tabs.setTabBar(bar)  # tear-off + cross-window drops live in TabBar
+        # `setTabBar` installs a fresh bar and drops `tabsClosable`/`movable`, so
+        # both have to be re-applied *after* the custom bar is in place (otherwise
+        # the tabs cannot be dragged and show no close button)
+        tabs.setTabsClosable(True)
+        tabs.setMovable(True)
         tabs.tabCloseRequested.connect(self._close_tab)
         tabs.tabBar().tabMoved.connect(self._on_tab_moved)
         tabs.tabBar().installEventFilter(self)  # middle click closes a tab
