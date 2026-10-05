@@ -110,7 +110,11 @@ a = Analysis(
     pathex=[str(PROJECT)],
     binaries=[],
     datas=datas,
-    hiddenimports=[],
+    # QPrinter (tab-menu "Экспорт -> PDF") lives in QtPrintSupport; list it
+    # explicitly so the analyser cannot miss it when the import is only reached
+    # through a slot. Its Qt6PrintSupport.dll and the Windows print plugin are
+    # kept (not in DROP_BINARIES), which is exactly what PDF output needs.
+    hiddenimports=["PyQt6.QtPrintSupport"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

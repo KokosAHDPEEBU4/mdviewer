@@ -16,6 +16,7 @@ from PyQt6.QtCore import (
     QByteArray,
     QEvent,
     QFileSystemWatcher,
+    QMarginsF,
     QMimeData,
     QPoint,
     QRegularExpression,
@@ -36,12 +37,14 @@ from PyQt6.QtGui import (
     QFont,
     QGuiApplication,
     QKeySequence,
+    QPageLayout,
     QPainter,
     QPen,
     QShortcut,
     QTextCursor,
     QTextDocument,
 )
+from PyQt6.QtPrintSupport import QPrinter
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -135,6 +138,11 @@ def _newline_of(raw: bytes) -> str:
 def _normalized(text: str) -> str:
     """Qt text widgets hand back LF-only text, so compare like for like."""
     return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+# PDF export page margin (millimetres). Generous enough that the text never
+# touches the paper edge, while still leaving a wide reading column.
+PDF_MARGIN_MM = 15
 
 
 def _standalone_html(title: str, body: str, theme: str) -> str:
@@ -710,29 +718,60 @@ class DocumentView(QWidget):
             return False
         return True
 
+    def export_pdf(self, dest: Path) -> bool:
+        """Print the preview's `QTextDocument` to a PDF file via `QPrinter`.
+
+        A clone is printed so the on-screen document is never repaginated, and
+        explicit margins keep the text off the paper edge. `PdfFormat` writes a
+        plain file, so no printer (or dialog) is required — which also makes it
+        safe to run from the automated checks.
+        """
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+        printer.setOutputFileName(str(dest))
+        printer.setPageMargins(
+            QMarginsF(PDF_MARGIN_MM, PDF_MARGIN_MM, PDF_MARGIN_MM, PDF_MARGIN_MM),
+            QPageLayout.Unit.Millimeter,
+        )
+        document = self._browser.document().clone()
+        try:
+            document.print(printer)
+        except Exception as exc:  # Qt can raise on a broken printer setup
+            self._export_error(exc)
+            return False
+        finally:
+            document.deleteLater()
+        if not Path(dest).is_file() or Path(dest).stat().st_size == 0:
+            self._export_error("файл не создан")
+            return False
+        return True
+
     def _export_error(self, exc) -> None:
         QMessageBox.warning(self, "Экспорт", f"Не удалось сохранить файл:\n{exc}")
 
-    def export_via_dialog(self) -> bool:
-        """Ask for a destination, then export the document as HTML.
+    def export_via_dialog(self, kind: str) -> bool:
+        """Ask for a destination, then export `kind` ('html' or 'pdf').
 
         Returns True once a file is written. Cancelling the dialog writes
         nothing and returns False; a write error is reported and also returns
-        False. The default name is `<имя файла>.html`.
+        False. The default name is `<имя файла>.<расширение>`.
         """
-        default = self._path.with_suffix(".html")
-        name, _ = QFileDialog.getSaveFileName(
-            self, "Экспорт в HTML", str(default), "HTML (*.html)"
-        )
+        suffix = "html" if kind == "html" else "pdf"
+        title = "Экспорт в HTML" if suffix == "html" else "Экспорт в PDF"
+        caption = "HTML (*.html)" if suffix == "html" else "PDF (*.pdf)"
+        default = self._path.with_suffix("." + suffix)
+        name, _ = QFileDialog.getSaveFileName(self, title, str(default), caption)
         if not name:
             return False
         dest = Path(name)
-        if dest.suffix.lower() != ".html":
+        if dest.suffix.lower() != "." + suffix:
             try:
-                dest = dest.with_suffix(".html")
+                dest = dest.with_suffix("." + suffix)
             except ValueError:
                 pass
-        return self.export_html(dest)
+        if suffix == "html":
+            return self.export_html(dest)
+        return self.export_pdf(dest)
 
     # -- theme -------------------------------------------------------------
 
@@ -3553,9 +3592,13 @@ class MainWindow(QMainWindow):
             copy = menu.addAction("Копировать путь")
             copy.triggered.connect(lambda _checked=False, p=path: self._copy_path(p))
             export_menu = menu.addMenu("Экспорт")
+            pdf = export_menu.addAction("PDF…")
+            pdf.triggered.connect(
+                lambda _checked=False, v=view: v.export_via_dialog("pdf")
+            )
             html = export_menu.addAction("HTML…")
             html.triggered.connect(
-                lambda _checked=False, v=view: v.export_via_dialog()
+                lambda _checked=False, v=view: v.export_via_dialog("html")
             )
             menu.addSeparator()
 

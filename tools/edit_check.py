@@ -1221,7 +1221,7 @@ def main() -> int:
         win.close()
         app.processEvents()
 
-    # --- export: standalone HTML, cancel writes nothing
+    # --- export: standalone HTML, PDF via QPrinter, cancel writes nothing
     with tempfile.TemporaryDirectory() as folder:
         path = Path(folder) / "export.md"
         path.write_text(
@@ -1243,7 +1243,7 @@ def main() -> int:
             lambda *args, **kwargs: (str(html_dest), "HTML (*.html)")
         )
         try:
-            ok = win.export_via_dialog()
+            ok = win.export_via_dialog("html")
         finally:
             viewer_mod.QFileDialog.getSaveFileName = original_save
         check("HTML export reports success", ok, True)
@@ -1267,7 +1267,7 @@ def main() -> int:
             lambda *args, **kwargs: (str(light_dest), "HTML (*.html)")
         )
         try:
-            win.export_via_dialog()
+            win.export_via_dialog("html")
         finally:
             viewer_mod.QFileDialog.getSaveFileName = original_save
         check("HTML export follows the active theme",
@@ -1276,16 +1276,33 @@ def main() -> int:
         win._set_theme("dark")
         app.processEvents()
 
+        # PDF: a real, non-empty file written without any printer
+        pdf_dest = Path(folder) / "out.pdf"
+        viewer_mod.QFileDialog.getSaveFileName = staticmethod(
+            lambda *args, **kwargs: (str(pdf_dest), "PDF (*.pdf)")
+        )
+        try:
+            ok = win.export_via_dialog("pdf")
+        finally:
+            viewer_mod.QFileDialog.getSaveFileName = original_save
+        check("PDF export reports success", ok, True)
+        check("PDF export wrote a non-empty file",
+              pdf_dest.is_file() and pdf_dest.stat().st_size > 0, True)
+        check("PDF export is a real PDF",
+              pdf_dest.read_bytes()[:5], b"%PDF-")
+
         # cancelling the dialog must write nothing at all
         before = sorted(p.name for p in Path(folder).iterdir())
         viewer_mod.QFileDialog.getSaveFileName = staticmethod(
             lambda *args, **kwargs: ("", "")
         )
         try:
-            cancelled_html = win.export_via_dialog()
+            cancelled_html = win.export_via_dialog("html")
+            cancelled_pdf = win.export_via_dialog("pdf")
         finally:
             viewer_mod.QFileDialog.getSaveFileName = original_save
         check("cancelled HTML export reports no success", cancelled_html, False)
+        check("cancelled PDF export reports no success", cancelled_pdf, False)
         check("cancelling writes no file",
               sorted(p.name for p in Path(folder).iterdir()), before)
 
@@ -1295,7 +1312,7 @@ def main() -> int:
             lambda *args, **kwargs: (str(bare), "HTML (*.html)")
         )
         try:
-            win.export_via_dialog()
+            win.export_via_dialog("html")
         finally:
             viewer_mod.QFileDialog.getSaveFileName = original_save
         check("a missing suffix is added", (Path(folder) / "bare.html").is_file(), True)

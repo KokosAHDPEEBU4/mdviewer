@@ -544,11 +544,11 @@ build.bat                                       # сборка dist\MDViewer
     `tools/edit_check.py` (палитры, переключение, перерисовка, DWM) и
     `tools/tabs_check.py` (переключение доходит до всех окон/вкладок).
 
-33. **Экспорт вкладки — «Экспорт → HTML…» в ПКМ-меню вкладок.**
-    Пункт действует на вкладку под курсором (иначе активную); диалог —
-    `QFileDialog.getSaveFileName` с дефолтным именем `<имя>.html`.
+33. **Экспорт вкладки — «Экспорт → PDF…/HTML…» в ПКМ-меню вкладок.**
+    Оба пункта действуют на вкладку под курсором (иначе активную); диалог —
+    `QFileDialog.getSaveFileName` с дефолтным именем `<имя>.<html|pdf>`.
     Отмена диалога и ошибка записи возвращают False и ничего не пишут
-    (ошибку показывает `QMessageBox.warning`).
+    (ошибку показывает `QMessageBox.warning`, инвариант про падения).
 
     - **HTML** (`DocumentView.export_html`): рендер последнего *показанного*
       источника (`self._map_source`, обновляется только на load/convert/save —
@@ -558,9 +558,18 @@ build.bat                                       # сборка dist\MDViewer
       `<title>` = имя файла и `<style>` = `content_css(theme)`. Локальные
       картинки остаются абсолютными `file:`-URL (рендерер их уже такими и
       делает) — файл самодостаточен и **не тянет сеть** (инвариант 5).
-    - **Тесты.** Секция export в `tools/edit_check.py` (заголовок/`<style>`/тема;
-      отмена ничего не пишет через замоканный `QFileDialog`) и проверка подменю
-      «Экспорт» в `tools/tabs_check.py`.
+    - **PDF** (`DocumentView.export_pdf`): `PyQt6.QtPrintSupport.QPrinter`
+      (`PrinterMode.HighResolution`, `OutputFormat.PdfFormat`,
+      `setOutputFileName`), поля `PDF_MARGIN_MM`=15 мм через `setPageMargins`.
+      Печатается **клон** документа (`document().clone()`), чтобы не
+      переразбивать превью; text wrap делает Qt, обрезки нет. PDF пишется
+      файлом без реального принтера — потому и проверяется в тестах.
+    - **Сборка.** `QtPrintSupport` должен попасть в onedir: он указан в
+      `hiddenimports` `MDViewer.spec`, а его dll/плагин (Windows print support)
+      в `DROP_BINARIES` не перечислены — не вырезай их. Тесты — секция export
+      в `tools/edit_check.py` (HTML: заголовок/`<style>`/тема; PDF: непустой
+      `%PDF-`; отмена ничего не пишет через замоканный `QFileDialog`) и проверка
+      подменю «Экспорт» в `tools/tabs_check.py`.
 
 Максимум контента — до `MEASURE` px, оглавление фиксируется по `TOC_WIDTH`,
 отступы уровней — `TOC_STEP`; всё в `theme.py`.

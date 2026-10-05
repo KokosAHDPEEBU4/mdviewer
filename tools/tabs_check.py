@@ -574,8 +574,8 @@ def main() -> int:
         check("the tab menu has an 'Экспорт' submenu", "Экспорт" in labels, True)
         submenu = next(action.menu() for action in menu.actions()
                        if action.text() == "Экспорт")
-        check("the export submenu offers HTML",
-              [action.text() for action in submenu.actions()], ["HTML…"])
+        check("the export submenu offers PDF and HTML",
+              [action.text() for action in submenu.actions()], ["PDF…", "HTML…"])
         close_window(win)
         pump(app)
 
