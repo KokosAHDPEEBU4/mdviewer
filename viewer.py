@@ -142,6 +142,14 @@ FILE_WATCH_DEBOUNCE_MS = 200
 RECENT_LIMIT = 10
 RECENT_KEY = "recent_files"
 
+# Editor <-> preview scroll sync (only while editing). A scrollbar emits many
+# single-step changes; the timer coalesces a burst into one cross-pane move.
+SYNC_SCROLL_MS = 70
+# Entering/leaving edit moves scrollbars itself (caret placement, relayout), so
+# sync is held off until the mode has settled; otherwise the careful
+# "open on the visible paragraph" positioning would be undone by a loop.
+SYNC_SCROLL_SETTLE_MS = 250
+
 
 def recent_files(settings: QSettings) -> list[str]:
     """The remembered file paths, newest first; only ones still on disk."""
@@ -466,6 +474,18 @@ class DocumentView(QWidget):
         self._map_dirty = False        # editor edited since the last render
         self._toc_syncing = False
         self._wheel_accum = {}        # per-pane leftover wheel delta for smooth zoom
+        # editor <-> preview scroll sync (only while editing). One flag breaks
+        # the feedback loop (setting the other bar re-emits valueChanged), the
+        # timer throttles a burst of steps, and `_sync_source` is the pane that
+        # started the pending sync.
+        self._syncing_scroll = False
+        self._sync_suppressed = False
+        self._sync_source = None
+        self._sync_count = 0          # applied syncs (diagnostics / tests)
+        self._sync_timer = QTimer(self)
+        self._sync_timer.setSingleShot(True)
+        self._sync_timer.setInterval(SYNC_SCROLL_MS)
+        self._sync_timer.timeout.connect(self._sync_scroll_now)
         # middle-click autoscroll: one pane at a time, tracked per pane
         self._autoscroll_pane = None
         self._autoscroll_origin = QPoint(0, 0)
@@ -509,6 +529,7 @@ class DocumentView(QWidget):
         self._browser.viewport().setMouseTracking(True)  # autoscroll follows the pointer
         self._browser.verticalScrollBar().valueChanged.connect(self._sync_outline)
         self._browser.verticalScrollBar().valueChanged.connect(self._sync_crumbs)
+        self._browser.verticalScrollBar().valueChanged.connect(self._on_preview_scrolled)
         self._browser.selectionChanged.connect(self._highlight_editor_from_preview)
         self._preview_base_font = QFont(self._browser.document().defaultFont())
 
@@ -1183,6 +1204,11 @@ class DocumentView(QWidget):
         self._numbers_action.setCheckable(True)
         self._numbers_action.setChecked(self._editor_line_numbers())
         self._numbers_action.toggled.connect(self._set_editor_line_numbers)
+        options.addSeparator()
+        self._sync_action = options.addAction("Синхронизировать прокрутку")
+        self._sync_action.setCheckable(True)
+        self._sync_action.setChecked(self._sync_scroll_enabled())
+        self._sync_action.toggled.connect(self._set_sync_scroll)
         self._editor_menu_btn.setMenu(options)
         for widget in (
             self._editor_zoom_out,
@@ -1203,6 +1229,7 @@ class DocumentView(QWidget):
         self._editor.viewport().installEventFilter(self)  # wheel lands on the viewport
         self._editor.viewport().setMouseTracking(True)  # autoscroll follows the pointer
         self._editor.selectionChanged.connect(self._highlight_preview_from_editor)
+        self._editor.verticalScrollBar().valueChanged.connect(self._on_editor_scrolled)
         self._editor_base_font = self._editor.font()
         self._apply_editor_options()
         layout.addWidget(self._editor, 1)
@@ -1252,6 +1279,17 @@ class DocumentView(QWidget):
         if self._editor is not None and hasattr(self._editor, "set_line_numbers"):
             self._editor.set_line_numbers(bool(enabled))
 
+    def _sync_scroll_enabled(self) -> bool:
+        """Whether scrolling one pane pulls the other along (default on)."""
+        return self._settings.value("sync_scroll", True, type=bool)
+
+    def _set_sync_scroll(self, enabled: bool) -> None:
+        """Persist the scroll-sync toggle and drop any pending sync."""
+        self._settings.setValue("sync_scroll", bool(enabled))
+        if not enabled:
+            self._sync_timer.stop()
+            self._sync_source = None
+
     def _toggle_edit(self) -> None:
         if self._editing():
             self._leave_edit()
@@ -1263,6 +1301,12 @@ class DocumentView(QWidget):
 
     def _enter_edit(self) -> None:
         self._ensure_overlay()
+        # caret placement and relayout move scrollbars on their own; hold the
+        # cross-pane sync back until edit mode has settled so entering never
+        # nudges the reader (invariant 15/17)
+        self._sync_suppressed = True
+        self._sync_timer.stop()
+        self._sync_source = None
         # the preview column shrinks a little when the editor opens (the window
         # may be capped by the screen), which rewraps the whole document; pin the
         # character at the top so the reader is not thrown to another section
@@ -1329,6 +1373,8 @@ class DocumentView(QWidget):
         self._highlight_editor_from_preview()  # keep an existing preview selection in view
         self._show_overlay()  # move it over the (now narrower) preview at once
         self._update_state()
+        # once the layout is stable, accept the first user-driven scroll sync
+        QTimer.singleShot(SYNC_SCROLL_SETTLE_MS, self._release_scroll_sync)
 
     def _visible_paragraph(self) -> str:
         """Rendered text of the paragraph at the top of the preview viewport."""
@@ -1788,6 +1834,9 @@ class DocumentView(QWidget):
         if not self._confirm_discard():
             return
         self._ensure_overlay()
+        self._sync_suppressed = True
+        self._sync_timer.stop()
+        self._sync_source = None
         self._preview_anchor = None  # entering-edit pin must not outlive the edit
         self._edit_mode = False
         self._panel.setVisible(False)
@@ -2532,6 +2581,147 @@ class DocumentView(QWidget):
                 offset = line.y()
         top = document.documentLayout().blockBoundingRect(block).top()
         self._browser.verticalScrollBar().setValue(max(0, round(top + offset)))
+
+    # -- editor <-> preview scroll sync (edit mode only) -------------------
+
+    def _on_preview_scrolled(self, _value: int) -> None:
+        self._queue_scroll_sync(self._browser)
+
+    def _on_editor_scrolled(self, _value: int) -> None:
+        self._queue_scroll_sync(self._editor)
+
+    def _queue_scroll_sync(self, source) -> None:
+        """Coalesce scrollbar steps into one sync.
+
+        Bailing out on the guard, on a hidden pane and outside edit mode keeps
+        the feature from fighting the layout or running in read mode.
+        """
+        if (
+            self._syncing_scroll
+            or self._sync_suppressed
+            or self._in_relayout
+            or not self._editing()
+            or not self._sync_scroll_enabled()
+            or self._editor is None
+            or not self._panel.isVisible()
+        ):
+            return
+        self._sync_source = source
+        self._sync_timer.start()
+
+    def _release_scroll_sync(self) -> None:
+        """Edit mode has settled: accept the first user-driven sync."""
+        self._sync_suppressed = False
+        self._sync_timer.stop()
+        self._sync_source = None
+
+    def _preview_top_position(self) -> int:
+        return self._browser.cursorForPosition(
+            self._browser.viewport().rect().topLeft()
+        ).position()
+
+    def _editor_top_position(self) -> int:
+        return self._editor.cursorForPosition(
+            self._editor.viewport().rect().topLeft()
+        ).position()
+
+    def _sync_scroll_now(self) -> None:
+        """Apply the pending scroll sync.
+
+        `_syncing_scroll` is held for the whole target move: setting a
+        scrollbar emits `valueChanged`, and without the flag that would queue
+        the reverse sync and the two panes would chase each other forever.
+        """
+        source = self._sync_source
+        self._sync_timer.stop()
+        if source is None:
+            return
+        if (
+            self._sync_suppressed
+            or not self._editing()
+            or not self._sync_scroll_enabled()
+            or self._editor is None
+            or not self._panel.isVisible()
+        ):
+            self._sync_source = None
+            return
+        self._syncing_scroll = True
+        try:
+            if source is self._browser:
+                self._sync_editor_from_preview()
+            else:
+                self._sync_preview_from_editor()
+        finally:
+            self._syncing_scroll = False
+            self._sync_source = None
+
+    def _sync_editor_from_preview(self) -> None:
+        """Scroll the editor to the place the preview's top edge shows.
+
+        The position map is exact and tried first; when it is missing (raw
+        HTML) or stale (the editor changed since the render) the enclosing
+        heading is used, which is coarse but never wrong about the section.
+        """
+        position = self._preview_top_position()
+        mapped = None
+        source_map = self._ensure_map()
+        if source_map is not None and not self._map_dirty:
+            span = source_map.to_source(position, position + 64)
+            if span:
+                mapped = span[0]
+        if mapped is None:
+            mapped = self._editor_position_for_section(self._current_section_index())
+        if mapped is None:
+            return
+        self._scroll_editor_to(mapped)
+        self._sync_count += 1
+
+    def _sync_preview_from_editor(self) -> None:
+        """Scroll the preview to the place the editor's top edge shows."""
+        position = self._editor_top_position()
+        mapped = None
+        source_map = self._ensure_map()
+        if source_map is not None and not self._map_dirty:
+            span = source_map.to_render(position, position + 64)
+            if span:
+                mapped = span[0]
+        if mapped is not None:
+            self._scroll_preview_to(mapped)
+            self._sync_count += 1
+            return
+        # no usable map: fall back to the heading that owns the top line
+        if not self._outline or self._editor is None:
+            return
+        block = self._editor.document().findBlock(position)
+        label = self._editor_section_label(block)
+        index = self._preview_index_for_label(label) if label else None
+        if index is None:
+            return
+        self._browser.scrollToAnchor(self._outline[index].anchor)
+        self._sync_count += 1
+
+    def _editor_position_for_section(self, index: int):
+        """Source position of an outline heading (fallback when no map)."""
+        if not self._outline or not 0 <= index < len(self._outline):
+            return None
+        block = self._find_heading_block(self._outline[index].label)
+        return block.position() if block is not None else None
+
+    def _scroll_editor_to(self, position: int) -> None:
+        """Scroll the editor so document `position` sits at the viewport top.
+
+        `QPlainTextEdit`'s vertical scrollbar is measured in pixels, and
+        `blockBoundingGeometry` is in document coordinates, so the block's top
+        is exactly the scroll value that pins it to the top edge.
+        """
+        if self._editor is None:
+            return
+        document = self._editor.document()
+        position = max(0, min(position, max(0, document.characterCount() - 1)))
+        block = document.findBlock(position)
+        top = int(round(self._editor.blockBoundingGeometry(block).top()))
+        bar = self._editor.verticalScrollBar()
+        bar.setValue(max(bar.minimum(), min(bar.maximum(), top)))
 
     def _apply_preview_zoom(self) -> None:
         if self._preview_base_font is None:
