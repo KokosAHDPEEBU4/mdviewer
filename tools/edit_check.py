@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from PyQt6.QtCore import QEvent, QPoint, QPointF, QSettings, Qt, QUrl
-from PyQt6.QtGui import QMouseEvent, QPalette, QTextCursor, QWheelEvent
+from PyQt6.QtGui import QKeyEvent, QMouseEvent, QPalette, QTextCursor, QWheelEvent
 from PyQt6.QtWidgets import QApplication, QTextBrowser
 
 import viewer as viewer_mod
@@ -351,6 +351,50 @@ def main() -> int:
         check("visibility persisted", win._settings.value("toc_visible", True, type=bool), False)
         win._toggle_outline()
         check("outline comes back", win._toc.isVisible(), True)
+
+        # --- breadcrumbs: the heading path of the current section
+        win._outline_clicked(win._toc.item(5))  # "## Section 4" under "# One"
+        for _ in range(8):
+            app.processEvents()
+        win._sync_crumbs()
+        check("breadcrumbs appear inside a section", win._crumbs.isVisible(), True)
+        check("breadcrumbs show the ancestor and the current heading",
+              "One" in win._crumbs.text() and "Section 4" in win._crumbs.text(), True)
+        check("breadcrumbs encode the ancestor as a link",
+              'href="0"' in win._crumbs.text(), True)
+        win._crumb_clicked("0")
+        for _ in range(8):
+            app.processEvents()
+        win._sync_outline()
+        win._sync_crumbs()
+        check("crumb click jumps to its heading", win._current_section_index(), 0)
+        check("crumb click updates the picked section", win._selected_section, 0)
+        check("breadcrumbs hide on a bare top heading", win._crumbs.isVisible(), False)
+
+        # --- outline filter: hides non-matching rows, Esc clears
+        win._toc_filter.setText("Section 3")
+        for _ in range(2):
+            app.processEvents()
+        shown = [r for r in range(win._toc.count()) if not win._toc.item(r).isHidden()]
+        check("filter hides the non-matching rows", len(shown) < win._toc.count(), True)
+        check("filter drops the root heading", win._toc.item(0).isHidden(), True)
+        check("filter keeps only matching rows",
+              all("Section 3" in win._toc.item(r).text() for r in shown), True)
+        check("filter keeps the matching section", win._toc.item(4).isHidden(), False)
+        check("outline stays visible while filtering", win._toc_panel.isVisible(), True)
+        win._populate_outline()  # a rebuild must re-apply the filter
+        for _ in range(2):
+            app.processEvents()
+        check("filter re-applies after a rebuild", win._toc.item(0).isHidden(), True)
+        escape_key = QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier
+        )
+        win.eventFilter(win._toc_filter, escape_key)
+        for _ in range(2):
+            app.processEvents()
+        check("Esc in the filter clears it", win._toc_filter.text(), "")
+        check("clearing restores every row",
+              all(not win._toc.item(r).isHidden() for r in range(win._toc.count())), True)
 
         # --- search: PyQt6 wants a FindFlag, a bool used to abort the process
         win._toggle_find()

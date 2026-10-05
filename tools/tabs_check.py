@@ -429,6 +429,31 @@ def main() -> int:
         close_window(win)
         pump(app)
 
+        # --- 14. reading mode (F11): fullscreen, tab bar and outline hidden
+        win = MainWindow(settings_for("tabs_reading"))
+        win._open_paths([a, b])
+        win.show()
+        pump(app)
+        window_keys = [s.key().toString() for s in win.findChildren(QShortcut)
+                       if s.parent() is win]
+        check("F11 is a window key", "F11" in window_keys, True)
+        view = win._tabs.currentWidget()
+        check("not fullscreen before F11", win.isFullScreen(), False)
+        check("tab bar visible before F11", win._tabs.tabBar().isVisible(), True)
+        check("outline visible before F11", view._toc_panel.isVisible(), True)
+        win._toggle_reading_mode()
+        pump(app)
+        check("F11 enters fullscreen", win.isFullScreen(), True)
+        check("F11 hides the tab bar", win._tabs.tabBar().isVisible(), False)
+        check("reading mode hides the outline", view._toc_panel.isVisible(), False)
+        view._handle_esc()
+        pump(app)
+        check("Esc leaves reading mode", win.isFullScreen(), False)
+        check("Esc brings the tab bar back", win._tabs.tabBar().isVisible(), True)
+        check("Esc brings the outline back", view._toc_panel.isVisible(), True)
+        close_window(win)
+        pump(app)
+
     print("all checks passed" if not failures else f"{len(failures)} failure(s)")
     return 1 if failures else 0
 
