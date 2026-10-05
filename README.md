@@ -1,7 +1,8 @@
 # MD Viewer
 
 Быстрый просмотрщик Markdown для Windows: PyQt6 + mistune, тёмная тема,
-сборка в один `.exe` без установленного Python.
+самодостаточная сборка без установленного Python, установщик и портативная
+версия.
 
 ## Возможности
 
@@ -56,13 +57,61 @@ py -3.14 -m venv .venv
 
 ## Сборка
 
+Требования: Windows 10/11, Python **3.14** (подойдёт и 3.10+), интернет для
+установки зависимостей. Всё остальное делает `build.bat`.
+
 ```bash
-build.bat            # .venv + зависимости + PyInstaller -> dist\MDViewer
-build.bat --run      # ... и сразу регистрация обработчика .md
+git clone https://github.com/KokosAHDPEEBU4/mdviewer.git
+cd mdviewer
+build.bat
 ```
 
-`dist\MDViewer\MDViewer.exe` (~54 МБ) содержит свой интерпретатор
-(`python314.dll`) и Qt — Python на машине не нужен.
+`build.bat` по шагам:
+1. создаёт `.venv` (если его нет) и ставит `requirements.txt` + PyInstaller;
+2. чистит `build\` и `dist\` — это обязательно: старые `pythonXXX.dll` иначе
+   попадают в сборку и приложение падает с «не найден python310.dll»;
+3. собирает `PyInstaller --clean MDViewer.spec`.
+
+Результат — `dist\MDViewer\MDViewer.exe` рядом с папкой `_internal\` (свой
+интерпретатор `python314.dll` и Qt; Python на машине не нужен).
+
+```bash
+dist\MDViewer\MDViewer.exe README.md   # запустить собранное
+build.bat --run                        # собрать и сразу зарегистрировать .md
+```
+
+Проверка свежести сборки: в `dist\MDViewer\_internal\` есть `python314.dll` и
+**нет** `python310.dll`.
+
+## Установщик
+
+`build-installer.bat` оборачивает готовый `dist\MDViewer` в инсталлятор Inno
+Setup — `dist\MDViewer-Setup-<версия>.exe` (ярлыки в меню «Пуск» и на рабочем
+столе, пункт «сделать `.md` по умолчанию», корректный деинсталлятор).
+
+```bash
+build.bat            # сначала сама сборка (если dist ещё нет — соберётся сам)
+build-installer.bat  # затем инсталлятор
+```
+
+Требуется **Inno Setup 6** (https://jrsoftware.org/isinfo.php); скрипт ищет
+`ISCC.exe` в `Program Files (x86)\Inno Setup 6`.
+
+## Релизы (установщик в GitHub Releases)
+
+Установщик собирается автоматически в CI по тегу — локальные Inno Setup и `gh`
+не нужны:
+
+```bash
+# поднимите версию в version.py, закоммитьте, затем:
+git tag v2.6.0
+git push mdviewer master --tags
+```
+
+Workflow `.github/workflows/release.yml` на `windows-latest` собирает приложение,
+делает инсталлятор через Inno Setup и публикует в **Releases** два файла:
+`MDViewer-Setup-<версия>.exe` и `MDViewer-portable.zip`. Версия файла берётся из
+`version.py`.
 
 ## Ассоциация с .md
 
@@ -99,6 +148,10 @@ theme.py       палитра, CSS для Qt rich text, размеры коло�
 winassoc.py    регистрация обработчика .md в HKCU
 version.py     версия, имя, ProgID, расширения
 MDViewer.spec  PyInstaller: onedir, иконка, версия, вырезание лишнего Qt
+build.bat      venv + зависимости + PyInstaller, флаг --run
+build-installer.bat  оборачивает dist\MDViewer в Inno Setup инсталлятор
+installer/     MDViewer.iss — сценарий Inno Setup
+.github/       workflows: ci.yml (py_compile) и release.yml (тег -> релиз)
 tools/         make_icon.py (генерация assets/icon.ico), render_check.py,
                debug_html.py (быстрый просмотр HTML),
                edit_check.py (правка/оглавление/оверлей без пользователя),

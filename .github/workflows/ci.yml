@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  compile:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Byte-compile every module
+        run: python -m py_compile main.py viewer.py renderer.py theme.py syncsel.py winassoc.py instance.py version.py tools/edit_check.py tools/tabs_check.py tools/render_check.py
