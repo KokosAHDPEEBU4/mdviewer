@@ -186,13 +186,9 @@ DRAFT_AUTOSAVE_MS = 3000
 RECENT_LIMIT = 10
 RECENT_KEY = "recent_files"
 
-# Editor <-> preview scroll sync (only while editing). A scrollbar emits many
-# single-step changes; the timer coalesces a burst into one cross-pane move.
+# Editor <-> preview pair scroll (Alt+wheel while editing). A wheel burst emits
+# many steps; the timer coalesces them into one cross-pane move.
 SYNC_SCROLL_MS = 70
-# Entering/leaving edit moves scrollbars itself (caret placement, relayout), so
-# sync is held off until the mode has settled; otherwise the careful
-# "open on the visible paragraph" positioning would be undone by a loop.
-SYNC_SCROLL_SETTLE_MS = 250
 
 # Zoom levels offered as the default for new tabs (the dialog's combo and the
 # "масштаб по умолчанию" setting). Stored as steps of 10% on top of 100%.
@@ -364,9 +360,31 @@ class LineNumberedEdit(OverlayPlainTextEdit):
         self._gutter_bg = CODE_BG
         self._gutter_fg = TEXT_MUTED
         self._gutter = LineNumberArea(self)
+        self._gutter.setFont(self.font())  # digits follow the (zoomable) font
         self.blockCountChanged.connect(self._update_gutter_width)
         self.updateRequest.connect(self._update_gutter)
         self._update_gutter_width()
+
+    def changeEvent(self, event):
+        """The zoom changes the widget font via `setFont`; the gutter must
+        follow, or its reserved width and drawn digits stay at the base size."""
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.FontChange and hasattr(self, "_gutter"):
+            self._gutter.setFont(self.font())
+            self._update_gutter_width()
+            self._gutter.update()
+
+    def _layout_gutter(self) -> None:
+        """Park the gutter next to the viewport at the current font width.
+
+        `setViewportMargins` resizes the *viewport*, not the editor, so no
+        `resizeEvent` reaches us on a font/zoom change; laying the gutter out
+        here keeps its width in step with the freshly reserved margin.
+        """
+        area = self.contentsRect()
+        self._gutter.setGeometry(
+            QRect(area.left(), area.top(), self.line_number_area_width(), area.height())
+        )
 
     def set_palette_colours(self, background: str, foreground: str) -> None:
         """Theme switch: repaint the gutter in the active palette colours."""
@@ -379,6 +397,7 @@ class LineNumberedEdit(OverlayPlainTextEdit):
         self._gutter.setVisible(self._line_numbers)
         self._update_gutter_width()
         self._update_gutter(self.viewport().rect(), 0)
+        self._layout_gutter()
 
     def line_numbers_visible(self) -> bool:
         return self._line_numbers and self._gutter.isVisible()
@@ -391,6 +410,8 @@ class LineNumberedEdit(OverlayPlainTextEdit):
 
     def _update_gutter_width(self, *_args) -> None:
         self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
+        if hasattr(self, "_gutter"):
+            self._layout_gutter()
 
     def _update_gutter(self, rect: QRect, dy: int) -> None:
         if dy:
@@ -402,13 +423,11 @@ class LineNumberedEdit(OverlayPlainTextEdit):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        area = self.contentsRect()
-        self._gutter.setGeometry(
-            QRect(area.left(), area.top(), self.line_number_area_width(), area.height())
-        )
+        self._layout_gutter()
 
     def paint_line_numbers(self, event) -> None:
         painter = QPainter(self._gutter)
+        painter.setFont(self.font())  # draw the digits at the editor's size
         painter.fillRect(event.rect(), QColor(self._gutter_bg))
         painter.setPen(QColor(self._gutter_fg))
         block = self.firstVisibleBlock()
@@ -546,12 +565,11 @@ class DocumentView(QWidget):
         self._map_dirty = False        # editor edited since the last render
         self._toc_syncing = False
         self._wheel_accum = {}        # per-pane leftover wheel delta for smooth zoom
-        # editor <-> preview scroll sync (only while editing). One flag breaks
-        # the feedback loop (setting the other bar re-emits valueChanged), the
-        # timer throttles a burst of steps, and `_sync_source` is the pane that
-        # started the pending sync.
+        # editor <-> preview pair scroll (Alt+wheel while editing). One flag
+        # breaks the feedback loop (setting the other bar re-emits valueChanged),
+        # the timer throttles a burst of steps, and `_sync_source` is the pane
+        # that started the pending sync.
         self._syncing_scroll = False
-        self._sync_suppressed = False
         self._sync_source = None
         self._sync_count = 0          # applied syncs (diagnostics / tests)
         self._sync_timer = QTimer(self)
@@ -608,7 +626,6 @@ class DocumentView(QWidget):
         self._browser.viewport().setMouseTracking(True)  # autoscroll follows the pointer
         self._browser.verticalScrollBar().valueChanged.connect(self._sync_outline)
         self._browser.verticalScrollBar().valueChanged.connect(self._sync_crumbs)
-        self._browser.verticalScrollBar().valueChanged.connect(self._on_preview_scrolled)
         self._browser.selectionChanged.connect(self._highlight_editor_from_preview)
         self._preview_base_font = QFont(self._browser.document().defaultFont())
 
@@ -1388,7 +1405,7 @@ class DocumentView(QWidget):
         self._editor_zoom_in = QToolButton()
         self._editor_zoom_in.setText("+")
         self._editor_zoom_in.clicked.connect(lambda: self._set_editor_zoom(self._editor_zoom + 1))
-        # Editor options (wrap / line numbers / scroll sync) live in the single
+        # Editor options (wrap / line numbers) live in the single
         # "Настройки" dialog now (Ctrl+, or the tab context menu); the header
         # keeps only the pane's own zoom controls.
         for widget in (
@@ -1409,7 +1426,6 @@ class DocumentView(QWidget):
         self._editor.viewport().installEventFilter(self)  # wheel lands on the viewport
         self._editor.viewport().setMouseTracking(True)  # autoscroll follows the pointer
         self._editor.selectionChanged.connect(self._highlight_preview_from_editor)
-        self._editor.verticalScrollBar().valueChanged.connect(self._on_editor_scrolled)
         self._editor_base_font = self._editor.font()
         self._apply_editor_options()
         self._refresh_theme_chrome()  # gutter matches the active palette
@@ -1460,30 +1476,18 @@ class DocumentView(QWidget):
         if self._editor is not None and hasattr(self._editor, "set_line_numbers"):
             self._editor.set_line_numbers(bool(enabled))
 
-    def _sync_scroll_enabled(self) -> bool:
-        """Whether scrolling one pane pulls the other along (default on)."""
-        return self._settings.value("sync_scroll", True, type=bool)
-
-    def _set_sync_scroll(self, enabled: bool) -> None:
-        """Persist the scroll-sync toggle and drop any pending sync."""
-        self._settings.setValue("sync_scroll", bool(enabled))
-        if not enabled:
-            self._sync_timer.stop()
-            self._sync_source = None
-
     def _apply_settings(self, values: dict) -> None:
         """Push a settings-dialog payload onto this view's editor.
 
-        Wrap / line numbers / scroll sync are applied live to an editor that
-        already exists and persisted; the theme and the default zoom belong to
-        the window (`MainWindow._apply_settings`).
+        Wrap / line numbers are applied live to an editor that already exists and
+        persisted; the theme and the default zoom belong to the window
+        (`MainWindow._apply_settings`). Pair scroll is not a setting: it is
+        driven on demand with Alt+wheel.
         """
         if "editor_wrap" in values:
             self._set_editor_wrap(bool(values["editor_wrap"]))
         if "editor_line_numbers" in values:
             self._set_editor_line_numbers(bool(values["editor_line_numbers"]))
-        if "sync_scroll" in values:
-            self._set_sync_scroll(bool(values["sync_scroll"]))
 
     def _toggle_edit(self) -> None:
         if self._editing():
@@ -1496,10 +1500,7 @@ class DocumentView(QWidget):
 
     def _enter_edit(self) -> None:
         self._ensure_overlay()
-        # caret placement and relayout move scrollbars on their own; hold the
-        # cross-pane sync back until edit mode has settled so entering never
-        # nudges the reader (invariant 15/17)
-        self._sync_suppressed = True
+        # drop any pending pair scroll from a previous Alt+wheel gesture
         self._sync_timer.stop()
         self._sync_source = None
         # the preview column shrinks a little when the editor opens (the window
@@ -1568,8 +1569,6 @@ class DocumentView(QWidget):
         self._highlight_editor_from_preview()  # keep an existing preview selection in view
         self._show_overlay()  # move it over the (now narrower) preview at once
         self._update_state()
-        # once the layout is stable, accept the first user-driven scroll sync
-        QTimer.singleShot(SYNC_SCROLL_SETTLE_MS, self._release_scroll_sync)
 
     def _visible_paragraph(self) -> str:
         """Rendered text of the paragraph at the top of the preview viewport."""
@@ -2030,7 +2029,6 @@ class DocumentView(QWidget):
             return
         self._discard_draft()  # leaving edit mode always retires the draft
         self._ensure_overlay()
-        self._sync_suppressed = True
         self._sync_timer.stop()
         self._sync_source = None
         self._preview_anchor = None  # entering-edit pin must not outlive the edit
@@ -2576,6 +2574,14 @@ class DocumentView(QWidget):
                 if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                     self._wheel_zoom(pane, event)
                     return True
+                if (
+                    self._editing()
+                    and event.modifiers() & Qt.KeyboardModifier.AltModifier
+                ):
+                    # Alt+wheel: pull the other pane along with this pane's
+                    # scroll. Let the event through so the pane under the pointer
+                    # scrolls natively; the timer then maps and moves the other.
+                    self._queue_scroll_sync(pane)
                 self._stop_autoscroll()
             elif etype == QEvent.Type.MouseButtonPress:
                 if event.button() == Qt.MouseButton.MiddleButton:
@@ -2838,38 +2844,24 @@ class DocumentView(QWidget):
         top = document.documentLayout().blockBoundingRect(block).top()
         self._browser.verticalScrollBar().setValue(max(0, round(top + offset)))
 
-    # -- editor <-> preview scroll sync (edit mode only) -------------------
-
-    def _on_preview_scrolled(self, _value: int) -> None:
-        self._queue_scroll_sync(self._browser)
-
-    def _on_editor_scrolled(self, _value: int) -> None:
-        self._queue_scroll_sync(self._editor)
+    # -- editor <-> preview pair scroll (Alt+wheel, edit mode only) --------
 
     def _queue_scroll_sync(self, source) -> None:
-        """Coalesce scrollbar steps into one sync.
+        """Coalesce a wheel burst into one pair scroll.
 
-        Bailing out on the guard, on a hidden pane and outside edit mode keeps
-        the feature from fighting the layout or running in read mode.
+        Triggered only by the Alt+wheel gesture over a pane, so plain scrolling
+        never pulls the other pane along.
         """
         if (
             self._syncing_scroll
-            or self._sync_suppressed
             or self._in_relayout
             or not self._editing()
-            or not self._sync_scroll_enabled()
             or self._editor is None
             or not self._panel.isVisible()
         ):
             return
         self._sync_source = source
         self._sync_timer.start()
-
-    def _release_scroll_sync(self) -> None:
-        """Edit mode has settled: accept the first user-driven sync."""
-        self._sync_suppressed = False
-        self._sync_timer.stop()
-        self._sync_source = None
 
     def _preview_top_position(self) -> int:
         return self._browser.cursorForPosition(
@@ -2882,7 +2874,7 @@ class DocumentView(QWidget):
         ).position()
 
     def _sync_scroll_now(self) -> None:
-        """Apply the pending scroll sync.
+        """Apply the pending pair scroll.
 
         `_syncing_scroll` is held for the whole target move: setting a
         scrollbar emits `valueChanged`, and without the flag that would queue
@@ -2893,9 +2885,7 @@ class DocumentView(QWidget):
         if source is None:
             return
         if (
-            self._sync_suppressed
-            or not self._editing()
-            or not self._sync_scroll_enabled()
+            not self._editing()
             or self._editor is None
             or not self._panel.isVisible()
         ):
@@ -3270,9 +3260,9 @@ class TabBar(QTabBar):
 class SettingsDialog(QDialog):
     """One dialog for the settings that used to be scattered over the menus.
 
-    Theme, the default zoom of new tabs, session restore and the three editor
-    toggles (wrap, line numbers, scroll sync) are read from `QSettings` when the
-    dialog is built and written back by `MainWindow._apply_settings` on OK.
+    Theme, the default zoom of new tabs, session restore and the two editor
+    toggles (wrap, line numbers) are read from `QSettings` when the dialog is
+    built and written back by `MainWindow._apply_settings` on OK.
     """
 
     def __init__(self, settings: QSettings, parent=None):
@@ -3297,8 +3287,6 @@ class SettingsDialog(QDialog):
         self._wrap.setChecked(settings.value("editor_wrap", True, type=bool))
         self._numbers = QCheckBox("Номера строк в редакторе")
         self._numbers.setChecked(settings.value("editor_line_numbers", False, type=bool))
-        self._sync = QCheckBox("Синхронизировать прокрутку редактор ↔ превью")
-        self._sync.setChecked(settings.value("sync_scroll", True, type=bool))
 
         form = QFormLayout()
         form.addRow("Тема:", self._theme)
@@ -3306,7 +3294,6 @@ class SettingsDialog(QDialog):
         form.addRow("", self._session)
         form.addRow("", self._wrap)
         form.addRow("", self._numbers)
-        form.addRow("", self._sync)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -3332,7 +3319,6 @@ class SettingsDialog(QDialog):
             "restore_session": self._session.isChecked(),
             "editor_wrap": self._wrap.isChecked(),
             "editor_line_numbers": self._numbers.isChecked(),
-            "sync_scroll": self._sync.isChecked(),
         }
 
 
@@ -3797,9 +3783,9 @@ class MainWindow(QMainWindow):
     def _apply_settings(self, values: dict) -> None:
         """Apply a settings-dialog payload to every open window and tab.
 
-        The theme re-renders every document; wrap / line numbers / scroll sync
-        reach existing editors; the default zoom is only remembered, so new tabs
-        open at it while the ones already open are left alone.
+        The theme re-renders every document; wrap / line numbers reach existing
+        editors; the default zoom is only remembered, so new tabs open at it
+        while the ones already open are left alone.
         """
         theme = normalize(values.get("theme", self._theme_name()))
         if theme != self._theme_name():

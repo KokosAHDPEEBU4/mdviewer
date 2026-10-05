@@ -504,24 +504,19 @@ build.bat                                       # сборка dist\MDViewer
     через `textChanged`, поэтому dirty и карта помечаются существующим путём
     (`_update_state`/`_map_dirty`), а превью не перерисовывается (инвариант 12).
 
-31. **Синхронизация прокрутки редактор ↔ превью — только в правке.** Тумблер
-    `QSettings("sync_scroll")` (дефолт — вкл) живёт в диалоге «Настройки»
-    (инвариант 35) и применяется ко всем существующим `DocumentView`.
-    `valueChanged` обоих `verticalScrollBar` зовёт
-    `_queue_scroll_sync`, которая взводит `_sync_timer` (`SYNC_SCROLL_MS` = 70,
-    single-shot) — троттлинг пачки шагов. `_sync_scroll_now` применяет одно
-    перемещение через карту `SourceMap` (`to_source`/`to_render`), а если карта
-    недоступна/устарела (`_map_dirty`) — по заголовку раздела
-    (`_editor_position_for_section` / `_editor_section_label` +
-    `_preview_index_for_label`), **не пересобирая HTML**. Петля рвётся флагом
-    `_syncing_scroll`: установка чужого скроллбара эмитит `valueChanged`, но
-    очередь при поднятом флаге выходит. Синхронизация не идёт вне правки, при
-    скрытой панели, при `_in_relayout` и выключенном тумблере. Вход/выход из
-    правки поднимают `_sync_suppressed` (`SYNC_SCROLL_SETTLE_MS` = 250, затем
-    `_release_scroll_sync`), иначе расстановка каретки/`_relayout` сами дёргали
-    бы прокрутку и «прыгали» (инварианты 15/17).     `_scroll_editor_to` кладёт
-    `blockBoundingGeometry(block).top()` прямо в скроллбар: у `QPlainTextEdit`
-    он измеряется в пикселях, а геометрия блока — в координатах документа.
+31. **Парная прокрутка редактор ↔ превью — по `Alt`+колесо, а не настройка.**
+    В режиме правки `Alt`+колесо над панелью (превью или редактор) в
+    `eventFilter` зовёт `_queue_scroll_sync(pane)`; событие пропускается вниз
+    (панель прокручивается нативно), а `_sync_timer` (`SYNC_SCROLL_MS` = 70,
+    single-shot) через `_sync_scroll_now` подтягивает вторую панель. Обычное
+    колесо панели не связывает. Перемещение идёт через карту `SourceMap`
+    (`to_source`/`to_render`), а если карта недоступна/устарела (`_map_dirty`) —
+    по заголовку раздела (`_editor_position_for_section` / `_editor_section_label`
+    + `_preview_index_for_label`), **не пересобирая HTML**. Петля рвётся флагом
+    `_syncing_scroll`. Синхронизация не идёт вне правки и при скрытой панели.
+    `_scroll_editor_to` кладёт `blockBoundingGeometry(block).top()` прямо в
+    скроллбар: у `QPlainTextEdit` он в пикселях, а геометрия блока — в координатах
+    документа. Тумблера `sync_scroll` в настройках больше нет.
 
 32. **Тема — тёмная (по умолчанию) или светлая; тёмная остаётся неизменной.**
     Имя хранится в `QSettings("theme")` (`"dark"`/`"light"`). `theme.py` держит

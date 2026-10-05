@@ -598,7 +598,6 @@ def main() -> int:
         check("the dialog reflects wrap on", dialog._wrap.isChecked(), True)
         check("the dialog reflects line numbers off",
               dialog._numbers.isChecked(), False)
-        check("the dialog reflects scroll sync on", dialog._sync.isChecked(), True)
 
         # flip everything and apply, exactly as "ОК" would
         dialog._theme.setCurrentIndex(dialog._theme.findData("light"))
@@ -606,7 +605,6 @@ def main() -> int:
         dialog._session.setChecked(True)
         dialog._wrap.setChecked(False)
         dialog._numbers.setChecked(True)
-        dialog._sync.setChecked(False)
         win._apply_settings(dialog.values())
         pump(app)
         check("OK persists the theme",
@@ -622,8 +620,6 @@ def main() -> int:
               dialog_settings.value("editor_wrap", True, type=bool), False)
         check("OK persists line numbers on",
               dialog_settings.value("editor_line_numbers", False, type=bool), True)
-        check("OK persists scroll sync off",
-              dialog_settings.value("sync_scroll", True, type=bool), False)
         check("applying the default zoom leaves open tabs alone",
               [win._tabs.widget(i)._zoom for i in range(win._tabs.count())], [0, 0])
         check("a rebuilt dialog reflects the saved theme",

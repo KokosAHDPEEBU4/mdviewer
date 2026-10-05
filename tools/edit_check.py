@@ -997,9 +997,9 @@ def main() -> int:
 
         dialog = win._build_settings_dialog()
         check("the settings dialog is filled from the current settings",
-              (dialog._zoom.currentData(), dialog._wrap.isChecked(),
-               dialog._numbers.isChecked(), dialog._sync.isChecked()),
-              (0, True, False, True))
+               (dialog._zoom.currentData(), dialog._wrap.isChecked(),
+                dialog._numbers.isChecked()),
+               (0, True, False))
         check("the dialog offers the full zoom ladder",
               [dialog._zoom.itemData(i) for i in range(dialog._zoom.count())],
               [-2, -1, 0, 1, 2, 5, 10])
@@ -1008,7 +1008,6 @@ def main() -> int:
         dialog._zoom.setCurrentIndex(dialog._zoom.findData(5))
         dialog._wrap.setChecked(False)
         dialog._numbers.setChecked(True)
-        dialog._sync.setChecked(False)
         win._apply_settings(dialog.values())
         for _ in range(2):
             app.processEvents()
@@ -1018,8 +1017,6 @@ def main() -> int:
               win._editor.line_numbers_visible(), True)
         check("the gutter is reserved after applying numbers",
               win._editor.viewportMargins().left() > 0, True)
-        check("scroll sync from the dialog is persisted",
-              settings.value("sync_scroll", True, type=bool), False)
         check("the default zoom from the dialog is persisted",
               settings.value("default_zoom", 0, type=int), 5)
         rebuilt = win._build_settings_dialog()
@@ -1195,62 +1192,58 @@ def main() -> int:
         win.show()
         for _ in range(3):
             app.processEvents()
-        check("scroll sync is on by default",
-              settings.value("sync_scroll", True, type=bool), True)
-
         win._enter_edit()
         for _ in range(4):
             app.processEvents()
-        win._release_scroll_sync()  # let the settled mode accept user scrolls
 
-        # preview -> editor
+        def wheel(pane, modifier):
+            event = QWheelEvent(
+                QPointF(10, 10), QPointF(10, 10), QPoint(0, 0), QPoint(0, 120),
+                Qt.MouseButton.NoButton, modifier,
+                Qt.ScrollPhase.NoScrollPhase, False,
+            )
+            QApplication.sendEvent(pane.viewport(), event)
+            for _ in range(2):
+                app.processEvents()
+
+        # a plain wheel scrolls its own pane only (pairing is not a default)
+        win._sync_source = None
         win._sync_count = 0
+        wheel(win._editor, Qt.KeyboardModifier.NoModifier)
+        check("a plain wheel queues no pair scroll", win._sync_source, None)
+        check("a plain wheel applies no sync", win._sync_count, 0)
+
+        # Alt+wheel over the editor pulls the preview to the same place
+        editor_bar = win._editor.verticalScrollBar()
+        editor_bar.setValue(editor_bar.maximum() // 2)
+        app.processEvents()
+        win._sync_source = None
+        win._sync_count = 0
+        wheel(win._editor, Qt.KeyboardModifier.AltModifier)
+        check("Alt+wheel over the editor queues a pair scroll",
+              win._sync_source is win._editor, True)
+        preview_before = win._browser.verticalScrollBar().value()
+        win._sync_scroll_now()
+        check("Alt+wheel over the editor moves the preview",
+              win._browser.verticalScrollBar().value() != preview_before, True)
+        check("the editor->preview pair applies once", win._sync_count, 1)
+        check("no loop is left pending", win._sync_source, None)
+
+        # Alt+wheel over the preview pulls the editor to the same place
         preview_bar = win._browser.verticalScrollBar()
         preview_bar.setValue(preview_bar.maximum() // 2)
         app.processEvents()
-        check("a preview scroll queues a sync", win._sync_source is win._browser, True)
-        win._sync_scroll_now()
-        check("a preview scroll moves the editor",
-              win._editor.verticalScrollBar().value() > 0, True)
-        check("one user scroll applies one sync", win._sync_count, 1)
-        check("no loop is left pending", win._sync_source, None)
-
-        # editor -> preview
+        win._sync_source = None
         win._sync_count = 0
-        editor_bar = win._editor.verticalScrollBar()
-        editor_bar.setValue(max(0, editor_bar.value() - editor_bar.pageStep()))
-        app.processEvents()
-        check("an editor scroll queues a sync", win._sync_source is win._editor, True)
-        preview_before = win._browser.verticalScrollBar().value()
+        wheel(win._browser, Qt.KeyboardModifier.AltModifier)
+        check("Alt+wheel over the preview queues a pair scroll",
+              win._sync_source is win._browser, True)
+        editor_before = win._editor.verticalScrollBar().value()
         win._sync_scroll_now()
-        check("an editor scroll moves the preview",
-              win._browser.verticalScrollBar().value() != preview_before, True)
-        check("the reverse sync also fires once", win._sync_count, 1)
-        check("the reverse sync leaves no pending loop", win._sync_source, None)
-
-        # the guard really breaks the loop: a sync-driven scroll re-queues nothing
-        win._syncing_scroll = True
-        win._browser.verticalScrollBar().setValue(10)
-        app.processEvents()
-        check("a sync-driven scroll does not queue another sync",
-              win._sync_source, None)
-        win._syncing_scroll = False
-
-        # disabled toggle: scrolling one pane leaves the other alone
-        win._set_sync_scroll(False)
-        check("sync toggle is persisted",
-              settings.value("sync_scroll", True, type=bool), False)
-        editor_bar = win._editor.verticalScrollBar()
-        editor_bar.setValue(
-            min(editor_bar.maximum(), editor_bar.value() + editor_bar.pageStep())
-        )
-        app.processEvents()
-        check("a disabled sync queues nothing", win._sync_source, None)
-        preview_now = win._browser.verticalScrollBar().value()
-        win._sync_scroll_now()
-        check("a disabled sync does not move the preview",
-              win._browser.verticalScrollBar().value(), preview_now)
-        win._set_sync_scroll(True)
+        check("Alt+wheel over the preview moves the editor",
+              win._editor.verticalScrollBar().value() != editor_before, True)
+        check("the preview->editor pair applies once", win._sync_count, 1)
+        check("the reverse pair leaves no pending loop", win._sync_source, None)
 
         # entering edit must not disturb the preview position (invariant 15/17)
         win._confirm_discard = lambda: True
