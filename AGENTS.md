@@ -440,6 +440,21 @@ build.bat                                       # сборка dist\MDViewer
       через `getattr`: событие может прийти во время сборки виджетов, иначе
       `AttributeError` в `eventFilter` роняет процесс с `0xC0000409`.
 
+28. **Редактор: необязательные перенос строк и номера строк.**
+    Настройки `QSettings("editor_wrap")` (дефолт — вкл) и
+    `QSettings("editor_line_numbers")` (дефолт — выкл) переключаются кнопкой
+    «⋯» в шапке панели редактора и применяются сразу и к текущему, и к будущим
+    редакторам (`_apply_editor_options` при `_build_editor`). Перенос —
+    `QPlainTextEdit.setLineWrapMode(WidgetWidth|NoWrap)`. Номера строк —
+    классический жёлоб `LineNumberArea` в отступе `QPlainTextEdit`; место
+    резервирует `setViewportMargins`, поэтому он не перекрывает текст.
+    `LineNumberedEdit` наследует `OverlayPlainTextEdit`, то есть
+    `_OverlayMixin.paintEvent` (ручная дорисовка зеркала выделения поверх
+    нативного, инвариант 22) продолжает работать: жёлоб — **отдельный дочерний
+    виджет**, а не часть `paintEvent` редактора. Не рисуй зеркало в жёлобе и не
+    трогай `_paint_selection_overlay`. Тумблеры не меняют `toPlainText()`
+    (по-прежнему только `\n`, инвариант 10) и базовую линию `_baseline`.
+
 Максимум контента — до `MEASURE` px, оглавление фиксируется по `TOC_WIDTH`,
 отступы уровней — `TOC_STEP`; всё в `theme.py`.
 

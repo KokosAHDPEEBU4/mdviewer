@@ -20,6 +20,7 @@ from PyQt6.QtCore import (
     QRegularExpression,
     QRect,
     QSettings,
+    QSize,
     QTimer,
     QUrl,
     Qt,
@@ -69,6 +70,7 @@ from syncsel import SourceMap
 from theme import (
     ACCENT,
     ACCENT_DIM,
+    CODE_BG,
     EDITOR_HARD,
     EDITOR_MIN,
     EDITOR_PREF,
@@ -248,6 +250,102 @@ class OverlayTextBrowser(_OverlayMixin, QTextBrowser):
 
 class OverlayPlainTextEdit(_OverlayMixin, QPlainTextEdit):
     pass
+
+
+class LineNumberArea(QWidget):
+    """The gutter next to a `LineNumberedEdit`.
+
+    It is a child widget parked in the viewport margin the editor reserves, so
+    the numbers never overlap the text and the editor's own `paintEvent` (which
+    `_OverlayMixin` already overrides for the selection mirror) is left alone.
+    """
+
+    def __init__(self, editor: "LineNumberedEdit"):
+        super().__init__(editor)
+        self._editor = editor
+
+    def sizeHint(self) -> QSize:
+        return QSize(self._editor.line_number_area_width(), 0)
+
+    def paintEvent(self, event):
+        self._editor.paint_line_numbers(event)
+
+
+class LineNumberedEdit(OverlayPlainTextEdit):
+    """`QPlainTextEdit` with an optional line-number gutter.
+
+    The gutter is toggleable at runtime (`set_line_numbers`); when off the
+    reserved viewport margin drops back to zero. `_OverlayMixin`'s selection
+    overlay keeps working because the numbers are drawn by the gutter widget,
+    not by the editor's `paintEvent`.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._line_numbers = True
+        self._gutter = LineNumberArea(self)
+        self.blockCountChanged.connect(self._update_gutter_width)
+        self.updateRequest.connect(self._update_gutter)
+        self._update_gutter_width()
+
+    def set_line_numbers(self, enabled: bool) -> None:
+        self._line_numbers = bool(enabled)
+        self._gutter.setVisible(self._line_numbers)
+        self._update_gutter_width()
+        self._update_gutter(self.viewport().rect(), 0)
+
+    def line_numbers_visible(self) -> bool:
+        return self._line_numbers and self._gutter.isVisible()
+
+    def line_number_area_width(self) -> int:
+        if not self._line_numbers:
+            return 0
+        digits = len(str(max(1, self.blockCount())))
+        return 12 + self.fontMetrics().horizontalAdvance("9") * digits
+
+    def _update_gutter_width(self, *_args) -> None:
+        self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
+
+    def _update_gutter(self, rect: QRect, dy: int) -> None:
+        if dy:
+            self._gutter.scroll(0, dy)
+        else:
+            self._gutter.update(0, rect.y(), self._gutter.width(), rect.height())
+        if rect.contains(self.viewport().rect()):
+            self._update_gutter_width()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        area = self.contentsRect()
+        self._gutter.setGeometry(
+            QRect(area.left(), area.top(), self.line_number_area_width(), area.height())
+        )
+
+    def paint_line_numbers(self, event) -> None:
+        painter = QPainter(self._gutter)
+        painter.fillRect(event.rect(), QColor(CODE_BG))
+        painter.setPen(QColor(TEXT_MUTED))
+        block = self.firstVisibleBlock()
+        number = block.blockNumber()
+        offset = self.contentOffset()
+        top = round(self.blockBoundingGeometry(block).translated(offset).top())
+        bottom = top + round(self.blockBoundingRect(block).height())
+        height = self.fontMetrics().height()
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                painter.drawText(
+                    0,
+                    top,
+                    self._gutter.width() - 6,
+                    height,
+                    Qt.AlignmentFlag.AlignRight,
+                    str(number + 1),
+                )
+            block = block.next()
+            top = bottom
+            bottom = top + round(self.blockBoundingRect(block).height())
+            number += 1
+        painter.end()
 
 
 class ScrollIndicator(QWidget):
@@ -947,13 +1045,33 @@ class DocumentView(QWidget):
         self._editor_zoom_in = QToolButton()
         self._editor_zoom_in.setText("+")
         self._editor_zoom_in.clicked.connect(lambda: self._set_editor_zoom(self._editor_zoom + 1))
-        for widget in (self._editor_zoom_out, self._editor_zoom_label, self._editor_zoom_in):
+        # a small overflow menu toggling the two editor options; the checks are
+        # set from QSettings before the signals are hooked, so building the menu
+        # never writes the settings back
+        self._editor_menu_btn = QToolButton()
+        self._editor_menu_btn.setText("⋯")
+        self._editor_menu_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        options = QMenu(self._editor_menu_btn)
+        self._wrap_action = options.addAction("Переносить строки")
+        self._wrap_action.setCheckable(True)
+        self._wrap_action.setChecked(self._editor_wrap())
+        self._wrap_action.toggled.connect(self._set_editor_wrap)
+        self._numbers_action = options.addAction("Номера строк")
+        self._numbers_action.setCheckable(True)
+        self._numbers_action.setChecked(self._editor_line_numbers())
+        self._numbers_action.toggled.connect(self._set_editor_line_numbers)
+        self._editor_menu_btn.setMenu(options)
+        for widget in (
+            self._editor_zoom_out,
+            self._editor_zoom_label,
+            self._editor_zoom_in,
+            self._editor_menu_btn,
+        ):
             header.addWidget(widget)
         layout.addLayout(header)
 
-        self._editor = OverlayPlainTextEdit()
+        self._editor = LineNumberedEdit()
         self._editor.overlay_painter = self._paint_selection_overlay
-        self._editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self._editor.setMinimumWidth(EDITOR_HARD)  # hard floor, see theme metrics
         self._editor.setPlaceholderText("Исходный Markdown — как в блокноте")
         self._editor.textChanged.connect(self._update_state)
@@ -963,6 +1081,7 @@ class DocumentView(QWidget):
         self._editor.viewport().setMouseTracking(True)  # autoscroll follows the pointer
         self._editor.selectionChanged.connect(self._highlight_preview_from_editor)
         self._editor_base_font = self._editor.font()
+        self._apply_editor_options()
         layout.addWidget(self._editor, 1)
 
         self._panel = panel
@@ -973,6 +1092,42 @@ class DocumentView(QWidget):
         self._splitter.addWidget(panel)
         self._splitter.setStretchFactor(1, 1)
         panel.setVisible(False)  # addWidget reveals the child; edit mode owns it
+
+    def _editor_wrap(self) -> bool:
+        """Whether long source lines wrap (default on: markdown reads better)."""
+        return self._settings.value("editor_wrap", True, type=bool)
+
+    def _editor_line_numbers(self) -> bool:
+        """Whether the source gutter is shown (off by default: less chrome)."""
+        return self._settings.value("editor_line_numbers", False, type=bool)
+
+    def _apply_editor_options(self) -> None:
+        """Push the saved wrap/line-number choices onto the editor."""
+        if self._editor is None:
+            return
+        self._editor.setLineWrapMode(
+            QPlainTextEdit.LineWrapMode.WidgetWidth
+            if self._editor_wrap()
+            else QPlainTextEdit.LineWrapMode.NoWrap
+        )
+        if hasattr(self._editor, "set_line_numbers"):
+            self._editor.set_line_numbers(self._editor_line_numbers())
+
+    def _set_editor_wrap(self, enabled: bool) -> None:
+        """Wrap toggle from the header menu: persist and apply at once."""
+        self._settings.setValue("editor_wrap", bool(enabled))
+        if self._editor is not None:
+            self._editor.setLineWrapMode(
+                QPlainTextEdit.LineWrapMode.WidgetWidth
+                if enabled
+                else QPlainTextEdit.LineWrapMode.NoWrap
+            )
+
+    def _set_editor_line_numbers(self, enabled: bool) -> None:
+        """Line-number toggle from the header menu: persist and apply at once."""
+        self._settings.setValue("editor_line_numbers", bool(enabled))
+        if self._editor is not None and hasattr(self._editor, "set_line_numbers"):
+            self._editor.set_line_numbers(bool(enabled))
 
     def _toggle_edit(self) -> None:
         if self._editing():
@@ -2157,6 +2312,9 @@ class DocumentView(QWidget):
             size = font.pointSizeF() * (1.0 + 0.1 * self._editor_zoom)
             font.setPointSizeF(max(6.0, size))
         self._editor.setFont(font)
+        # the gutter width is font-dependent, so re-reserve it after a zoom
+        if hasattr(self._editor, "_update_gutter_width"):
+            self._editor._update_gutter_width()
 
     def _update_editor_zoom_label(self) -> None:
         if getattr(self, "_editor_zoom_label", None) is None:
