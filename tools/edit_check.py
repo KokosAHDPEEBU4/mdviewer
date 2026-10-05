@@ -555,6 +555,8 @@ def main() -> int:
         check("Qt's own link handling is off", win._browser.openLinks(), False)
         win._show_overlay()
         check("back is disabled at the start", win._back_btn.isEnabled(), False)
+        check("the watch follows the open file", win._watch, first.resolve())
+        check("the watcher holds the open file", str(first.resolve()) in win._watcher.files(), True)
 
         # follow the link exactly as a click would
         win._browser.anchorClicked.emit(QUrl.fromLocalFile(str(second)))
@@ -564,6 +566,8 @@ def main() -> int:
         check("linked file rendered with the theme", "тело второго." in win._browser.toPlainText(), True)
         check("outline rebuilt for the linked file", win._toc.count(), 2)
         check("back is enabled after following a link", win._back_btn.isEnabled(), True)
+        check("navigation re-arms the watch on the new file", win._watch, second.resolve())
+        check("the old file is no longer watched", str(first.resolve()) in win._watcher.files(), False)
 
         win._go_back()
         for _ in range(3):
@@ -571,6 +575,7 @@ def main() -> int:
         check("back returns to the previous file", win._path, first.resolve())
         check("previous file is rendered again", "Смотри" in win._browser.toPlainText(), True)
         check("back is disabled once history is empty", win._back_btn.isEnabled(), False)
+        check("going back re-arms the watch too", win._watch, first.resolve())
 
         win.close()
         app.processEvents()
@@ -888,6 +893,93 @@ def main() -> int:
         win2._confirm_discard = lambda: True
         win2._leave_edit()
         win2.close()
+        app.processEvents()
+
+    # --- external file changes: silent reload, dirty prompt, deleted file
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "watch.md"
+        body = "# Doc\n\n" + "\n\n".join(f"## Section {i}\n\ntext {i} body\n" for i in range(30))
+        path.write_text(body, encoding="utf-8")
+        win = viewer_mod.Viewer(path, QSettings(tempfile.mkdtemp(), "watch_check"))
+        win.resize(800, 400)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+
+        check("a view watches the file it opened", win._watch, path.resolve())
+        check("the watcher really holds the path", str(path.resolve()) in win._watcher.files(), True)
+
+        # scroll into the middle, then change the file *below* the viewport: the
+        # reload must pick up the new text and keep the reader in place
+        bar = win._browser.verticalScrollBar()
+        bar.setValue(bar.maximum() // 2)
+        for _ in range(3):
+            app.processEvents()
+        before_block = win._browser.cursorForPosition(
+            win._browser.viewport().rect().topLeft()
+        ).block().blockNumber()
+        path.write_text(body + "\n\n## Appended\n\nfresh tail text\n", encoding="utf-8")
+        win._reload_timer.stop()
+        win._on_file_changed()
+        for _ in range(4):
+            app.processEvents()
+        check("a clean view reloads silently", "fresh tail text" in win._browser.toPlainText(), True)
+        after_block = win._browser.cursorForPosition(
+            win._browser.viewport().rect().topLeft()
+        ).block().blockNumber()
+        check("the reload keeps the reading position", abs(after_block - before_block) <= 1, True)
+        check("the fresh content is now the disk baseline",
+              win._baseline, viewer_mod._normalized(path.read_text(encoding="utf-8")))
+
+        # dirty view: refusing the prompt must not touch the editor or preview
+        win._enter_edit()
+        for _ in range(3):
+            app.processEvents()
+        draft = "# Draft\n\nmy unsaved text\n"
+        win._editor.setPlainText(draft)
+        check("the draft counts as unsaved", win._is_unsaved(), True)
+        changed = "# Doc\n\nchanged on disk\n"
+        path.write_text(changed, encoding="utf-8")
+        original_question = viewer_mod.QMessageBox.question
+        try:
+            viewer_mod.QMessageBox.question = staticmethod(
+                lambda *args, **kwargs: viewer_mod.QMessageBox.StandardButton.No
+            )
+            win._reload_timer.stop()
+            win._on_file_changed()
+            for _ in range(2):
+                app.processEvents()
+            check("refusing keeps the unsaved edit", win._editor.toPlainText(), draft)
+            check("refusing leaves the preview alone", "changed on disk" in win._browser.toPlainText(), False)
+            check("still marked unsaved after refusing", win._is_unsaved(), True)
+
+            viewer_mod.QMessageBox.question = staticmethod(
+                lambda *args, **kwargs: viewer_mod.QMessageBox.StandardButton.Yes
+            )
+            win._reload_timer.stop()
+            win._on_file_changed()
+            for _ in range(4):
+                app.processEvents()
+            check("agreeing reloads the disk text", "changed on disk" in win._browser.toPlainText(), True)
+            check("agreeing drops the unsaved state", win._is_unsaved(), False)
+            check("the editor shows the disk text again", win._editor.toPlainText(), changed)
+        finally:
+            viewer_mod.QMessageBox.question = original_question
+
+        # a vanished file must not crash and must drop its watch, leaving the
+        # shown document exactly as it was
+        path.unlink()
+        win._reload_timer.stop()
+        win._on_file_changed()  # must be a no-op, not an exception
+        app.processEvents()
+        check("a deleted file is dropped from the watch",
+              str(path.resolve()) in win._watcher.files(), False)
+        check("a deleted file leaves the content alone",
+              "changed on disk" in win._browser.toPlainText(), True)
+
+        win._confirm_discard = lambda: True
+        win._leave_edit()
+        win.close()
         app.processEvents()
 
     print("all checks passed" if not failures else f"{len(failures)} failure(s)")

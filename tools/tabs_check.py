@@ -505,6 +505,26 @@ def main() -> int:
         close_window(win)
         pump(app)
 
+        # --- 17. every view watches its own file; the watch travels with it
+        win = MainWindow(settings_for("tabs_watch"))
+        win._open_paths([a, b])
+        win.show()
+        pump(app)
+        va = win._tabs.widget(0)
+        vb = win._tabs.widget(1)
+        check("each tab watches its own file", (va._watch, vb._watch), (a.resolve(), b.resolve()))
+        check("the two watchers are independent", va._watcher is not vb._watcher, True)
+        check("a watcher holds only its own file", str(a.resolve()) in va._watcher.files(), True)
+        check("a watcher does not hold the other tab's file",
+              str(b.resolve()) in va._watcher.files(), False)
+        win._tear_off(va, QPoint(100, 100))
+        pump(app)
+        check("a torn-off view keeps its watch", va._watch, a.resolve())
+        check("a torn-off view keeps its watcher", str(a.resolve()) in va._watcher.files(), True)
+        close_window(va.window())
+        close_window(win)
+        pump(app)
+
     print("all checks passed" if not failures else f"{len(failures)} failure(s)")
     return 1 if failures else 0
 
