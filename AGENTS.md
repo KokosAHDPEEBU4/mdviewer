@@ -9,7 +9,10 @@
 ```
 main.py         CLI (файлы, --install-default/--uninstall-default/--assoc-status/
                 --restore-session), QApplication, диалог открытия файла; создаёт
-                один MainWindow, CLI-пути открываются вкладками
+                один MainWindow, CLI-пути открываются вкладками; единственный
+                экземпляр — второй запуск отдаёт пути через instance.py
+instance.py     single-instance: именованный мьютекс Win32 + файловая очередь
+                запросов (QtNetwork вырезан из сборки, QLocalServer недоступен)
 viewer.py       DocumentView(QWidget) — содержимое одного файла: превью +
                 оглавление + QPlainTextEdit, оверлей, поиск, подсветка, zoom,
                 история, QSettings, dirty-state;
@@ -350,15 +353,27 @@ build.bat                                       # сборка dist\MDViewer
       При переносе вкладки между окнами сигналы **переподключаются** в
       `MainWindow._adopt_view` (`disconnect` + `connect`), сам виджет не
       пересоздаётся, поэтому состояние едет целиком.
-    - **tear-off/merge.** `TabBar._start_drag` запускает `QDrag` только когда
-      указатель вышел за `rect()` (иначе ломается `setMovable`). Payload —
-      `TAB_MIME` + `_TabMimeData.view`; `_resolve_drag_view` падает на
-      module-global `_DRAG_VIEW`, т.к. Qt может отдать базовый `QMimeData` без
-      Python-подкласса. Drop вне любой полосы → `_tear_off` (новое окно в точке
-      курсора, `_take_view` с `setParent(None)`), drop на чужую полосу →
-      `_adopt_view` (merge); окно-источник закрывается, если вкладок не осталось.
-      Перестановка внутри полосы — забота Qt (`setMovable`), свои QDrag её не
-      перехватывают.
+    - **tear-off/merge.** `TabBar.mouseMoveEvent` запускает `QDrag` только когда
+      указатель вышел за **рамку всего окна** (`frameGeometry`), а не за тонкую
+      полосу: иначе вкладка отрывалась при малейшем уходе вниз и обычная
+      перестановка (`setMovable`, которую Qt делает в `super().mouseMoveEvent`)
+      становилась невозможной. Payload — `TAB_MIME` + `_TabMimeData.view`;
+      `_resolve_drag_view` падает на module-global `_DRAG_VIEW`, т.к. Qt может
+      отдать базовый `QMimeData` без Python-подкласса. Когда полоса дроп не
+      приняла, `_resolve_tab_drop` решает по `_window_at(QCursor.pos())`:
+      чужое окно → merge (`_take_view` + `_adopt_view`, окно поднимается);
+      своё окно → ничего; вне всяких окон → `_tear_off` (новое окно в точке
+      курсора, `_take_view` с `setParent(None)`). Drop точно на чужую полосу
+      обрабатывает `TabBar.dropEvent`; окно-источник закрывается, если вкладок
+      не осталось.
+    - **Единственный экземпляр (`instance.py`).** Windows запускает новый процесс
+      на каждый двойной клик по `.md`. `main.py` берёт mutex
+      `Local\MDViewer-singleton`; второй процесс пишет пути в
+      `%LOCALAPPDATA%\MDViewer\requests\*.req` и выходит, а owner опрашивает
+      очередь (`instance.RequestWatcher`, 400 мс) и открывает их вкладками
+      (`MainWindow.open_external`, окно поднимается). `QtNetwork`/`QLocalServer`
+      недоступны (вырезаны спеком) — отсюда stdlib-подход. `MDVIEWER_STATE_DIR`
+      переопределяет каталог очереди (для тестов).
     - **Сессия.** Флаг `QSettings("restore_session")` (по умолчанию выключен),
       снимок — `session_paths` + `session_active` (`_save_session` всех окон из
       реестра `_WINDOWS`), восстановление — `_restore_session`. Тумблер — ПКМ по

@@ -22,8 +22,15 @@ from PyQt6.QtGui import QDropEvent, QShortcut
 from PyQt6.QtWidgets import QApplication
 
 import viewer as viewer_mod
+import instance
 from main import create_app
-from viewer import MainWindow, _TabMimeData, _resolve_drag_view
+from viewer import (
+    MainWindow,
+    _TabMimeData,
+    _resolve_drag_view,
+    _resolve_tab_drop,
+    _window_at,
+)
 
 failures = []
 
@@ -329,6 +336,59 @@ def main() -> int:
         first._leave_edit()
         close_window(win)
         pump(app)
+
+        # --- 11. a dropped tab is resolved by the window under the pointer
+        left = MainWindow(settings_for("tabs_drop_l"))
+        right = MainWindow(settings_for("tabs_drop_r"))
+        left._open_paths([a, b])
+        left.setGeometry(100, 100, 300, 200)
+        right.setGeometry(500, 100, 300, 200)
+        left.show()
+        right.show()
+        pump(app)
+        left.setGeometry(100, 100, 300, 200)
+        right.setGeometry(500, 100, 300, 200)
+        pump(app)
+        inside_left = QPoint(200, 150)
+        inside_right = QPoint(600, 150)
+        far_away = QPoint(4000, 4000)
+        check("window-at finds the left window", _window_at(inside_left) is left, True)
+        check("window-at finds the right window", _window_at(inside_right) is right, True)
+        check("window-at is empty away from every window", _window_at(far_away) is None, True)
+
+        merged = left._tabs.widget(0)
+        check("the merged view starts in the source", left._tabs.indexOf(merged) >= 0, True)
+        _resolve_tab_drop(left, merged, inside_right)
+        pump(app)
+        check("dropping on another window merges the tab", right._tabs.indexOf(merged) >= 0, True)
+        check("the merged view left the source window", left._tabs.indexOf(merged), -1)
+        check("the merged view kept its file", merged._path, a.resolve())
+        before_idx = right._tabs.indexOf(merged)
+        _resolve_tab_drop(right, merged, inside_right)  # drop back on the source
+        check("dropping on the source window keeps the tab", right._tabs.indexOf(merged), before_idx)
+
+        torn = left._tabs.widget(0)
+        _resolve_tab_drop(left, torn, far_away)
+        pump(app)
+        check("dropping away from windows tears the tab off",
+              left not in viewer_mod._live_windows(), True)
+        check("the torn-off view lives in a fresh window",
+              torn.window() is not None and torn.window() is not left, True)
+        close_window(torn.window())
+        close_window(right)
+        pump(app)
+
+        # --- 12. single-instance hand-off queue
+        state = Path(folder) / "state"
+        os.environ["MDVIEWER_STATE_DIR"] = str(state)
+        try:
+            instance.write_request([a, b])
+            instance.write_request([])
+            check("queued requests arrive oldest first",
+                  instance.take_requests(), [[str(a), str(b)], []])
+            check("the queue is drained after reading", instance.take_requests(), [])
+        finally:
+            os.environ.pop("MDVIEWER_STATE_DIR", None)
 
     print("all checks passed" if not failures else f"{len(failures)} failure(s)")
     return 1 if failures else 0

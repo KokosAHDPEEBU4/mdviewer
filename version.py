@@ -2,7 +2,7 @@
 PyInstaller spec (exe metadata) and the file-association installer."""
 
 APP_NAME = "MD Viewer"
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.5.1"
 APP_PUBLISHER = "MD Viewer"
 APP_DESCRIPTION = "Fast markdown viewer"
 

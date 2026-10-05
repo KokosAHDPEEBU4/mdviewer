@@ -1984,6 +1984,35 @@ def _live_windows() -> list["MainWindow"]:
     return live
 
 
+def _window_at(global_pos: QPoint) -> "MainWindow | None":
+    """The visible `MainWindow` whose frame contains `global_pos`, if any."""
+    for window in reversed(_live_windows()):
+        if window.isVisible() and not window.isMinimized():
+            if window.frameGeometry().contains(global_pos):
+                return window
+    return None
+
+
+def _resolve_tab_drop(source: "MainWindow", view: "DocumentView", global_pos: QPoint) -> None:
+    """Finish a tab drag that no tab bar accepted.
+
+    The pointer decides the gesture: over another window -> merge the tab there;
+    over the source window -> leave it alone; anywhere else -> tear it off into
+    a new window at the pointer.
+    """
+    target = _window_at(global_pos)
+    if target is source:
+        return
+    if target is not None:
+        if source._take_view(view):
+            target._adopt_view(view)
+            target.activate()
+            if source._tabs.count() == 0:
+                source.close()
+        return
+    source._tear_off(view, global_pos)
+
+
 class _TabMimeData(QMimeData):
     """Drag payload: the `DocumentView` being moved between tab bars.
 
@@ -2040,13 +2069,19 @@ class TabBar(QTabBar):
             and self._press_index >= 0
             and event.buttons() & Qt.MouseButton.LeftButton
         ):
-            pos = event.position().toPoint()
-            if not self.rect().contains(pos):
-                moved = (pos - self._press_pos).manhattanLength()
+            # Only leaving the *whole window* starts a drag.  Comparing against
+            # the thin tab-bar rect instead tore tabs off as soon as the pointer
+            # dipped below the strip, which made plain reordering impossible.
+            window = self.window()
+            outside = window is not None and not window.frameGeometry().contains(
+                event.globalPosition().toPoint()
+            )
+            if outside:
+                moved = (event.position().toPoint() - self._press_pos).manhattanLength()
                 if moved >= QApplication.startDragDistance():
                     if self._start_drag():
                         return
-        # still over the strip: hand the move to Qt so it reorders the tab
+        # still inside the window: hand the move to Qt so it reorders the tab
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
@@ -2078,10 +2113,10 @@ class TabBar(QTabBar):
             # `view`, so the global never outlives the drag
             _DRAG_VIEW = None
             self._dragging = False
-        # no bar accepted the drop: the tab was let go outside every strip,
-        # which is the tear-off gesture — give it a window at the pointer
+        # no tab bar accepted the drop: the pointer decides — merge into the
+        # window under it, or tear off into a new one (see `_resolve_tab_drop`)
         if result == Qt.DropAction.IgnoreAction:
-            window._tear_off(view, QCursor.pos())
+            _resolve_tab_drop(window, view, QCursor.pos())
         return True
 
     # -- accepting a tab dropped onto this bar -----------------------------
@@ -2336,6 +2371,17 @@ class MainWindow(QMainWindow):
             return
         self._settings.setValue("last_dir", str(Path(names[0]).parent))
         self._open_paths([Path(name) for name in names])
+
+    def open_external(self, paths) -> None:
+        """Open paths handed over by another process (singleton hand-off)."""
+        self._open_paths(paths)
+        self.activate()
+
+    def activate(self) -> None:
+        """Raise and focus the window (single-instance hand-off)."""
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
 
     # -- closing / switching ----------------------------------------------
 

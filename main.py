@@ -13,6 +13,7 @@ from PyQt6.QtCore import QSettings
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
+import instance
 import winassoc
 from theme import APP_QSS
 from version import APP_NAME, APP_VERSION
@@ -58,7 +59,17 @@ def main(argv: list[str]) -> int:
 
     app = create_app()
     settings = QSettings()
+
+    # Single instance: a second launch (normally a .md double-click) hands its
+    # paths to the running viewer as tabs and exits. `handle` and `watcher`
+    # must outlive `app.exec()` below, hence they stay as locals here.
+    handle, already_running = instance.acquire_singleton()
+    if already_running:
+        instance.write_request([path for path in files if path.is_file()])
+        return 0
+
     window = MainWindow(settings)
+    watcher = instance.RequestWatcher(window.open_external)
     paths = [path for path in files if path.is_file()]
     if paths:
         window._open_paths(paths)
