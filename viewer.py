@@ -29,7 +29,6 @@ from PyQt6.QtCore import (
     pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QActionGroup,
     QColor,
     QCursor,
     QDesktopServices,
@@ -47,7 +46,12 @@ from PyQt6.QtGui import (
 from PyQt6.QtPrintSupport import QPrinter
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -189,6 +193,15 @@ SYNC_SCROLL_MS = 70
 # sync is held off until the mode has settled; otherwise the careful
 # "open on the visible paragraph" positioning would be undone by a loop.
 SYNC_SCROLL_SETTLE_MS = 250
+
+# Zoom levels offered as the default for new tabs (the dialog's combo and the
+# "масштаб по умолчанию" setting). Stored as steps of 10% on top of 100%.
+DEFAULT_ZOOM_LEVELS = (-2, -1, 0, 1, 2, 5, 10)
+
+
+def zoom_percent(level: int) -> int:
+    """Human-readable percentage for a zoom step (`0` -> 100)."""
+    return round((1.0 + 0.1 * level) * 100)
 
 
 def recent_files(settings: QSettings) -> list[str]:
@@ -1375,32 +1388,13 @@ class DocumentView(QWidget):
         self._editor_zoom_in = QToolButton()
         self._editor_zoom_in.setText("+")
         self._editor_zoom_in.clicked.connect(lambda: self._set_editor_zoom(self._editor_zoom + 1))
-        # a small overflow menu toggling the two editor options; the checks are
-        # set from QSettings before the signals are hooked, so building the menu
-        # never writes the settings back
-        self._editor_menu_btn = QToolButton()
-        self._editor_menu_btn.setText("⋯")
-        self._editor_menu_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        options = QMenu(self._editor_menu_btn)
-        self._wrap_action = options.addAction("Переносить строки")
-        self._wrap_action.setCheckable(True)
-        self._wrap_action.setChecked(self._editor_wrap())
-        self._wrap_action.toggled.connect(self._set_editor_wrap)
-        self._numbers_action = options.addAction("Номера строк")
-        self._numbers_action.setCheckable(True)
-        self._numbers_action.setChecked(self._editor_line_numbers())
-        self._numbers_action.toggled.connect(self._set_editor_line_numbers)
-        options.addSeparator()
-        self._sync_action = options.addAction("Синхронизировать прокрутку")
-        self._sync_action.setCheckable(True)
-        self._sync_action.setChecked(self._sync_scroll_enabled())
-        self._sync_action.toggled.connect(self._set_sync_scroll)
-        self._editor_menu_btn.setMenu(options)
+        # Editor options (wrap / line numbers / scroll sync) live in the single
+        # "Настройки" dialog now (Ctrl+, or the tab context menu); the header
+        # keeps only the pane's own zoom controls.
         for widget in (
             self._editor_zoom_out,
             self._editor_zoom_label,
             self._editor_zoom_in,
-            self._editor_menu_btn,
         ):
             header.addWidget(widget)
         layout.addLayout(header)
@@ -1476,6 +1470,20 @@ class DocumentView(QWidget):
         if not enabled:
             self._sync_timer.stop()
             self._sync_source = None
+
+    def _apply_settings(self, values: dict) -> None:
+        """Push a settings-dialog payload onto this view's editor.
+
+        Wrap / line numbers / scroll sync are applied live to an editor that
+        already exists and persisted; the theme and the default zoom belong to
+        the window (`MainWindow._apply_settings`).
+        """
+        if "editor_wrap" in values:
+            self._set_editor_wrap(bool(values["editor_wrap"]))
+        if "editor_line_numbers" in values:
+            self._set_editor_line_numbers(bool(values["editor_line_numbers"]))
+        if "sync_scroll" in values:
+            self._set_sync_scroll(bool(values["sync_scroll"]))
 
     def _toggle_edit(self) -> None:
         if self._editing():
@@ -3259,6 +3267,75 @@ class TabBar(QTabBar):
         event.acceptProposedAction()
 
 
+class SettingsDialog(QDialog):
+    """One dialog for the settings that used to be scattered over the menus.
+
+    Theme, the default zoom of new tabs, session restore and the three editor
+    toggles (wrap, line numbers, scroll sync) are read from `QSettings` when the
+    dialog is built and written back by `MainWindow._apply_settings` on OK.
+    """
+
+    def __init__(self, settings: QSettings, parent=None):
+        super().__init__(parent)
+        self._settings = settings
+        self.setWindowTitle("Настройки")
+        self.setModal(True)
+
+        self._theme = QComboBox()
+        self._theme.addItem("Тёмная", "dark")
+        self._theme.addItem("Светлая", "light")
+        self._select_data(self._theme, normalize(settings.value("theme", DEFAULT_THEME)))
+
+        self._zoom = QComboBox()
+        for level in DEFAULT_ZOOM_LEVELS:
+            self._zoom.addItem(f"{zoom_percent(level)}%", level)
+        self._select_data(self._zoom, settings.value("default_zoom", 0, type=int))
+
+        self._session = QCheckBox("Восстанавливать прошлую сессию")
+        self._session.setChecked(settings.value("restore_session", False, type=bool))
+        self._wrap = QCheckBox("Переносить строки в редакторе")
+        self._wrap.setChecked(settings.value("editor_wrap", True, type=bool))
+        self._numbers = QCheckBox("Номера строк в редакторе")
+        self._numbers.setChecked(settings.value("editor_line_numbers", False, type=bool))
+        self._sync = QCheckBox("Синхронизировать прокрутку редактор ↔ превью")
+        self._sync.setChecked(settings.value("sync_scroll", True, type=bool))
+
+        form = QFormLayout()
+        form.addRow("Тема:", self._theme)
+        form.addRow("Масштаб по умолчанию:", self._zoom)
+        form.addRow("", self._session)
+        form.addRow("", self._wrap)
+        form.addRow("", self._numbers)
+        form.addRow("", self._sync)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+    @staticmethod
+    def _select_data(combo: QComboBox, value) -> None:
+        """Select the entry whose userData equals `value`, else the first one."""
+        index = combo.findData(value)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+
+    def values(self) -> dict:
+        """The chosen settings, ready for `MainWindow._apply_settings`."""
+        return {
+            "theme": self._theme.currentData(),
+            "default_zoom": self._zoom.currentData(),
+            "restore_session": self._session.isChecked(),
+            "editor_wrap": self._wrap.isChecked(),
+            "editor_line_numbers": self._numbers.isChecked(),
+            "sync_scroll": self._sync.isChecked(),
+        }
+
+
 class MainWindow(QMainWindow):
     """The application shell: hosts a `QTabWidget`, one `DocumentView` per tab.
 
@@ -3693,35 +3770,48 @@ class MainWindow(QMainWindow):
             empty.setEnabled(False)
 
         menu.addSeparator()
-        restore = menu.addAction("Восстанавливать прошлую сессию")
-        restore.setCheckable(True)
-        restore.setChecked(self._settings.value("restore_session", False, type=bool))
-        restore.toggled.connect(self._set_restore_session)
-
-        menu.addSeparator()
-        light = menu.addAction("Светлая тема")
-        light.setCheckable(True)
-        light.setChecked(self._theme_name() == "light")
-        light.toggled.connect(self._set_light_theme)
-
-        menu.addSeparator()
-        zoom_menu = menu.addMenu("Масштаб по умолчанию")
-        group = QActionGroup(zoom_menu)  # parented: stays alive for the menu
-        group.setExclusive(True)
-        current = self._settings.value("default_zoom", 0, type=int)
-        for level in (-2, -1, 0, 1, 2, 5, 10):  # 80, 90, 100, 110, 120, 150, 200 %
-            action = zoom_menu.addAction(f"{round((1.0 + 0.1 * level) * 100)}%")
-            action.setCheckable(True)
-            action.setChecked(level == current)
-            action.triggered.connect(
-                lambda _checked=False, value=level: self._set_default_zoom(value)
-            )
+        settings_action = menu.addAction("Настройки…")
+        settings_action.triggered.connect(
+            lambda _checked=False: self._open_settings_dialog()
+        )
         return menu
 
     def _show_tab_menu(self, pos: QPoint) -> None:
-        """Right-click on the tab strip: file/export actions, recents, session, zoom."""
+        """Right-click on the tab strip: file/export actions, recents, settings."""
         menu = self._build_tab_menu(self._tab_view_at(pos))
         menu.exec(self._tabs.tabBar().mapToGlobal(pos))
+
+    # -- settings dialog (single source for the scattered toggles) ---------
+
+    def _build_settings_dialog(self) -> SettingsDialog:
+        """The dialog pre-filled from this window's QSettings (testable)."""
+        return SettingsDialog(self._settings, self)
+
+    def _open_settings_dialog(self) -> None:
+        """`Ctrl+,` / «Настройки…»: edit the settings, apply them on OK."""
+        dialog = self._build_settings_dialog()
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._apply_settings(dialog.values())
+        dialog.deleteLater()
+
+    def _apply_settings(self, values: dict) -> None:
+        """Apply a settings-dialog payload to every open window and tab.
+
+        The theme re-renders every document; wrap / line numbers / scroll sync
+        reach existing editors; the default zoom is only remembered, so new tabs
+        open at it while the ones already open are left alone.
+        """
+        theme = normalize(values.get("theme", self._theme_name()))
+        if theme != self._theme_name():
+            self._set_theme(theme)
+        self._set_restore_session(bool(values.get("restore_session", False)))
+        if "default_zoom" in values:
+            self._settings.setValue("default_zoom", int(values["default_zoom"]))
+        for window in _live_windows():
+            for index in range(window._tabs.count()):
+                view = window._tabs.widget(index)
+                if view is not None:
+                    view._apply_settings(values)
 
     def _set_restore_session(self, enabled: bool) -> None:
         """Persist the flag; turning it on snapshots the current session at once."""
@@ -3790,6 +3880,7 @@ class MainWindow(QMainWindow):
             "Ctrl+Shift+T": self._reopen_closed_tab,
             "Ctrl+Tab": lambda: self._cycle_tab(1),
             "Ctrl+Shift+Tab": lambda: self._cycle_tab(-1),
+            "Ctrl+,": self._open_settings_dialog,
             "F11": self._toggle_reading_mode,
         }
         for number in range(1, 10):
