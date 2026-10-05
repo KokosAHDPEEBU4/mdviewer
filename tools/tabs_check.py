@@ -237,6 +237,27 @@ def main() -> int:
         close_window(target)
         pump(app)
 
+        # dropping a tab back on its own strip reorders it (browser-like)
+        win = MainWindow(settings_for("tabs_selfdrop"))
+        win._open_paths([a, b])
+        win.show()
+        pump(app)
+        bar = win._tabs.tabBar()
+        moving = win._tabs.widget(1)  # b is second
+        mime = _TabMimeData(moving)
+        mime.setData(viewer_mod.TAB_MIME, QByteArray(b"tab"))
+        drop = QDropEvent(
+            QPointF(bar.tabRect(0).center()), Qt.DropAction.MoveAction, mime,
+            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+        )
+        bar.dropEvent(drop)
+        pump(app)
+        check("dropping a tab on its own strip reorders it",
+              win._tabs.widget(0)._path, b.resolve())
+        check("the tab count is unchanged", win._tabs.count(), 2)
+        close_window(win)
+        pump(app)
+
         # --- 7. drag payload resolution (both channels)
         win = MainWindow(settings_for("tabs_resolve"))
         win._open_paths([a, b])

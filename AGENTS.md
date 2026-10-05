@@ -366,24 +366,25 @@ build.bat                                       # сборка dist\MDViewer
       При переносе вкладки между окнами сигналы **переподключаются** в
       `MainWindow._adopt_view` (`disconnect` + `connect`), сам виджет не
       пересоздаётся, поэтому состояние едет целиком.
-    - **tear-off/merge.** `TabBar.mouseMoveEvent` запускает `QDrag` только когда
-      указатель вышел за **рамку всего окна** (`frameGeometry`), а не за тонкую
-      полосу: иначе вкладка отрывалась при малейшем уходе вниз и обычная
-      перестановка (`setMovable`, которую Qt делает в `super().mouseMoveEvent`)
-      становилась невозможной. Payload — `TAB_MIME` + `_TabMimeData.view`;
-      `_resolve_drag_view` падает на module-global `_DRAG_VIEW`, т.к. Qt может
-      отдать базовый `QMimeData` без Python-подкласса. Когда полоса дроп не
-      приняла, `_resolve_tab_drop` решает по `_window_at(QCursor.pos())`:
-      чужое окно → merge (`_take_view` + `_adopt_view`, окно поднимается);
-      своё окно → ничего; вне всяких окон → `_tear_off` (новое окно в точке
-      курсора, `_take_view` с `setParent(None)`). Drop точно на чужую полосу
-      обрабатывает `TabBar.dropEvent`; окно-источник закрывается, если вкладок
-      не осталось.
+    - **tear-off/merge (по-браузерному).** Вкладку ведут по полосе — Qt
+      переставляет (`setMovable` в `super().mouseMoveEvent`). `QDrag` стартует,
+      когда указатель вытянут **из полосы**: ниже её низа на `TAB_DETACH_MARGIN`
+      (=18) или за рамку окна (`frameGeometry`) — так отрыв не срабатывает на
+      лёгком провале и перестановка остаётся рабочей. Драг тащит пиксмап самой
+      вкладки (`tabRect` + `grab`, hotspot по точке нажатия). Payload — `TAB_MIME`
+      + `_TabMimeData.view`; `_resolve_drag_view` падает на module-global
+      `_DRAG_VIEW`, т.к. Qt может отдать базовый `QMimeData` без Python-подкласса.
+      Бросок на **свою** полосу → `moveTab` на позицию указателя (перестановка);
+      на чужую полосу → `dropEvent` вставляет по индексу; если полоса дроп не
+      приняла, `_resolve_tab_drop` решает по `_window_at(QCursor.pos())`: чужое
+      окно → merge (`_take_view` + `_adopt_view`, окно поднимается), своё → ничего,
+      вне окон → `_tear_off` (новое окно у курсора, `_take_view` с `setParent(None)`,
+      `activate()`). Окно-источник закрывается, если вкладок не осталось.
     - **Единственный экземпляр (`instance.py`).** Windows запускает новый процесс
       на каждый двойной клик по `.md`. `main.py` берёт mutex
       `Local\MDViewer-singleton`; второй процесс пишет пути в
       `%LOCALAPPDATA%\MDViewer\requests\*.req` и выходит, а owner опрашивает
-      очередь (`instance.RequestWatcher`, 400 мс) и открывает их вкладками
+      очередь (`instance.make_watcher`, 150 мс) и открывает их вкладками
       (`MainWindow.open_external`, окно поднимается). `QtNetwork`/`QLocalServer`
       недоступны (вырезаны спеком) — отсюда stdlib-подход. `MDVIEWER_STATE_DIR`
       переопределяет каталог очереди (для тестов).

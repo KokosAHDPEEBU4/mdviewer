@@ -3048,6 +3048,11 @@ class DocumentView(QWidget):
 
 TAB_MIME = "application/x-mdviewer-tab"
 
+# How far below the tab strip the pointer must be pulled before a press-drag
+# becomes a tear-off (browser-style: drag along the strip reorders, pull it down
+# and the tab detaches). A small margin avoids tearing off on a slight dip.
+TAB_DETACH_MARGIN = 18
+
 # The tab currently being dragged. `QDrag` is synchronous and in-process, so a
 # module global is a reliable second channel: Qt may hand the drop handler a
 # plain base `QMimeData` wrapper, dropping the Python subclass and its `.view`.
@@ -3137,11 +3142,14 @@ def _resolve_drag_view(mime) -> "DocumentView | None":
 
 
 class TabBar(QTabBar):
-    """A tab bar that can tear a tab off and pull one in from another window.
+    """A browser-style tab strip: drag to reorder, pull down to detach.
 
-    Reordering *inside* the strip is left to Qt (`setMovable`): a `QDrag` is
-    started only once the pointer leaves the bar's rectangle, so the ordinary
-    "slide a tab sideways" gesture keeps working exactly as before.
+    Sliding a tab along the strip is left to Qt (`setMovable`) so reordering
+    stays smooth. A `QDrag` starts only once the pointer is pulled *out of the
+    strip* (below it, or out of the window), which is the tear-off gesture. The
+    drag carries the tab's own pixmap; dropping it on another bar inserts at the
+    pointer, dropping it on another window merges, and dropping it anywhere else
+    opens a new window at the pointer.
     """
 
     def __init__(self, parent=None):
@@ -3167,19 +3175,17 @@ class TabBar(QTabBar):
             and self._press_index >= 0
             and event.buttons() & Qt.MouseButton.LeftButton
         ):
-            # Only leaving the *whole window* starts a drag.  Comparing against
-            # the thin tab-bar rect instead tore tabs off as soon as the pointer
-            # dipped below the strip, which made plain reordering impossible.
+            gp = event.globalPosition().toPoint()
+            strip_bottom = self.mapToGlobal(QPoint(0, self.height())).y()
             window = self.window()
-            outside = window is not None and not window.frameGeometry().contains(
-                event.globalPosition().toPoint()
-            )
-            if outside:
+            pulled_down = gp.y() > strip_bottom + TAB_DETACH_MARGIN
+            outside = window is not None and not window.frameGeometry().contains(gp)
+            if pulled_down or outside:
                 moved = (event.position().toPoint() - self._press_pos).manhattanLength()
                 if moved >= QApplication.startDragDistance():
                     if self._start_drag():
                         return
-        # still inside the window: hand the move to Qt so it reorders the tab
+        # still along the strip: hand the move to Qt so it reorders the tab
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
@@ -3202,6 +3208,11 @@ class TabBar(QTabBar):
         mime.setData(TAB_MIME, QByteArray(b"tab"))
         drag = QDrag(self)
         drag.setMimeData(mime)
+        # the tab follows the cursor, like a browser tab
+        rect = self.tabRect(self._press_index)
+        if rect.isValid():
+            drag.setPixmap(self.grab(rect))
+            drag.setHotSpot(self._press_pos - rect.topLeft())
         self._dragging = True
         _DRAG_VIEW = view  # fallback channel while the drag is in flight
         try:
@@ -3242,8 +3253,12 @@ class TabBar(QTabBar):
             return
         source = view.window()
         if source is window:
-            # same-window reorder is Qt's job; never hijack it with a drag
-            event.ignore()
+            # dropped back on its own strip: place it where the pointer is
+            src = window._tabs.indexOf(view)
+            to = self.tabAt(event.position().toPoint())
+            if src >= 0 and to >= 0 and to != src:
+                self.moveTab(src, to)
+            event.acceptProposedAction()
             return
         index = self.tabAt(event.position().toPoint())
         if isinstance(source, MainWindow):
@@ -3521,8 +3536,9 @@ class MainWindow(QMainWindow):
         new = MainWindow(self._settings)
         new._adopt_view(view)
         new.resize(self.size())
+        new.move(global_pos.x() - 80, global_pos.y() - 12)
         new.show()
-        new.move(global_pos.x() - 60, global_pos.y() - 20)
+        new.activate()  # browser-like: the fresh window takes focus
         if self._tabs.count() == 0:
             self.close()
 
