@@ -20,6 +20,7 @@ from PyQt6.QtCore import (
     QRegularExpression,
     QRect,
     QSettings,
+    QSize,
     QTimer,
     QUrl,
     Qt,
@@ -69,6 +70,7 @@ from syncsel import SourceMap
 from theme import (
     ACCENT,
     ACCENT_DIM,
+    CODE_BG,
     EDITOR_HARD,
     EDITOR_MIN,
     EDITOR_PREF,
@@ -126,6 +128,31 @@ def _newline_of(raw: bytes) -> str:
 def _normalized(text: str) -> str:
     """Qt text widgets hand back LF-only text, so compare like for like."""
     return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+# How many files the "Недавние" submenu remembers. Stored newest-first, deduped
+# by resolved path, and pruned of anything that has since disappeared.
+RECENT_LIMIT = 10
+RECENT_KEY = "recent_files"
+
+
+def recent_files(settings: QSettings) -> list[str]:
+    """The remembered file paths, newest first; only ones still on disk."""
+    raw = settings.value(RECENT_KEY, [], type=list) or []
+    return [str(item) for item in raw if Path(item).is_file()]
+
+
+def remember_recent_file(path: Path, settings: QSettings) -> list[str]:
+    """Move `path` to the front of the recents, dropping duplicates and stale
+    entries. Shared by tab opens and in-window navigation so both paths agree.
+    """
+    target = str(Path(path).resolve())
+    raw = settings.value(RECENT_KEY, [], type=list) or []
+    recent = [str(item) for item in raw if str(item) != target and Path(item).is_file()]
+    recent.insert(0, target)
+    recent = recent[:RECENT_LIMIT]
+    settings.setValue(RECENT_KEY, recent)
+    return recent
 
 
 def layout_panes(avail: int, edit: bool, toc_visible: bool, toc_pref: int, editor_pref: int):
@@ -223,6 +250,102 @@ class OverlayTextBrowser(_OverlayMixin, QTextBrowser):
 
 class OverlayPlainTextEdit(_OverlayMixin, QPlainTextEdit):
     pass
+
+
+class LineNumberArea(QWidget):
+    """The gutter next to a `LineNumberedEdit`.
+
+    It is a child widget parked in the viewport margin the editor reserves, so
+    the numbers never overlap the text and the editor's own `paintEvent` (which
+    `_OverlayMixin` already overrides for the selection mirror) is left alone.
+    """
+
+    def __init__(self, editor: "LineNumberedEdit"):
+        super().__init__(editor)
+        self._editor = editor
+
+    def sizeHint(self) -> QSize:
+        return QSize(self._editor.line_number_area_width(), 0)
+
+    def paintEvent(self, event):
+        self._editor.paint_line_numbers(event)
+
+
+class LineNumberedEdit(OverlayPlainTextEdit):
+    """`QPlainTextEdit` with an optional line-number gutter.
+
+    The gutter is toggleable at runtime (`set_line_numbers`); when off the
+    reserved viewport margin drops back to zero. `_OverlayMixin`'s selection
+    overlay keeps working because the numbers are drawn by the gutter widget,
+    not by the editor's `paintEvent`.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._line_numbers = True
+        self._gutter = LineNumberArea(self)
+        self.blockCountChanged.connect(self._update_gutter_width)
+        self.updateRequest.connect(self._update_gutter)
+        self._update_gutter_width()
+
+    def set_line_numbers(self, enabled: bool) -> None:
+        self._line_numbers = bool(enabled)
+        self._gutter.setVisible(self._line_numbers)
+        self._update_gutter_width()
+        self._update_gutter(self.viewport().rect(), 0)
+
+    def line_numbers_visible(self) -> bool:
+        return self._line_numbers and self._gutter.isVisible()
+
+    def line_number_area_width(self) -> int:
+        if not self._line_numbers:
+            return 0
+        digits = len(str(max(1, self.blockCount())))
+        return 12 + self.fontMetrics().horizontalAdvance("9") * digits
+
+    def _update_gutter_width(self, *_args) -> None:
+        self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
+
+    def _update_gutter(self, rect: QRect, dy: int) -> None:
+        if dy:
+            self._gutter.scroll(0, dy)
+        else:
+            self._gutter.update(0, rect.y(), self._gutter.width(), rect.height())
+        if rect.contains(self.viewport().rect()):
+            self._update_gutter_width()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        area = self.contentsRect()
+        self._gutter.setGeometry(
+            QRect(area.left(), area.top(), self.line_number_area_width(), area.height())
+        )
+
+    def paint_line_numbers(self, event) -> None:
+        painter = QPainter(self._gutter)
+        painter.fillRect(event.rect(), QColor(CODE_BG))
+        painter.setPen(QColor(TEXT_MUTED))
+        block = self.firstVisibleBlock()
+        number = block.blockNumber()
+        offset = self.contentOffset()
+        top = round(self.blockBoundingGeometry(block).translated(offset).top())
+        bottom = top + round(self.blockBoundingRect(block).height())
+        height = self.fontMetrics().height()
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                painter.drawText(
+                    0,
+                    top,
+                    self._gutter.width() - 6,
+                    height,
+                    Qt.AlignmentFlag.AlignRight,
+                    str(number + 1),
+                )
+            block = block.next()
+            top = bottom
+            bottom = top + round(self.blockBoundingRect(block).height())
+            number += 1
+        painter.end()
 
 
 class ScrollIndicator(QWidget):
@@ -876,6 +999,7 @@ class DocumentView(QWidget):
         self._path = Path(path).resolve()
         self._update_window_title(False)
         if self.load():
+            remember_recent_file(self._path, self._settings)
             return True
         self._path = previous
         self._update_window_title(False)
@@ -921,13 +1045,33 @@ class DocumentView(QWidget):
         self._editor_zoom_in = QToolButton()
         self._editor_zoom_in.setText("+")
         self._editor_zoom_in.clicked.connect(lambda: self._set_editor_zoom(self._editor_zoom + 1))
-        for widget in (self._editor_zoom_out, self._editor_zoom_label, self._editor_zoom_in):
+        # a small overflow menu toggling the two editor options; the checks are
+        # set from QSettings before the signals are hooked, so building the menu
+        # never writes the settings back
+        self._editor_menu_btn = QToolButton()
+        self._editor_menu_btn.setText("⋯")
+        self._editor_menu_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        options = QMenu(self._editor_menu_btn)
+        self._wrap_action = options.addAction("Переносить строки")
+        self._wrap_action.setCheckable(True)
+        self._wrap_action.setChecked(self._editor_wrap())
+        self._wrap_action.toggled.connect(self._set_editor_wrap)
+        self._numbers_action = options.addAction("Номера строк")
+        self._numbers_action.setCheckable(True)
+        self._numbers_action.setChecked(self._editor_line_numbers())
+        self._numbers_action.toggled.connect(self._set_editor_line_numbers)
+        self._editor_menu_btn.setMenu(options)
+        for widget in (
+            self._editor_zoom_out,
+            self._editor_zoom_label,
+            self._editor_zoom_in,
+            self._editor_menu_btn,
+        ):
             header.addWidget(widget)
         layout.addLayout(header)
 
-        self._editor = OverlayPlainTextEdit()
+        self._editor = LineNumberedEdit()
         self._editor.overlay_painter = self._paint_selection_overlay
-        self._editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self._editor.setMinimumWidth(EDITOR_HARD)  # hard floor, see theme metrics
         self._editor.setPlaceholderText("Исходный Markdown — как в блокноте")
         self._editor.textChanged.connect(self._update_state)
@@ -937,6 +1081,7 @@ class DocumentView(QWidget):
         self._editor.viewport().setMouseTracking(True)  # autoscroll follows the pointer
         self._editor.selectionChanged.connect(self._highlight_preview_from_editor)
         self._editor_base_font = self._editor.font()
+        self._apply_editor_options()
         layout.addWidget(self._editor, 1)
 
         self._panel = panel
@@ -947,6 +1092,42 @@ class DocumentView(QWidget):
         self._splitter.addWidget(panel)
         self._splitter.setStretchFactor(1, 1)
         panel.setVisible(False)  # addWidget reveals the child; edit mode owns it
+
+    def _editor_wrap(self) -> bool:
+        """Whether long source lines wrap (default on: markdown reads better)."""
+        return self._settings.value("editor_wrap", True, type=bool)
+
+    def _editor_line_numbers(self) -> bool:
+        """Whether the source gutter is shown (off by default: less chrome)."""
+        return self._settings.value("editor_line_numbers", False, type=bool)
+
+    def _apply_editor_options(self) -> None:
+        """Push the saved wrap/line-number choices onto the editor."""
+        if self._editor is None:
+            return
+        self._editor.setLineWrapMode(
+            QPlainTextEdit.LineWrapMode.WidgetWidth
+            if self._editor_wrap()
+            else QPlainTextEdit.LineWrapMode.NoWrap
+        )
+        if hasattr(self._editor, "set_line_numbers"):
+            self._editor.set_line_numbers(self._editor_line_numbers())
+
+    def _set_editor_wrap(self, enabled: bool) -> None:
+        """Wrap toggle from the header menu: persist and apply at once."""
+        self._settings.setValue("editor_wrap", bool(enabled))
+        if self._editor is not None:
+            self._editor.setLineWrapMode(
+                QPlainTextEdit.LineWrapMode.WidgetWidth
+                if enabled
+                else QPlainTextEdit.LineWrapMode.NoWrap
+            )
+
+    def _set_editor_line_numbers(self, enabled: bool) -> None:
+        """Line-number toggle from the header menu: persist and apply at once."""
+        self._settings.setValue("editor_line_numbers", bool(enabled))
+        if self._editor is not None and hasattr(self._editor, "set_line_numbers"):
+            self._editor.set_line_numbers(bool(enabled))
 
     def _toggle_edit(self) -> None:
         if self._editing():
@@ -2131,6 +2312,9 @@ class DocumentView(QWidget):
             size = font.pointSizeF() * (1.0 + 0.1 * self._editor_zoom)
             font.setPointSizeF(max(6.0, size))
         self._editor.setFont(font)
+        # the gutter width is font-dependent, so re-reserve it after a zoom
+        if hasattr(self._editor, "_update_gutter_width"):
+            self._editor._update_gutter_width()
 
     def _update_editor_zoom_label(self) -> None:
         if getattr(self, "_editor_zoom_label", None) is None:
@@ -2491,7 +2675,9 @@ class MainWindow(QMainWindow):
         index = self._find_tab(path)
         if index >= 0:
             self._tabs.setCurrentIndex(index)
-            return self._tabs.widget(index)
+            view = self._tabs.widget(index)
+            remember_recent_file(view._path, self._settings)
+            return view
         view = DocumentView(Path(path).resolve(), self._settings)
         view.state_changed.connect(lambda v=view: self._on_view_state_changed(v))
         view.link_requested.connect(self._add_tab)  # Ctrl/middle click -> new tab
@@ -2501,6 +2687,7 @@ class MainWindow(QMainWindow):
         index = self._tabs.addTab(view, view._tab_title())
         self._tabs.setTabToolTip(index, str(view._path))
         self._tabs.setCurrentIndex(index)
+        remember_recent_file(view._path, self._settings)
         self._on_current_changed(self._tabs.currentIndex())
         self._save_session()
         return view
@@ -2743,9 +2930,67 @@ class MainWindow(QMainWindow):
 
     # -- "restore session" toggle (tab context menu) -----------------------
 
+    def _tab_view_at(self, pos: QPoint) -> DocumentView | None:
+        """The view of the tab under `pos` (the active one when none is hit)."""
+        bar = self._tabs.tabBar()
+        index = bar.tabAt(pos)
+        if index < 0:
+            index = self._tabs.currentIndex()
+        if index < 0:
+            return None
+        return self._tabs.widget(index)
+
+    def _copy_path(self, path: Path) -> None:
+        """Put a local file path on the clipboard."""
+        QApplication.clipboard().setText(str(path))
+
+    def _open_folder(self, path: Path) -> None:
+        """Open the containing folder in the system file manager (local only)."""
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
+
+    def _open_recent(self, path: str) -> None:
+        """Open a file picked from the "Недавние" submenu, if it still exists."""
+        candidate = Path(path)
+        if candidate.is_file():
+            self._add_tab(candidate)
+
+    def _clear_recent(self) -> None:
+        self._settings.setValue(RECENT_KEY, [])
+
     def _show_tab_menu(self, pos: QPoint) -> None:
-        """Right-click on the tab strip: session toggle and default zoom."""
+        """Right-click on the tab strip: file actions, recents, session, zoom.
+
+        The file actions (`Открыть содержащую папку`, `Копировать путь`) target
+        the tab under the pointer, falling back to the active tab. Paths are
+        always local (`DocumentView` only ever holds local files), so nothing
+        here reaches the network.
+        """
         menu = QMenu(self)
+        bar = self._tabs.tabBar()
+        view = self._tab_view_at(pos)
+        if view is not None:
+            path = view._path
+            folder = menu.addAction("Открыть содержащую папку")
+            folder.triggered.connect(lambda _checked=False, p=path: self._open_folder(p))
+            copy = menu.addAction("Копировать путь")
+            copy.triggered.connect(lambda _checked=False, p=path: self._copy_path(p))
+            menu.addSeparator()
+
+        recent_menu = menu.addMenu("Недавние")
+        recent = recent_files(self._settings)
+        if recent:
+            for item in recent:
+                action = recent_menu.addAction(Path(item).name)
+                action.setToolTip(item)
+                action.triggered.connect(lambda _checked=False, p=item: self._open_recent(p))
+            recent_menu.addSeparator()
+            clear = recent_menu.addAction("Очистить список")
+            clear.triggered.connect(self._clear_recent)
+        else:
+            empty = recent_menu.addAction("Пусто")
+            empty.setEnabled(False)
+
+        menu.addSeparator()
         restore = menu.addAction("Восстанавливать прошлую сессию")
         restore.setCheckable(True)
         restore.setChecked(self._settings.value("restore_session", False, type=bool))
@@ -2763,7 +3008,7 @@ class MainWindow(QMainWindow):
             action.triggered.connect(
                 lambda _checked=False, value=level: self._set_default_zoom(value)
             )
-        menu.exec(self._tabs.tabBar().mapToGlobal(pos))
+        menu.exec(bar.mapToGlobal(pos))
 
     def _set_restore_session(self, enabled: bool) -> None:
         """Persist the flag; turning it on snapshots the current session at once."""

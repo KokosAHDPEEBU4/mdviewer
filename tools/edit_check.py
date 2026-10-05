@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from PyQt6.QtCore import QEvent, QPoint, QPointF, QSettings, Qt, QUrl
 from PyQt6.QtGui import QKeyEvent, QMouseEvent, QPalette, QTextCursor, QWheelEvent
-from PyQt6.QtWidgets import QApplication, QTextBrowser
+from PyQt6.QtWidgets import QApplication, QPlainTextEdit, QTextBrowser
 
 import viewer as viewer_mod
 from main import create_app
@@ -811,6 +811,84 @@ def main() -> int:
         check("tabs: closing the last empties the window", win._tabs.count(), 0)
         for _ in range(2):
             app.processEvents()
+
+    # --- editor toggles: wrap and line numbers persist and apply at once
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "opts.md"
+        path.write_text("# Doc\n\n" + "line\n" * 30, encoding="utf-8")
+        settings = QSettings(tempfile.mkdtemp(), "opts_check")
+        win = viewer_mod.Viewer(path, settings)
+        win.resize(900, 600)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+        win._enter_edit()
+        for _ in range(3):
+            app.processEvents()
+
+        check("wrap is on by default",
+              win._editor.lineWrapMode(), QPlainTextEdit.LineWrapMode.WidgetWidth)
+        win._set_editor_wrap(False)
+        check("wrap toggle switches to no-wrap",
+              win._editor.lineWrapMode(), QPlainTextEdit.LineWrapMode.NoWrap)
+        check("wrap choice is saved", settings.value("editor_wrap", True, type=bool), False)
+        win._set_editor_wrap(True)
+        check("wrap toggle switches back",
+              win._editor.lineWrapMode(), QPlainTextEdit.LineWrapMode.WidgetWidth)
+
+        check("line numbers are off by default",
+              settings.value("editor_line_numbers", False, type=bool), False)
+        check("no gutter while numbers are off",
+              win._editor.viewportMargins().left(), 0)
+        check("numbers off means not visible", win._editor.line_numbers_visible(), False)
+        win._set_editor_line_numbers(True)
+        check("line numbers reserve a gutter",
+              win._editor.viewportMargins().left() > 0, True)
+        check("numbers on are visible", win._editor.line_numbers_visible(), True)
+        check("numbers choice is saved",
+              settings.value("editor_line_numbers", False, type=bool), True)
+        win._set_editor_line_numbers(False)
+        check("turning numbers off drops the gutter",
+              win._editor.viewportMargins().left(), 0)
+
+        # the custom selection overlay (invariant 22) must keep working with the
+        # gutter present: the mirror still lands in the preview and the editor
+        # still draws its own layer
+        win._set_editor_line_numbers(True)
+        editor_cursor = win._editor.textCursor()
+        editor_cursor.setPosition(5)
+        editor_cursor.setPosition(9, QTextCursor.MoveMode.KeepAnchor)
+        win._editor.setTextCursor(editor_cursor)
+        win._highlight_preview_from_editor()
+        check("mirror still lands in the preview with the gutter",
+              len(win._browser.extraSelections()), 1)
+        check("editor still draws its own layer with the gutter",
+              len(win._editor.extraSelections()), 1)
+        win._clear_highlights()
+
+        # a fresh editor picks up the saved choices
+        win._set_editor_line_numbers(True)
+        win._set_editor_wrap(False)
+        win._confirm_discard = lambda: True
+        win._leave_edit()
+        win.close()
+        app.processEvents()
+
+        win2 = viewer_mod.Viewer(path, settings)
+        win2.show()
+        for _ in range(3):
+            app.processEvents()
+        win2._enter_edit()
+        for _ in range(3):
+            app.processEvents()
+        check("new editor picks up the saved wrap",
+              win2._editor.lineWrapMode(), QPlainTextEdit.LineWrapMode.NoWrap)
+        check("new editor picks up the saved numbers",
+              win2._editor.line_numbers_visible(), True)
+        win2._confirm_discard = lambda: True
+        win2._leave_edit()
+        win2.close()
+        app.processEvents()
 
     print("all checks passed" if not failures else f"{len(failures)} failure(s)")
     return 1 if failures else 0
