@@ -128,6 +128,31 @@ def _normalized(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
+# How many files the "Недавние" submenu remembers. Stored newest-first, deduped
+# by resolved path, and pruned of anything that has since disappeared.
+RECENT_LIMIT = 10
+RECENT_KEY = "recent_files"
+
+
+def recent_files(settings: QSettings) -> list[str]:
+    """The remembered file paths, newest first; only ones still on disk."""
+    raw = settings.value(RECENT_KEY, [], type=list) or []
+    return [str(item) for item in raw if Path(item).is_file()]
+
+
+def remember_recent_file(path: Path, settings: QSettings) -> list[str]:
+    """Move `path` to the front of the recents, dropping duplicates and stale
+    entries. Shared by tab opens and in-window navigation so both paths agree.
+    """
+    target = str(Path(path).resolve())
+    raw = settings.value(RECENT_KEY, [], type=list) or []
+    recent = [str(item) for item in raw if str(item) != target and Path(item).is_file()]
+    recent.insert(0, target)
+    recent = recent[:RECENT_LIMIT]
+    settings.setValue(RECENT_KEY, recent)
+    return recent
+
+
 def layout_panes(avail: int, edit: bool, toc_visible: bool, toc_pref: int, editor_pref: int):
     """Split `avail` px (splitter handles already removed) between the panes.
 
@@ -876,6 +901,7 @@ class DocumentView(QWidget):
         self._path = Path(path).resolve()
         self._update_window_title(False)
         if self.load():
+            remember_recent_file(self._path, self._settings)
             return True
         self._path = previous
         self._update_window_title(False)
@@ -2491,7 +2517,9 @@ class MainWindow(QMainWindow):
         index = self._find_tab(path)
         if index >= 0:
             self._tabs.setCurrentIndex(index)
-            return self._tabs.widget(index)
+            view = self._tabs.widget(index)
+            remember_recent_file(view._path, self._settings)
+            return view
         view = DocumentView(Path(path).resolve(), self._settings)
         view.state_changed.connect(lambda v=view: self._on_view_state_changed(v))
         view.link_requested.connect(self._add_tab)  # Ctrl/middle click -> new tab
@@ -2501,6 +2529,7 @@ class MainWindow(QMainWindow):
         index = self._tabs.addTab(view, view._tab_title())
         self._tabs.setTabToolTip(index, str(view._path))
         self._tabs.setCurrentIndex(index)
+        remember_recent_file(view._path, self._settings)
         self._on_current_changed(self._tabs.currentIndex())
         self._save_session()
         return view
@@ -2743,9 +2772,67 @@ class MainWindow(QMainWindow):
 
     # -- "restore session" toggle (tab context menu) -----------------------
 
+    def _tab_view_at(self, pos: QPoint) -> DocumentView | None:
+        """The view of the tab under `pos` (the active one when none is hit)."""
+        bar = self._tabs.tabBar()
+        index = bar.tabAt(pos)
+        if index < 0:
+            index = self._tabs.currentIndex()
+        if index < 0:
+            return None
+        return self._tabs.widget(index)
+
+    def _copy_path(self, path: Path) -> None:
+        """Put a local file path on the clipboard."""
+        QApplication.clipboard().setText(str(path))
+
+    def _open_folder(self, path: Path) -> None:
+        """Open the containing folder in the system file manager (local only)."""
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
+
+    def _open_recent(self, path: str) -> None:
+        """Open a file picked from the "Недавние" submenu, if it still exists."""
+        candidate = Path(path)
+        if candidate.is_file():
+            self._add_tab(candidate)
+
+    def _clear_recent(self) -> None:
+        self._settings.setValue(RECENT_KEY, [])
+
     def _show_tab_menu(self, pos: QPoint) -> None:
-        """Right-click on the tab strip: session toggle and default zoom."""
+        """Right-click on the tab strip: file actions, recents, session, zoom.
+
+        The file actions (`Открыть содержащую папку`, `Копировать путь`) target
+        the tab under the pointer, falling back to the active tab. Paths are
+        always local (`DocumentView` only ever holds local files), so nothing
+        here reaches the network.
+        """
         menu = QMenu(self)
+        bar = self._tabs.tabBar()
+        view = self._tab_view_at(pos)
+        if view is not None:
+            path = view._path
+            folder = menu.addAction("Открыть содержащую папку")
+            folder.triggered.connect(lambda _checked=False, p=path: self._open_folder(p))
+            copy = menu.addAction("Копировать путь")
+            copy.triggered.connect(lambda _checked=False, p=path: self._copy_path(p))
+            menu.addSeparator()
+
+        recent_menu = menu.addMenu("Недавние")
+        recent = recent_files(self._settings)
+        if recent:
+            for item in recent:
+                action = recent_menu.addAction(Path(item).name)
+                action.setToolTip(item)
+                action.triggered.connect(lambda _checked=False, p=item: self._open_recent(p))
+            recent_menu.addSeparator()
+            clear = recent_menu.addAction("Очистить список")
+            clear.triggered.connect(self._clear_recent)
+        else:
+            empty = recent_menu.addAction("Пусто")
+            empty.setEnabled(False)
+
+        menu.addSeparator()
         restore = menu.addAction("Восстанавливать прошлую сессию")
         restore.setCheckable(True)
         restore.setChecked(self._settings.value("restore_session", False, type=bool))
@@ -2763,7 +2850,7 @@ class MainWindow(QMainWindow):
             action.triggered.connect(
                 lambda _checked=False, value=level: self._set_default_zoom(value)
             )
-        menu.exec(self._tabs.tabBar().mapToGlobal(pos))
+        menu.exec(bar.mapToGlobal(pos))
 
     def _set_restore_session(self, enabled: bool) -> None:
         """Persist the flag; turning it on snapshots the current session at once."""

@@ -454,6 +454,57 @@ def main() -> int:
         close_window(win)
         pump(app)
 
+        # --- 15. recent files: newest first, deduped, capped, existing only
+        recent = QSettings(tempfile.mkdtemp(), "tabs_recent")
+        recent.clear()
+        r1 = Path(folder) / "r1.md"
+        r2 = Path(folder) / "r2.md"
+        r1.write_text("# R1\n", encoding="utf-8")
+        r2.write_text("# R2\n", encoding="utf-8")
+        check("recents start empty", viewer_mod.recent_files(recent), [])
+        viewer_mod.remember_recent_file(r1, recent)
+        viewer_mod.remember_recent_file(r2, recent)
+        check("recents keep the newest first",
+              viewer_mod.recent_files(recent), [str(r2.resolve()), str(r1.resolve())])
+        viewer_mod.remember_recent_file(r1, recent)
+        check("re-remembering dedups and moves to the front",
+              viewer_mod.recent_files(recent), [str(r1.resolve()), str(r2.resolve())])
+        for i in range(14):
+            extra = Path(folder) / f"extra{i}.md"
+            extra.write_text("# X\n", encoding="utf-8")
+            viewer_mod.remember_recent_file(extra, recent)
+        check("recents are capped at the limit",
+              len(viewer_mod.recent_files(recent)), viewer_mod.RECENT_LIMIT)
+        check("the cap keeps the newest and drops the oldest",
+              viewer_mod.recent_files(recent)[0], str((Path(folder) / "extra13.md").resolve()))
+        gone = Path(folder) / "gone.md"
+        gone.write_text("# G\n", encoding="utf-8")
+        viewer_mod.remember_recent_file(gone, recent)
+        gone.unlink()
+        check("a deleted file drops out of the recents",
+              str(gone.resolve()) in viewer_mod.recent_files(recent), False)
+
+        # --- 16. "copy path" / recent reopen act on real files
+        win = MainWindow(settings_for("tabs_paths"))
+        win._open_paths([a, b])
+        win.show()
+        pump(app)
+        check("opening files records them as recent",
+              viewer_mod.recent_files(win._settings)[0], str(b.resolve()))
+        win._copy_path(win._tabs.widget(1)._path)
+        check("copy path puts the file path on the clipboard",
+              QApplication.clipboard().text(), str(b.resolve()))
+        win._open_recent(str(a.resolve()))
+        check("reopening a recent focuses its existing tab",
+              win._tabs.currentWidget()._path, a.resolve())
+        check("reopening a recent promotes it to the front",
+              viewer_mod.recent_files(win._settings)[0], str(a.resolve()))
+        win._clear_recent()
+        check("clearing the recents empties the list",
+              viewer_mod.recent_files(win._settings), [])
+        close_window(win)
+        pump(app)
+
     print("all checks passed" if not failures else f"{len(failures)} failure(s)")
     return 1 if failures else 0
 
