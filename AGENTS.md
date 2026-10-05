@@ -345,8 +345,9 @@ build.bat                                       # сборка dist\MDViewer
       `Ctrl+Enter`, `Alt+Left`, зум) создаются в `DocumentView._build_shortcuts` с
       `WidgetWithChildrenShortcut`: при `WindowShortcut` две вкладки дали бы
       `Ambiguous shortcut overload`. Оконные (`Ctrl+W`/`Ctrl+Q`/`Ctrl+O`,
-      `Ctrl+Tab`/`Ctrl+Shift+Tab`, `Ctrl+1..9`) — один раз на `MainWindow`
-      (`_build_window_shortcuts`) и маршрутизируются в активную вкладку.
+      `Ctrl+Shift+T`, `Ctrl+Tab`/`Ctrl+Shift+Tab`, `Ctrl+1..9`) — один раз на
+      `MainWindow` (`_build_window_shortcuts`) и маршрутизируются в активную
+      вкладку.
     - **Сигналы `DocumentView`:** `state_changed` (перерисовать подпись вкладки и,
       если она активна, заголовок окна) и `link_requested` (Ctrl+клик или средняя
       кнопка — открыть `.md` в новой вкладке; обычный клик навигирует текущую).
@@ -383,6 +384,15 @@ build.bat                                       # сборка dist\MDViewer
       используют `viewer.Viewer(path, settings)` (подкласс `MainWindow`) и
       проксирование `MainWindow.__getattr__`/`__setattr__` в текущий `DocumentView`.
       Не ломать: инструменты обращаются к атрибутам окна напрямую.
+    - **Переоткрытие и зум.** `Ctrl+Shift+T` возвращает последнюю закрытую вкладку:
+      модульный стек `_CLOSED_TABS` (кэп `_CLOSED_LIMIT`=20) кладёт `_close_tab`
+      после `_confirm_discard`; merge/tear-off и закрытие окна в стек не пишут.
+      Клик по метке зума — `100%` → `200%`, иначе → `100%`
+      (`_toggle_zoom_label`, `_toggle_editor_zoom_label`; `_reset_zoom` остаётся
+      жёстким сбросом для `Ctrl+0`). `QSettings("default_zoom")` (уровень,
+      по умолчанию 0) заставляет `_add_tab` открывать новые вкладки на этом
+      масштабе; выбор — подменю «Масштаб по умолчанию» в ПКМ-меню вкладок
+      (`_set_default_zoom`, применяется и к текущей вкладке).
 
 Максимум контента — до `MEASURE` px, оглавление фиксируется по `TOC_WIDTH`,
 отступы уровней — `TOC_STEP`; всё в `theme.py`.

@@ -25,6 +25,7 @@ from PyQt6.QtCore import (
     pyqtSignal,
 )
 from PyQt6.QtGui import (
+    QActionGroup,
     QColor,
     QCursor,
     QDesktopServices,
@@ -739,7 +740,7 @@ class DocumentView(QWidget):
         self._editor_zoom_out.clicked.connect(lambda: self._set_editor_zoom(self._editor_zoom - 1))
         self._editor_zoom_label = QToolButton()
         self._editor_zoom_label.setText("100%")
-        self._editor_zoom_label.clicked.connect(lambda: self._set_editor_zoom(0))
+        self._editor_zoom_label.clicked.connect(self._toggle_editor_zoom_label)
         self._editor_zoom_in = QToolButton()
         self._editor_zoom_in.setText("+")
         self._editor_zoom_in.clicked.connect(lambda: self._set_editor_zoom(self._editor_zoom + 1))
@@ -1566,7 +1567,7 @@ class DocumentView(QWidget):
 
         self._zoom_label = QToolButton()
         self._zoom_label.setText("100%")
-        self._zoom_label.clicked.connect(self._reset_zoom)
+        self._zoom_label.clicked.connect(self._toggle_zoom_label)
 
         zoom_in = QToolButton()
         zoom_in.setText("+")
@@ -1910,6 +1911,10 @@ class DocumentView(QWidget):
     def _reset_zoom(self) -> None:
         self._set_zoom(0)
 
+    def _toggle_zoom_label(self) -> None:
+        """Preview % label: at 100% jump to 200%, otherwise back to 100%."""
+        self._set_zoom(10 if self._zoom == 0 else 0)
+
     def _set_editor_zoom(self, level: int) -> None:
         """Editor zoom only, independent of the preview."""
         self._editor_zoom = max(-8, min(20, level))
@@ -1929,6 +1934,10 @@ class DocumentView(QWidget):
         if getattr(self, "_editor_zoom_label", None) is None:
             return
         self._editor_zoom_label.setText(f"{round((1.0 + 0.1 * self._editor_zoom) * 100)}%")
+
+    def _toggle_editor_zoom_label(self) -> None:
+        """Editor % label: at 100% jump to 200%, otherwise back to 100%."""
+        self._set_editor_zoom(10 if self._editor_zoom == 0 else 0)
 
     def _set_toc_zoom(self, level: int) -> None:
         """Outline zoom only, independent of the other panes."""
@@ -1970,6 +1979,16 @@ _DRAG_VIEW: DocumentView | None = None
 # is dropped in `closeEvent` (before its `deleteLater` runs, so a torn-off or
 # merged window never leaves a dangling entry behind).
 _WINDOWS: list["MainWindow"] = []
+
+# Paths of tabs the user closed, newest last; Ctrl+Shift+T reopens one. Shared
+# by every window (browser-like), capped so a long session cannot grow forever.
+_CLOSED_TABS: list[Path] = []
+_CLOSED_LIMIT = 20
+
+
+def _remember_closed(path: Path) -> None:
+    _CLOSED_TABS.append(Path(path))
+    del _CLOSED_TABS[:-_CLOSED_LIMIT]
 
 
 def _live_windows() -> list["MainWindow"]:
@@ -2270,6 +2289,9 @@ class MainWindow(QMainWindow):
         view = DocumentView(Path(path).resolve(), self._settings)
         view.state_changed.connect(lambda v=view: self._on_view_state_changed(v))
         view.link_requested.connect(self._add_tab)  # Ctrl/middle click -> new tab
+        default_zoom = self._settings.value("default_zoom", 0, type=int)
+        if default_zoom:  # new tabs open at the user's preferred zoom
+            view._set_zoom(default_zoom)
         index = self._tabs.addTab(view, view._tab_title())
         self._tabs.setTabToolTip(index, str(view._path))
         self._tabs.setCurrentIndex(index)
@@ -2394,6 +2416,7 @@ class MainWindow(QMainWindow):
             return
         if not view._confirm_discard():
             return
+        _remember_closed(view._path)  # Ctrl+Shift+T can bring it back
         self._tabs.removeTab(index)
         view.deleteLater()
         self._save_session()
@@ -2405,6 +2428,14 @@ class MainWindow(QMainWindow):
             self.close()
             return
         self._close_tab(self._tabs.currentIndex())
+
+    def _reopen_closed_tab(self) -> None:
+        """Ctrl+Shift+T: reopen the most recently closed tab (browser style)."""
+        while _CLOSED_TABS:
+            path = _CLOSED_TABS.pop()
+            if path.is_file():
+                self._add_tab(path)
+                return
 
     def _select_tab(self, index: int) -> None:
         """Ctrl+1..9: jump to the n-th tab (no-op when it does not exist)."""
@@ -2501,12 +2532,25 @@ class MainWindow(QMainWindow):
     # -- "restore session" toggle (tab context menu) -----------------------
 
     def _show_tab_menu(self, pos: QPoint) -> None:
-        """Right-click on the tab strip: toggle session restore (in Russian)."""
+        """Right-click on the tab strip: session toggle and default zoom."""
         menu = QMenu(self)
-        action = menu.addAction("Восстанавливать прошлую сессию")
-        action.setCheckable(True)
-        action.setChecked(self._settings.value("restore_session", False, type=bool))
-        action.toggled.connect(self._set_restore_session)
+        restore = menu.addAction("Восстанавливать прошлую сессию")
+        restore.setCheckable(True)
+        restore.setChecked(self._settings.value("restore_session", False, type=bool))
+        restore.toggled.connect(self._set_restore_session)
+
+        menu.addSeparator()
+        zoom_menu = menu.addMenu("Масштаб по умолчанию")
+        group = QActionGroup(zoom_menu)  # parented: stays alive for the menu
+        group.setExclusive(True)
+        current = self._settings.value("default_zoom", 0, type=int)
+        for level in (-2, -1, 0, 1, 2, 5, 10):  # 80, 90, 100, 110, 120, 150, 200 %
+            action = zoom_menu.addAction(f"{round((1.0 + 0.1 * level) * 100)}%")
+            action.setCheckable(True)
+            action.setChecked(level == current)
+            action.triggered.connect(
+                lambda _checked=False, value=level: self._set_default_zoom(value)
+            )
         menu.exec(self._tabs.tabBar().mapToGlobal(pos))
 
     def _set_restore_session(self, enabled: bool) -> None:
@@ -2514,6 +2558,13 @@ class MainWindow(QMainWindow):
         self._settings.setValue("restore_session", bool(enabled))
         if enabled:
             self._save_session()
+
+    def _set_default_zoom(self, level: int) -> None:
+        """Remember the zoom new tabs open at and apply it to the current tab."""
+        self._settings.setValue("default_zoom", int(level))
+        view = self._current_view()
+        if view is not None:
+            view._set_zoom(int(level))
 
     # -- window chrome -----------------------------------------------------
 
@@ -2532,6 +2583,7 @@ class MainWindow(QMainWindow):
             "Ctrl+W": self._close_current_tab,
             "Ctrl+Q": self.close,
             "Ctrl+O": self._open_files_dialog,
+            "Ctrl+Shift+T": self._reopen_closed_tab,
             "Ctrl+Tab": lambda: self._cycle_tab(1),
             "Ctrl+Shift+Tab": lambda: self._cycle_tab(-1),
         }

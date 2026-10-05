@@ -390,6 +390,45 @@ def main() -> int:
         finally:
             os.environ.pop("MDVIEWER_STATE_DIR", None)
 
+        # --- 13. reopen closed tab, zoom-label toggle, default zoom
+        viewer_mod._CLOSED_TABS.clear()
+        win = MainWindow(settings_for("tabs_reopen"))
+        win._open_paths([a, b])
+        win.show()
+        pump(app)
+        window_keys = [s.key().toString() for s in win.findChildren(QShortcut)
+                       if s.parent() is win]
+        check("Ctrl+Shift+T is a window key", "Ctrl+Shift+T" in window_keys, True)
+        win._close_tab(1)
+        pump(app)
+        check("a closed tab is remembered", viewer_mod._CLOSED_TABS[-1], b.resolve())
+        win._reopen_closed_tab()
+        pump(app)
+        check("reopen restores the tab", win._tabs.count(), 2)
+        check("the restored tab is the closed file",
+              win._tabs.currentWidget()._path, b.resolve())
+        check("reopening consumes the stack entry", len(viewer_mod._CLOSED_TABS), 0)
+
+        view = win._tabs.currentWidget()
+        view._ensure_overlay()
+        pump(app)
+        check("zoom label starts at 100%", view._zoom_label.text(), "100%")
+        view._zoom_label.click()
+        pump(app)
+        check("clicking 100% jumps to 200%", view._zoom, 10)
+        check("the label shows 200%", view._zoom_label.text(), "200%")
+        view._zoom_label.click()
+        pump(app)
+        check("clicking 200% returns to 100%", view._zoom, 0)
+
+        (Path(folder) / "c.md").write_text("# C\r\n\r\ngamma\r\n", encoding="utf-8")
+        win._settings.setValue("default_zoom", 2)  # 120 %
+        fresh = win._add_tab(Path(folder) / "c.md")
+        check("a new tab opens at the default zoom", fresh._zoom, 2)
+        win._settings.setValue("default_zoom", 0)
+        close_window(win)
+        pump(app)
+
     print("all checks passed" if not failures else f"{len(failures)} failure(s)")
     return 1 if failures else 0
 
