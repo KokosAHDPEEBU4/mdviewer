@@ -13,11 +13,13 @@ main.py         CLI (файлы, --install-default/--uninstall-default/--assoc-s
                 экземпляр — второй запуск отдаёт пути через instance.py
 instance.py     single-instance: именованный мьютекс Win32 + файловая очередь
                 запросов (QtNetwork вырезан из сборки, QLocalServer недоступен)
-viewer.py       DocumentView(QWidget) — содержимое одного файла: превью +
-                оглавление + QPlainTextEdit, оверлей, поиск, подсветка, zoom,
-                история, QSettings, dirty-state;
+viewer.py       DocumentView(QWidget) — содержимое одного файла: превью
+                (контейнер «крошки + QTextBrowser») + оглавление с фильтром +
+                QPlainTextEdit, оверлей, поиск, подсветка, zoom, история,
+                QSettings, dirty-state, режим чтения;
                 MainWindow(QMainWindow) — оболочка: QTabWidget, заголовок,
-                геометрия, closeEvent по всем вкладкам, реестр _WINDOWS;
+                геометрия, режим чтения (F11), closeEvent по всем вкладкам,
+                реестр _WINDOWS;
                 TabBar(QTabBar) — tear-off/merge вкладок; совместимый
                 Viewer(MainWindow) для tools/
 renderer.py     mistune -> HTML: код, картинки, чекбоксы, сноски, якоря заголовков
@@ -393,6 +395,43 @@ build.bat                                       # сборка dist\MDViewer
       по умолчанию 0) заставляет `_add_tab` открывать новые вкладки на этом
       масштабе; выбор — подменю «Масштаб по умолчанию» в ПКМ-меню вкладок
       (`_set_default_zoom`, применяется и к текущей вкладке).
+
+27. **Режим чтения (F11), крошки и фильтр оглавления.**
+    - **Режим чтения** — оконный хоткей `F11` в
+      `MainWindow._build_window_shortcuts` → `_toggle_reading_mode`:
+      `showFullScreen()`, полоса вкладок `_tabs.tabBar().setVisible(False)`, у
+      активного `DocumentView` `_set_reading_mode(True)`. Тот прячет оглавление,
+      запомнив `_toc_user_visible` в `_reading_toc_saved`, и подавляет оверлей
+      (`_show_overlay` выходит при `_reading_mode`). Выход — повторный `F11` или
+      `Esc`; `Esc` разобран в `DocumentView._handle_esc`: если host в режиме,
+      сначала выйти (автопрокрутку/поиск не трогать). `toc_visible` в QSettings
+      не пишется — режим временный. В правке (`_editing()`) оглавление и панель
+      редактора **не двигаются**: `_set_reading_mode` трогает `_toc_*` только
+      вне правки (раскладка по инварианту 25 не ломается).
+    - **Крошки** — `QLabel#breadcrumbs` над `_browser`, а сам браузер обёрнут в
+      `_preview_panel` (`QVBoxLayout`: крошки + браузер). В сплиттер добавлен
+      контейнер, а не браузер, поэтому детей по-прежнему три (оглавление /
+      превью-контейнер / редактор) и все ссылки на `self._browser`
+      (`_pane_for`, `_set_margins`, `_place_overlay`, eventFilter на viewport)
+      работают. Путь собирается `_crumb_path` из `self._outline` по
+      `_current_section_index()` (предки — ближайшие заголовки со **строго**
+      меньшим `level`), сегменты — `<a href="{row}">` (индекс строки, не текст!)
+      и разделитель `›`, HTML экранируется, длинные обрезаются
+      (`CRUMB_LABEL_MAX`/`CRUMB_SEGMENT_MAX`). Клик — `_crumb_clicked` →
+      `_outline_clicked`. Строка видна только при ≥2 сегментах. Обновляется из
+      того же `valueChanged`, что и оглавление, **отдельным** `_sync_crumbs`
+      (в `_sync_outline` нельзя: он рано выходит при скрытом оглавлении), а
+      также после `_render`, `_outline_clicked` и `_set_zoom`.
+    - **Фильтр оглавления** — `QLineEdit#tocFilter` над `_toc` в `_build_outline`;
+      само оглавление теперь в панели `_toc_panel`, и `_relayout`,
+      `_on_splitter_moved`, `_toc_can_toggle` смотрят на панель (не на `_toc`).
+      `textChanged` → `_apply_toc_filter`: `setHidden` несовпадающих
+      (регистронезависимо), при вводе панель при необходимости показывается.
+      `Esc` в поле очищает фильтр (ветка в `eventFilter` **и** в `_handle_esc`).
+      `_populate_outline` переприменяет текущий текст фильтра. `_build_outline`
+      создаёт `_toc` до добавления фильтра в layout, а `_pane_for` берёт панели
+      через `getattr`: событие может прийти во время сборки виджетов, иначе
+      `AttributeError` в `eventFilter` роняет процесс с `0xC0000409`.
 
 Максимум контента — до `MEASURE` px, оглавление фиксируется по `TOC_WIDTH`,
 отступы уровней — `TOC_STEP`; всё в `theme.py`.

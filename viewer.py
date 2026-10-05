@@ -501,7 +501,7 @@ class DocumentView(QWidget):
         sizes = self._splitter.sizes()
         if not sizes:
             return
-        if self._toc.isVisible():
+        if self._toc_panel.isVisible():
             self._settings.setValue("toc_width", max(TOC_MIN_WIDTH, sizes[0]))
         if self._editing() and self._panel is not None and self._panel.isVisible():
             self._editor_pref = max(EDITOR_HARD, sizes[-1])
@@ -509,6 +509,7 @@ class DocumentView(QWidget):
     # -- table of contents -------------------------------------------------
 
     def _build_outline(self) -> QWidget:
+        """The outline pane: a filter row on top of the heading list."""
         self._toc = QListWidget()
         self._toc.setObjectName("outline")
         self._toc.setUniformItemSizes(False)
@@ -520,8 +521,25 @@ class DocumentView(QWidget):
         self._toc.installEventFilter(self)
         self._toc.viewport().installEventFilter(self)  # wheel lands on the viewport
         self._toc_base_font = self._toc.font()
-        self._toc.setVisible(False)  # shown once a document has headings
-        return self._toc
+
+        self._toc_filter = QLineEdit()
+        self._toc_filter.setObjectName("tocFilter")
+        self._toc_filter.setPlaceholderText("Фильтр…")
+        self._toc_filter.textChanged.connect(self._apply_toc_filter)
+        self._toc_filter.installEventFilter(self)
+
+        panel = QWidget()
+        panel.setObjectName("tocPanel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._toc_filter)
+        layout.addWidget(self._toc, 1)
+
+        self._toc_panel = panel
+        panel.setMinimumWidth(TOC_MIN_WIDTH)
+        panel.setVisible(False)  # shown once a document has headings
+        return panel
 
     def _populate_outline(self) -> None:
         """Rebuild the list from the last render (cheap: it is plain text)."""
@@ -535,6 +553,8 @@ class DocumentView(QWidget):
             self._settings.value("toc_visible", True, type=bool) and bool(self._outline)
         )
         self._toc_auto_hidden = False  # a freshly rendered document starts shown
+        # a rebuilt outline re-applies whatever is in the filter field
+        self._apply_toc_filter(self._toc_filter.text() if self._toc_filter else "")
         self._relayout()
         QTimer.singleShot(0, self._sync_outline)
 
@@ -554,7 +574,7 @@ class DocumentView(QWidget):
         """False when turning the outline on now would just auto-hide it again."""
         if not self._outline:
             return False
-        if self._toc.isVisible():
+        if self._toc_panel.isVisible():
             return True
         edit = self._editing()
         main_panes = 2 if edit else 1
@@ -630,7 +650,7 @@ class DocumentView(QWidget):
 
     def _sync_outline(self) -> None:
         """Highlight the section that owns the top of the viewport."""
-        if self._toc_syncing or not self._toc.isVisible() or not self._outline:
+        if self._toc_syncing or not self._toc_panel.isVisible() or not self._outline:
             return
         current = self._current_section_index()
         if self._toc.currentRow() == current:
@@ -983,7 +1003,7 @@ class DocumentView(QWidget):
         window = self.window()
         screen = window.screen() or QGuiApplication.primaryScreen()
         available = screen.availableGeometry().width() if screen else SCREEN_FALLBACK
-        toc_w = self._toc_pref() if self._toc.isVisible() else 0
+        toc_w = self._toc_pref() if self._toc_panel.isVisible() else 0
         panes = 2 + (1 if toc_w else 0)
         target = min(
             self._preview_width + self._editor_pref + toc_w + SPLIT_HANDLE * (panes - 1),
@@ -1508,7 +1528,7 @@ class DocumentView(QWidget):
             self._toc_auto_hidden = user_visible and not toc_visible
             if not user_visible:
                 self._toc_auto_hidden = False
-            self._toc.setVisible(toc_visible)
+            self._toc_panel.setVisible(toc_visible)
             panes = main_panes + (1 if toc_visible else 0)
             avail = max(0, content - SPLIT_HANDLE * (panes - 1))
             toc, editor, preview = layout_panes(
@@ -1632,8 +1652,20 @@ class DocumentView(QWidget):
         self._update_window_title(unsaved)
 
     def _handle_esc(self) -> None:
+        # reading mode is the outermost layer: Esc leaves it first and touches
+        # neither the autoscroll ring nor the search box
+        window = self.window()
+        if window is not self and getattr(window, "_reading_mode", False):
+            window._leave_reading_mode()
+            return
         if self._autoscroll_timer.isActive():
             self._stop_autoscroll()
+        elif (
+            self._toc_filter is not None
+            and self._toc_filter.hasFocus()
+            and self._toc_filter.text()
+        ):
+            self._toc_filter.clear()
         elif self._find_edit is not None and self._find_edit.hasFocus():
             self._close_find()
         elif self._editing():
@@ -1765,13 +1797,19 @@ class DocumentView(QWidget):
         self._overlay.move(x, top_left.y() + 12)
 
     def _pane_for(self, obj):
-        """The pane a filtered object belongs to (the widget or its viewport)."""
+        """The pane a filtered object belongs to (the widget or its viewport).
+
+        `getattr` guards against events arriving while the panes are still being
+        assembled in `__init__` (`_toc` is created after the preview).
+        """
         if obj is self._browser or obj is self._browser.viewport():
             return self._browser
-        if obj is self._toc or obj is self._toc.viewport():
-            return self._toc
-        if self._editor is not None and (obj is self._editor or obj is self._editor.viewport()):
-            return self._editor
+        toc = getattr(self, "_toc", None)
+        if toc is not None and (obj is toc or obj is toc.viewport()):
+            return toc
+        editor = getattr(self, "_editor", None)
+        if editor is not None and (obj is editor or obj is editor.viewport()):
+            return editor
         return None
 
     def eventFilter(self, obj, event):
@@ -1789,6 +1827,10 @@ class DocumentView(QWidget):
             # the final width; laying out here avoids a stale-width pass
             self._relayout(event.size().width())
             return False
+        if obj is self._toc_filter and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Escape:
+                self._toc_filter.clear()
+                return True
         pane = self._pane_for(obj)
         if pane is None:
             return super().eventFilter(obj, event)
@@ -2008,7 +2050,7 @@ class DocumentView(QWidget):
 
     def _zoom_step(self, step: int) -> None:
         """Zoom the pane the user is working in. All three are independent."""
-        if self._toc.isVisible() and self._toc.hasFocus():
+        if self._toc_panel.isVisible() and self._toc.hasFocus():
             target = self._toc_zoom + step if step else 0
             self._set_toc_zoom(target)
         elif self._editing() and self._editor.hasFocus():

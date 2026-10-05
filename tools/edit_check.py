@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from PyQt6.QtCore import QEvent, QPoint, QPointF, QSettings, Qt, QUrl
-from PyQt6.QtGui import QMouseEvent, QPalette, QTextCursor, QWheelEvent
+from PyQt6.QtGui import QKeyEvent, QMouseEvent, QPalette, QTextCursor, QWheelEvent
 from PyQt6.QtWidgets import QApplication, QTextBrowser
 
 import viewer as viewer_mod
