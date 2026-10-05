@@ -15,6 +15,7 @@ import sys
 from PyQt6.QtCore import (
     QByteArray,
     QEvent,
+    QFileSystemWatcher,
     QMimeData,
     QPoint,
     QRegularExpression,
@@ -128,6 +129,12 @@ def _newline_of(raw: bytes) -> str:
 def _normalized(text: str) -> str:
     """Qt text widgets hand back LF-only text, so compare like for like."""
     return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+# A file save is rarely one event (editors write a temp file and rename it), so
+# the external-change reload waits this long to coalesce the burst before it
+# reads the file once. Short enough to feel instant, long enough to be one read.
+FILE_WATCH_DEBOUNCE_MS = 200
 
 
 # How many files the "Недавние" submenu remembers. Stored newest-first, deduped
@@ -467,6 +474,19 @@ class DocumentView(QWidget):
         self._autoscroll_timer = QTimer(self)
         self._autoscroll_timer.timeout.connect(self._autoscroll_tick)
 
+        # external file changes: one watcher per view (one view -> one file).
+        # `_watch` is the path currently armed; it follows `_path` on navigation.
+        # The watcher is a child, so it is torn down with the view.
+        self._watch: Path | None = None
+        self._watcher = QFileSystemWatcher(self)
+        self._watcher.fileChanged.connect(self._on_watch_event)
+        # editors save via temp+rename, so one save arrives as a burst of events;
+        # a single-shot timer coalesces them before any reload work is done
+        self._reload_timer = QTimer(self)
+        self._reload_timer.setSingleShot(True)
+        self._reload_timer.setInterval(FILE_WATCH_DEBOUNCE_MS)
+        self._reload_timer.timeout.connect(self._on_file_changed)
+
         # the window title and geometry belong to MainWindow (see below)
 
         self._browser = OverlayTextBrowser()
@@ -563,6 +583,7 @@ class DocumentView(QWidget):
             self._editor.document().setModified(False)
             self._map_dirty = False  # matches the render that just happened
         self._update_state()
+        self._watch_current()  # the watch follows the file that is now shown
         return True
 
     def _render(self, text: str) -> None:
@@ -598,6 +619,108 @@ class DocumentView(QWidget):
             self._render(text)
         finally:
             QApplication.restoreOverrideCursor()
+
+    # -- external changes (`QFileSystemWatcher`) ---------------------------
+
+    def _watch_current(self) -> None:
+        """Point the filesystem watch at the file shown right now.
+
+        Called after every successful `load()`, so navigation (`_navigate`,
+        `_go_back`, link clicks) and F5 re-arm the watch on the new path.
+        """
+        self._watch = self._path
+        self._rewatch()
+
+    def _unwatch(self) -> None:
+        """Drop every path from the watcher (the view still shows the file)."""
+        watched = self._watcher.files()
+        if watched:
+            self._watcher.removePaths(watched)
+
+    def _rewatch(self) -> None:
+        """(Re)install the watch for `self._watch`.
+
+        On Windows the watch is often dropped when the file is atomically
+        replaced (temp+rename), so the path is removed and added again after
+        every notification. A path that no longer exists is simply left
+        unwatched; the shown document is never touched here.
+        """
+        self._unwatch()
+        if self._watch is not None and self._watch.is_file():
+            self._watcher.addPath(str(self._watch))
+
+    def _on_watch_event(self, _path: str) -> None:
+        """A raw filesystem notification: re-arm and debounce the reload."""
+        self._rewatch()
+        self._reload_timer.start()
+
+    def _on_file_changed(self) -> None:
+        """React to the watched file changing on disk (after the debounce).
+
+        With no unsaved edits the file is re-read and repainted automatically,
+        keeping the reading position. With unsaved edits the user is asked
+        first; "Нет" leaves everything as it is. A missing or unreadable file
+        is ignored (only the watch is adjusted) so a delete/rename never
+        disturbs what is on screen.
+        """
+        self._rewatch()
+        if self._watch != self._path or not self._path.is_file():
+            return
+        try:
+            text, encoding, newline = read_document(self._path)
+        except OSError:
+            return
+        if _normalized(text) == _normalized(self._text):
+            return  # a spurious event: the contents on disk did not change
+        if self._is_unsaved():
+            answer = QMessageBox.question(
+                self,
+                APP_NAME,
+                "Файл изменён на диске. Перезагрузить и потерять ваши правки?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._reload_from_disk(text, encoding, newline)
+
+    def _reload_from_disk(
+        self,
+        text: str | None = None,
+        encoding: str | None = None,
+        newline: str | None = None,
+    ) -> bool:
+        """Re-read the current file and repaint, keeping the reading position.
+
+        Unlike `load()` this never asks to discard edits: the caller has already
+        decided (silently when clean, after the prompt when dirty). Returns
+        False when the file is gone or cannot be read.
+        """
+        if text is None:
+            try:
+                text, encoding, newline = read_document(self._path)
+            except OSError:
+                return False
+        # remember the character on the top edge, exactly like a zoom or `load`:
+        # the document is about to be rebuilt, so a raw scroll pixel would point
+        # at different text afterwards
+        anchor = self._browser.cursorForPosition(
+            self._browser.viewport().rect().topLeft()
+        ).position()
+        self._text = text
+        self._encoding = encoding or self._encoding
+        self._newline = newline or self._newline
+        self._clear_highlights()
+        self._selected_section = None  # the outline is rebuilt for this content
+        self._render(text)
+        self._baseline = _normalized(text)
+        if self._editor is not None:
+            self._editor.setPlainText(text)
+            self._editor.document().setModified(False)
+            self._map_dirty = False  # matches the render that just happened
+        self._update_state()
+        self._scroll_preview_to(anchor)
+        return True
 
     def _set_margins(self) -> None:
         """Keep the text column at a readable width.
@@ -2265,6 +2388,9 @@ class DocumentView(QWidget):
     def _scroll_preview_to(self, position: int) -> None:
         """Scroll the preview so document `position` sits at the viewport top."""
         document = self._browser.document()
+        # an external change may have shortened the document: clamp the remembered
+        # position so it can never point past the new end
+        position = max(0, min(position, max(0, document.characterCount() - 1)))
         cursor = QTextCursor(document)
         cursor.setPosition(position)
         block = cursor.block()
