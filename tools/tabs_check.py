@@ -21,6 +21,7 @@ from PyQt6.QtCore import QByteArray, QMimeData, QPoint, QPointF, QSettings, Qt
 from PyQt6.QtGui import QDropEvent, QShortcut
 from PyQt6.QtWidgets import QApplication
 
+import theme as theme_mod
 import viewer as viewer_mod
 import instance
 from main import create_app
@@ -522,6 +523,44 @@ def main() -> int:
         check("a torn-off view keeps its watch", va._watch, a.resolve())
         check("a torn-off view keeps its watcher", str(a.resolve()) in va._watcher.files(), True)
         close_window(va.window())
+        close_window(win)
+        pump(app)
+
+        # --- 18. theme switch reaches every open window and tab
+        theme_settings = QSettings(tempfile.mkdtemp(), "tabs_theme")
+        theme_settings.clear()
+        win = MainWindow(theme_settings)
+        win._open_paths([a, b])
+        win.show()
+        pump(app)
+        check("tabs start on the dark theme",
+              [win._tabs.widget(i)._theme for i in range(2)], ["dark", "dark"])
+        other = MainWindow(theme_settings)
+        other._open_paths([a])
+        other.show()
+        pump(app)
+        win._set_theme("light")
+        pump(app)
+        check("the switch persists the theme",
+              theme_settings.value("theme", "", type=str), "light")
+        check("both tabs of the first window switch",
+              [win._tabs.widget(i)._theme for i in range(2)], ["light", "light"])
+        check("an open tab of another window switches too",
+              other._tabs.widget(0)._theme, "light")
+        check("the application stylesheet follows the theme",
+              QApplication.instance().styleSheet() == theme_mod.app_qss("light"), True)
+        d = Path(folder) / "d.md"
+        d.write_text("# D\n\ntheme body\n", encoding="utf-8")
+        fresh = win._add_tab(d)
+        check("a new tab opens on the current theme", fresh._theme, "light")
+        win._set_theme("dark")
+        pump(app)
+        check("switching back restores dark everywhere",
+              [win._tabs.widget(i)._theme for i in range(win._tabs.count())],
+              ["dark", "dark", "dark"])
+        check("the dark QSS is restored",
+              QApplication.instance().styleSheet() == theme_mod.app_qss("dark"), True)
+        close_window(other)
         close_window(win)
         pump(app)
 

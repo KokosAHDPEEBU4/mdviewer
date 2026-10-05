@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 
 import instance
 import winassoc
-from theme import APP_QSS
+from theme import DEFAULT_THEME, app_qss
 from version import APP_NAME, APP_VERSION
 from viewer import MainWindow
 
@@ -107,7 +107,10 @@ def create_app() -> QApplication:
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("MDViewer")
     app.setWindowIcon(QIcon(str(ICON_PATH)))
-    app.setStyleSheet(APP_QSS)
+    # apply the saved theme before any window exists, so the first frame is
+    # already correct (no dark flash for a light-theme user)
+    theme_name = QSettings().value("theme", DEFAULT_THEME, type=str)
+    app.setStyleSheet(app_qss(theme_name))
     app.setQuitOnLastWindowClosed(True)  # closing the last tab closes the app
     return app
 

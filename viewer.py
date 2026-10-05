@@ -72,6 +72,7 @@ from theme import (
     ACCENT,
     ACCENT_DIM,
     CODE_BG,
+    DEFAULT_THEME,
     EDITOR_HARD,
     EDITOR_MIN,
     EDITOR_PREF,
@@ -87,7 +88,12 @@ from theme import (
     TEXT_MUTED,
     TOC_MIN_WIDTH,
     TOC_WIDTH,
+    app_qss,
     content_css,
+    is_light,
+    normalize,
+    palette,
+    retheme_tables,
     side_margin,
 )
 from version import APP_NAME, APP_VERSION
@@ -223,12 +229,17 @@ _DWMWA_USE_IMMERSIVE_DARK_MODE = 20          # Windows 10 20H1+
 _DWMWA_USE_IMMERSIVE_DARK_MODE_OLD = 19      # Windows 10 1809..1909
 
 
-def enable_dark_title_bar(widget) -> bool:
-    """Ask DWM for a dark caption. False when the OS will not have it."""
+def set_dark_title_bar(widget, enabled: bool) -> bool:
+    """Ask DWM for a dark (True) or light (False) caption.
+
+    Returns False when the OS will not have it. The same attribute is used by
+    the old and new Windows builds; passing 0 restores the light caption, which
+    is what the light theme wants.
+    """
     if sys.platform != "win32":
         return False
     try:
-        value = ctypes.c_int(1)
+        value = ctypes.c_int(1 if enabled else 0)
         for attribute in (_DWMWA_USE_IMMERSIVE_DARK_MODE, _DWMWA_USE_IMMERSIVE_DARK_MODE_OLD):
             result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
                 int(widget.winId()), attribute, ctypes.byref(value), ctypes.sizeof(value)
@@ -238,6 +249,11 @@ def enable_dark_title_bar(widget) -> bool:
     except (AttributeError, OSError):
         pass
     return False
+
+
+def enable_dark_title_bar(widget) -> bool:
+    """Backwards-compatible alias: request a dark caption."""
+    return set_dark_title_bar(widget, True)
 
 
 class _OverlayMixin:
@@ -298,10 +314,18 @@ class LineNumberedEdit(OverlayPlainTextEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._line_numbers = True
+        self._gutter_bg = CODE_BG
+        self._gutter_fg = TEXT_MUTED
         self._gutter = LineNumberArea(self)
         self.blockCountChanged.connect(self._update_gutter_width)
         self.updateRequest.connect(self._update_gutter)
         self._update_gutter_width()
+
+    def set_palette_colours(self, background: str, foreground: str) -> None:
+        """Theme switch: repaint the gutter in the active palette colours."""
+        self._gutter_bg = background
+        self._gutter_fg = foreground
+        self._gutter.update()
 
     def set_line_numbers(self, enabled: bool) -> None:
         self._line_numbers = bool(enabled)
@@ -338,8 +362,8 @@ class LineNumberedEdit(OverlayPlainTextEdit):
 
     def paint_line_numbers(self, event) -> None:
         painter = QPainter(self._gutter)
-        painter.fillRect(event.rect(), QColor(CODE_BG))
-        painter.setPen(QColor(TEXT_MUTED))
+        painter.fillRect(event.rect(), QColor(self._gutter_bg))
+        painter.setPen(QColor(self._gutter_fg))
         block = self.firstVisibleBlock()
         number = block.blockNumber()
         offset = self.contentOffset()
@@ -423,6 +447,7 @@ class DocumentView(QWidget):
         super().__init__()
         self._path = Path(path).resolve()
         self._settings = settings or QSettings()
+        self._theme = normalize(self._settings.value("theme", DEFAULT_THEME))
         self._unsaved = False
         self._side = -1
         self._zoom = 0
@@ -616,8 +641,11 @@ class DocumentView(QWidget):
         self._rendered = _normalized(text)
         # the stylesheet has to be in place before the HTML: Qt matches CSS while
         # importing, not afterwards
-        self._browser.document().setDefaultStyleSheet(content_css())
+        self._browser.document().setDefaultStyleSheet(content_css(self._theme))
         html, self._outline = render_with_outline(text, self._path.parent)
+        # renderer bakes the dark table colours into `bgcolor`; recolour them
+        # for the light theme (a no-op for the default dark palette)
+        html = retheme_tables(html, self._theme)
         self._browser.setHtml(html)
         # relative links (`other.md`, `#anchor`) resolve against the current
         # file so the click handler can find the target on disk
@@ -640,6 +668,42 @@ class DocumentView(QWidget):
             self._render(text)
         finally:
             QApplication.restoreOverrideCursor()
+
+    # -- theme -------------------------------------------------------------
+
+    def _pal(self) -> dict:
+        """Colour tokens of the theme this view is showing."""
+        return palette(self._theme)
+
+    def _refresh_theme_chrome(self) -> None:
+        """Re-tint the bits painted by hand (inline label styles, gutter)."""
+        p = self._pal()
+        caption = getattr(self, "_editor_caption", None)
+        if caption is not None:
+            caption.setStyleSheet(f"color: {p['TEXT_MUTED']}; font-size: 11px;")
+        status = getattr(self, "_find_status", None)
+        if status is not None:
+            status.setStyleSheet(f"color: {p['TEXT_MUTED']};")
+        editor = getattr(self, "_editor", None)
+        if editor is not None and hasattr(editor, "set_palette_colours"):
+            editor.set_palette_colours(p["CODE_BG"], p["TEXT_MUTED"])
+
+    def _apply_theme(self, name: str) -> None:
+        """Switch this view to `name`, re-rendering and keeping the position.
+
+        The application stylesheet is set by the window; here the document
+        stylesheet, the hand-painted chrome and the rendered table colours are
+        brought in line, and the character at the top of the viewport is pinned
+        across the re-render (a theme swap can rewrap the document).
+        """
+        name = normalize(name)
+        self._theme = name
+        self._refresh_theme_chrome()
+        anchor = self._browser.cursorForPosition(
+            self._browser.viewport().rect().topLeft()
+        ).position()
+        self._render(self._text)
+        self._scroll_preview_to(anchor)
 
     # -- external changes (`QFileSystemWatcher`) ---------------------------
 
@@ -1009,19 +1073,21 @@ class DocumentView(QWidget):
             trimmed = True
         else:
             trimmed = False
+        p = self._pal()
+        muted, accent, accent_dim = p["TEXT_MUTED"], p["ACCENT"], p["ACCENT_DIM"]
         parts = []
         if trimmed:
-            parts.append(f'<span style="color:{TEXT_MUTED}">…</span>')
+            parts.append(f'<span style="color:{muted}">…</span>')
         last = len(path) - 1
         for position, row in enumerate(path):
             label = self._crumb_label(self._outline[row].label)
             if position == last:
-                parts.append(f'<span style="color:{ACCENT}">{label}</span>')
+                parts.append(f'<span style="color:{accent}">{label}</span>')
             else:
                 parts.append(
-                    f'<a href="{row}" style="color:{ACCENT_DIM}; text-decoration:none">{label}</a>'
+                    f'<a href="{row}" style="color:{accent_dim}; text-decoration:none">{label}</a>'
                 )
-        separator = f'<span style="color:{TEXT_MUTED}"> › </span>'
+        separator = f'<span style="color:{muted}"> › </span>'
         self._crumbs.setText(separator.join(parts))
         self._crumbs.setVisible(True)
 
@@ -1170,7 +1236,8 @@ class DocumentView(QWidget):
         header.setContentsMargins(12, 8, 12, 8)
         header.setSpacing(8)
         caption = QLabel("ИСХОДНИК")
-        caption.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px;")
+        self._editor_caption = caption
+        caption.setStyleSheet(f"color: {self._pal()['TEXT_MUTED']}; font-size: 11px;")
         self._convert_btn = QPushButton("Конвертировать")
         self._convert_btn.clicked.connect(self._convert)
         self._save_btn = QPushButton("Сохранить")
@@ -1232,6 +1299,7 @@ class DocumentView(QWidget):
         self._editor.verticalScrollBar().valueChanged.connect(self._on_editor_scrolled)
         self._editor_base_font = self._editor.font()
         self._apply_editor_options()
+        self._refresh_theme_chrome()  # gutter matches the active palette
         layout.addWidget(self._editor, 1)
 
         self._panel = panel
@@ -1564,7 +1632,8 @@ class DocumentView(QWidget):
         so its colour wins on both sides while the other pane's earlier
         selection stays visible underneath (it is not replaced).
         """
-        colour = PREVIEW_SELECTION if source is self._browser else EDITOR_SELECTION
+        p = self._pal()
+        colour = p["PREVIEW_SELECTION"] if source is self._browser else p["EDITOR_SELECTION"]
         text = self._collapse(source.textCursor().selectedText())
         target = self._editor if source is self._browser else self._browser
         if target is not None:
@@ -1758,12 +1827,11 @@ class DocumentView(QWidget):
         ]
         pane.setExtraSelections(selections)
 
-    @staticmethod
-    def _extra_selection(cursor, colour: str) -> QTextEdit.ExtraSelection:
+    def _extra_selection(self, cursor, colour: str) -> QTextEdit.ExtraSelection:
         selection = QTextEdit.ExtraSelection()
         selection.cursor = cursor
         selection.format.setBackground(QColor(colour))
-        selection.format.setForeground(QColor("#ffffff"))
+        selection.format.setForeground(QColor(self._pal()["SEL_TEXT"]))
         return selection
 
     def _clear_highlights(self) -> None:
@@ -2055,7 +2123,7 @@ class DocumentView(QWidget):
         self._find_edit.textChanged.connect(lambda text: self._update_hits(text, jump=True))
 
         self._find_status = QLabel("")
-        self._find_status.setStyleSheet(f"color: {TEXT_MUTED};")
+        self._find_status.setStyleSheet(f"color: {self._pal()['TEXT_MUTED']};")
 
         prev_btn = QToolButton()
         prev_btn.setText("↑")
@@ -3032,6 +3100,7 @@ class MainWindow(QMainWindow):
         "_settings",
         "_view_geometry",
         "_dark_titled",
+        "_title_bar_ready",
         "_reading_mode",
         "_reading_view",
     }
@@ -3043,6 +3112,7 @@ class MainWindow(QMainWindow):
         object.__setattr__(self, "_settings", settings or QSettings())
         object.__setattr__(self, "_view_geometry", None)  # QByteArray (invariant 14)
         object.__setattr__(self, "_dark_titled", False)
+        object.__setattr__(self, "_title_bar_ready", False)
         object.__setattr__(self, "_reading_mode", False)
         object.__setattr__(self, "_reading_view", None)
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
@@ -3443,6 +3513,12 @@ class MainWindow(QMainWindow):
         restore.toggled.connect(self._set_restore_session)
 
         menu.addSeparator()
+        light = menu.addAction("Светлая тема")
+        light.setCheckable(True)
+        light.setChecked(self._theme_name() == "light")
+        light.toggled.connect(self._set_light_theme)
+
+        menu.addSeparator()
         zoom_menu = menu.addMenu("Масштаб по умолчанию")
         group = QActionGroup(zoom_menu)  # parented: stays alive for the menu
         group.setExclusive(True)
@@ -3468,6 +3544,40 @@ class MainWindow(QMainWindow):
         view = self._current_view()
         if view is not None:
             view._set_zoom(int(level))
+
+    # -- theme (dark / light, applied app-wide) ----------------------------
+
+    def _theme_name(self) -> str:
+        return normalize(self._settings.value("theme", DEFAULT_THEME))
+
+    def _apply_title_bar(self) -> None:
+        """Match the DWM caption to the theme (dark caption for the dark theme)."""
+        dark = not is_light(self._theme_name())
+        set_dark_title_bar(self, dark)
+        object.__setattr__(self, "_dark_titled", dark)
+
+    def _set_light_theme(self, enabled: bool) -> None:
+        """Tab-context-menu toggle: light theme on, dark theme off."""
+        self._set_theme("light" if enabled else "dark")
+
+    def _set_theme(self, name: str) -> None:
+        """Persist and apply a theme to every open window and tab.
+
+        The application stylesheet lives on `QApplication`, so one call covers
+        the chrome of all windows; each document then re-renders with its own
+        stylesheet and table colours, keeping the reading position.
+        """
+        name = normalize(name)
+        self._settings.setValue("theme", name)
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(app_qss(name))
+        for window in _live_windows():
+            for index in range(window._tabs.count()):
+                view = window._tabs.widget(index)
+                if view is not None:
+                    view._apply_theme(name)
+            window._apply_title_bar()
 
     # -- window chrome -----------------------------------------------------
 
@@ -3530,9 +3640,9 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event):
         super().showEvent(event)
-        if not self._dark_titled:
-            self._dark_titled = True
-            enable_dark_title_bar(self)
+        if not self._title_bar_ready:
+            object.__setattr__(self, "_title_bar_ready", True)
+            self._apply_title_bar()
         view = self._current_view()
         if view is not None:
             QTimer.singleShot(0, view._relayout)

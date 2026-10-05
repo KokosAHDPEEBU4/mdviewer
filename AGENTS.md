@@ -27,7 +27,8 @@ viewer.py       DocumentView(QWidget) — содержимое одного фа
                 Viewer(MainWindow) для tools/
 renderer.py     mistune -> HTML: код, картинки, чекбоксы, сноски, якоря заголовков
                 и оглавление (render_with_outline)
-theme.py        палитра, CSS для Qt rich text, MEASURE/side_margin, QSS приложения
+theme.py        палитры (dark/light), CSS для Qt rich text, MEASURE/side_margin,
+                QSS приложения; content_css(theme)/app_qss(theme), retheme_tables
 syncsel.py      SourceMap: выравнивание источник <-> рендер для синхронизации выделения
 winassoc.py     регистрация .md в HKCU (ProgID, OpenWithProgids, RegisteredApplications)
 version.py      APP_NAME, APP_VERSION, PROG_ID, EXTENSIONS — общий источник истины
@@ -507,9 +508,37 @@ build.bat                                       # сборка dist\MDViewer
     скрытой панели, при `_in_relayout` и выключенном тумблере. Вход/выход из
     правки поднимают `_sync_suppressed` (`SYNC_SCROLL_SETTLE_MS` = 250, затем
     `_release_scroll_sync`), иначе расстановка каретки/`_relayout` сами дёргали
-    бы прокрутку и «прыгали» (инварианты 15/17). `_scroll_editor_to` кладёт
+    бы прокрутку и «прыгали» (инварианты 15/17).     `_scroll_editor_to` кладёт
     `blockBoundingGeometry(block).top()` прямо в скроллбар: у `QPlainTextEdit`
     он измеряется в пикселях, а геометрия блока — в координатах документа.
+
+32. **Тема — тёмная (по умолчанию) или светлая; тёмная остаётся неизменной.**
+    Имя хранится в `QSettings("theme")` (`"dark"`/`"light"`). `theme.py` держит
+    две палитры (`DARK`/`LIGHT`), `content_css(theme)`/`app_qss(theme)` строят
+    стили по ним, а модульные константы (`BG`, `TEXT`, `APP_QSS`, `content_css()`
+    без аргумента и т.д.) — это ровно тёмная палитра: их импортируют
+    viewer/renderer/main/render_check, и тёмная тема обязана остаться
+    пиксель-в-пиксель прежней (`tools/render_check.py` — зелёный, те же hex).
+    Любой токен, который упоминает `content_css`/`app_qss`, обязан быть в
+    **обеих** палитрах, иначе сборка стиля упадёт с `KeyError`.
+
+    Переключатель — checkable-пункт «Светлая тема» в ПКМ-меню вкладок
+    (`MainWindow._show_tab_menu` → `_set_light_theme` → `_set_theme`):
+    `_set_theme` пишет `QSettings`, ставит `QApplication.setStyleSheet(app_qss)`
+    (это общий стиль всех окон) и для каждой вкладки каждого живого окна зовёт
+    `DocumentView._apply_theme`, который переустанавливает
+    `document().setDefaultStyleSheet(content_css(theme))`, перерисовывает
+    документ (`_render(self._text)`) и возвращает символ с верхней кромки.
+    Заголовок DWM тоже переключается (`set_dark_title_bar`: тёмный для тёмной,
+    светлый для светлой темы), флаг — `MainWindow._dark_titled`. Таблицы
+    `renderer.py` запекает в HTML `bgcolor` из тёмной палитры, поэтому
+    `theme.retheme_tables` (вызывается в `DocumentView._render`) заменяет их
+    на цвета активной темы — сам `renderer.py` не трогается. Светлая палитра
+    задаёт фон страницы/текст/muted/границы/accent/код/selection/цвета
+    выделений панелей (инвариант 22)/зебру таблиц/чекбоксы/сноски и токены
+    хрома (`DISABLED_*`, `OVERLAY_BG`, `SEL_TEXT`). Правки — в
+    `tools/edit_check.py` (палитры, переключение, перерисовка, DWM) и
+    `tools/tabs_check.py` (переключение доходит до всех окон/вкладок).
 
 Максимум контента — до `MEASURE` px, оглавление фиксируется по `TOC_WIDTH`,
 отступы уровней — `TOC_STEP`; всё в `theme.py`.
