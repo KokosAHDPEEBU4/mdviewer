@@ -431,4 +431,28 @@ QListWidget#outline::item:selected {{
     background-color: {SURFACE_2};
     border-color: {ACCENT_DIM};
 }}
+
+/* Filter row above the outline. Typing here reveals the outline and hides the
+   headings that do not match. */
+QLineEdit#tocFilter {{
+    background-color: {SURFACE};
+    border: none;
+    border-bottom: 1px solid {BORDER};
+    border-radius: 0;
+    padding: 4px 8px;
+    color: {TEXT};
+    font-size: 12px;
+    selection-background-color: {SELECTION};
+}}
+QLineEdit#tocFilter:focus {{ border-bottom: 1px solid {ACCENT_DIM}; }}
+
+/* Breadcrumb strip above the preview: the heading path of the current section.
+   Ancestor segments are links (inline colour), the last one is the accent. */
+QLabel#breadcrumbs {{
+    background-color: {BG};
+    color: {TEXT_MUTED};
+    font-size: 11px;
+    padding: 4px 12px;
+    border-bottom: 1px solid {BORDER};
+}}
 """

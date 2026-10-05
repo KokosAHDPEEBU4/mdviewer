@@ -7,6 +7,7 @@ from the edited text, "Сохранить" writes the file and refreshes the pre
 """
 
 from pathlib import Path
+from html import escape
 import ctypes
 import re
 import sys
@@ -52,6 +53,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QTabBar,
     QTabWidget,
@@ -65,6 +67,8 @@ from PyQt6.QtWidgets import (
 from renderer import Heading, render_with_outline
 from syncsel import SourceMap
 from theme import (
+    ACCENT,
+    ACCENT_DIM,
     EDITOR_HARD,
     EDITOR_MIN,
     EDITOR_PREF,
@@ -268,6 +272,8 @@ class ScrollIndicator(QWidget):
 class DocumentView(QWidget):
     SCROLL_DEAD_ZONE = 12   # px the pointer must move before autoscroll kicks in
     WHEEL_STEP = 40.0       # accumulated wheel units that make one zoom level
+    CRUMB_LABEL_MAX = 40    # characters of a heading before the crumb is truncated
+    CRUMB_SEGMENT_MAX = 4   # most crumbs shown; deeper paths collapse to "…"
 
     # `state_changed` fires whenever the dirty state may have moved (the tab
     # label and the window title follow it); `link_requested` asks the host
@@ -359,6 +365,7 @@ class DocumentView(QWidget):
         self._browser.viewport().installEventFilter(self)
         self._browser.viewport().setMouseTracking(True)  # autoscroll follows the pointer
         self._browser.verticalScrollBar().valueChanged.connect(self._sync_outline)
+        self._browser.verticalScrollBar().valueChanged.connect(self._sync_crumbs)
         self._browser.selectionChanged.connect(self._highlight_editor_from_preview)
         self._preview_base_font = QFont(self._browser.document().defaultFont())
 
@@ -366,8 +373,30 @@ class DocumentView(QWidget):
         self._splitter.setChildrenCollapsible(False)
         # a wide handle is much easier to catch with the mouse than the ~5 px default
         self._splitter.setHandleWidth(SPLIT_HANDLE)
+        # The outline is built *first*: a filter event can reach `eventFilter`
+        # while the preview is being assembled, and `_pane_for` reads `_toc`.
         self._splitter.addWidget(self._build_outline())
-        self._splitter.addWidget(self._browser)
+
+        # Breadcrumbs live in a thin strip above the preview. The browser is
+        # wrapped (not replaced): every `self._browser` lookup keeps working, and
+        # the splitter still owns three children (outline / preview / editor).
+        self._preview_panel = QWidget()
+        preview_layout = QVBoxLayout(self._preview_panel)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(0)
+        self._crumbs = QLabel()
+        self._crumbs.setObjectName("breadcrumbs")
+        self._crumbs.setTextFormat(Qt.TextFormat.RichText)
+        self._crumbs.setOpenExternalLinks(False)
+        self._crumbs.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        # a long path must never widen the preview pane: the label is a strip
+        self._crumbs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self._crumbs.setWordWrap(False)
+        self._crumbs.linkActivated.connect(self._crumb_clicked)
+        self._crumbs.setVisible(False)
+        preview_layout.addWidget(self._crumbs)
+        preview_layout.addWidget(self._browser, 1)
+        self._splitter.addWidget(self._preview_panel)
         self._splitter.setStretchFactor(0, 0)
         self._splitter.setStretchFactor(1, 1)
         # the divider changes the preview width without resizing the window, so
@@ -437,6 +466,7 @@ class DocumentView(QWidget):
         self._populate_outline()
         self._set_margins()
         self._browser.verticalScrollBar().setValue(0)
+        self._sync_crumbs()
 
     def _render_busy(self, text: str) -> None:
         """Same, with a wait cursor: a big file takes ~0.5 s to render."""
@@ -541,6 +571,7 @@ class DocumentView(QWidget):
         anchor = item.data(Qt.ItemDataRole.UserRole)
         self._browser.scrollToAnchor(anchor)
         self._sync_outline()
+        self._sync_crumbs()
 
     def _remembered_section(self):
         """Outline row the user last jumped to, while it is still on screen.
@@ -610,6 +641,126 @@ class DocumentView(QWidget):
             self._toc.scrollToItem(self._toc.item(current), QListWidget.ScrollHint.EnsureVisible)
         finally:
             self._toc_syncing = False
+
+    # -- outline filter ----------------------------------------------------
+
+    def _apply_toc_filter(self, text: str = "") -> None:
+        """Hide outline rows that do not match the filter (case-insensitive).
+
+        Typing is a request to see the outline: if it was hidden it is shown
+        again so the matches are actually visible.
+        """
+        if self._toc is None or self._toc_filter is None:
+            return
+        needle = (text or "").strip().lower()
+        if needle and self._toc_panel is not None and not self._toc_panel.isVisible():
+            self._set_outline_visible(True)
+        for row in range(self._toc.count()):
+            item = self._toc.item(row)
+            if item is not None:
+                item.setHidden(bool(needle) and needle not in item.text().lower())
+
+    # -- breadcrumbs -------------------------------------------------------
+
+    def _crumb_path(self) -> list[int]:
+        """Outline rows from the top ancestor down to the current section.
+
+        Ancestors are the nearest earlier headings with a strictly smaller
+        level, so `## A` under `# T` under `### S` reads as one path.
+        """
+        if not self._outline:
+            return []
+        index = self._current_section_index()
+        if not 0 <= index < len(self._outline):
+            return []
+        path = [index]
+        level = self._outline[index].level
+        for row in range(index - 1, -1, -1):
+            if self._outline[row].level < level:
+                path.append(row)
+                level = self._outline[row].level
+                if level <= 1:
+                    break
+        path.reverse()
+        return path
+
+    @staticmethod
+    def _crumb_label(label: str) -> str:
+        """HTML-escaped heading text, truncated so one crumb cannot get huge."""
+        text = (label or "").strip()
+        if len(text) > DocumentView.CRUMB_LABEL_MAX:
+            text = text[: DocumentView.CRUMB_LABEL_MAX - 1].rstrip() + "…"
+        return escape(text)
+
+    def _crumb_clicked(self, href: str) -> None:
+        """Jump to the heading a crumb points at (its outline row index)."""
+        try:
+            row = int(href)
+        except (TypeError, ValueError):
+            return
+        if not 0 <= row < self._toc.count():
+            return
+        item = self._toc.item(row)
+        if item is not None:
+            self._outline_clicked(item)
+
+    def _sync_crumbs(self) -> None:
+        """Render the heading path of the current section above the preview.
+
+        Shown only when there is more than one segment: a bare top heading adds
+        no navigation value. Ancestors are links (row index as href), the last
+        segment is the accent-coloured current heading.
+        """
+        if self._crumbs is None:
+            return
+        path = self._crumb_path()
+        if len(path) < 2:
+            self._crumbs.setVisible(False)
+            return
+        if len(path) > self.CRUMB_SEGMENT_MAX:
+            path = path[-self.CRUMB_SEGMENT_MAX:]
+            trimmed = True
+        else:
+            trimmed = False
+        parts = []
+        if trimmed:
+            parts.append(f'<span style="color:{TEXT_MUTED}">…</span>')
+        last = len(path) - 1
+        for position, row in enumerate(path):
+            label = self._crumb_label(self._outline[row].label)
+            if position == last:
+                parts.append(f'<span style="color:{ACCENT}">{label}</span>')
+            else:
+                parts.append(
+                    f'<a href="{row}" style="color:{ACCENT_DIM}; text-decoration:none">{label}</a>'
+                )
+        separator = f'<span style="color:{TEXT_MUTED}"> › </span>'
+        self._crumbs.setText(separator.join(parts))
+        self._crumbs.setVisible(True)
+
+    # -- reading mode (driven by the host window's F11) --------------------
+
+    def _set_reading_mode(self, active: bool) -> None:
+        """Temporarily hide the outline and the hover chrome for fullscreen.
+
+        The user's `toc_visible` preference is saved and put back on exit; it is
+        never written to QSettings, because reading mode is ephemeral. In edit
+        mode the panes are left alone: the window may still go fullscreen.
+        """
+        self._reading_mode = bool(active)
+        if self._reading_mode:
+            if not self._editing():
+                self._reading_toc_saved = self._toc_user_visible
+                self._toc_user_visible = False
+                self._toc_auto_hidden = False
+            if self._overlay is not None:
+                self._overlay.setVisible(False)
+            self._relayout()
+        elif self._reading_toc_saved is not None:
+            self._toc_user_visible = self._reading_toc_saved
+            self._reading_toc_saved = None
+            self._relayout()
+        self._sync_crumbs()
 
     def _open_link(self, url: QUrl, new_tab: bool | None = None) -> None:
         """Route a link click: markdown files open in this window, everything
@@ -1886,6 +2037,7 @@ class DocumentView(QWidget):
         self._apply_preview_zoom()
         self._update_zoom_label()
         self._scroll_preview_to(anchor)
+        self._sync_crumbs()
 
     def _scroll_preview_to(self, position: int) -> None:
         """Scroll the preview so document `position` sits at the viewport top."""
