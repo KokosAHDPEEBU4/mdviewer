@@ -208,11 +208,21 @@ TOC_WIDTH = 240         # default / preferred outline width (px)
 TOC_MIN_WIDTH = 120     # outline shrinks to this, then auto-hides
 TOC_STEP = 14           # indent per heading level
 TOC_ROW = "#0f0f0f"     # current section highlight in the outline
-EDITOR_PREF = 520       # preferred editor width; the preview is residual by design
+EDITOR_PREF = 520       # fallback editor width (kept for tools/compat)
 EDITOR_MIN = 360        # editor yields to this before the preview drops below MIN_COLUMN
 EDITOR_HARD = 220       # hard floor for the editor
 SPLIT_HANDLE = 14       # splitter grab width (px): the panes' edges are easier to catch
 HYST = 40               # auto-hide hysteresis: no flicker at the show/hide threshold
+
+# Edit-mode split is stored as a *ratio* editor/(editor+preview), not a fixed
+# width, so 27" and 34" monitors look the same (B3). The window in edit mode is
+# capped at the width where the preview is exactly MEASURE (B2): `EDITOR_MAX`
+# stops the code pane from getting absurdly wide on an ultrawide.
+EDITOR_RATIO = 0.30     # default share of the preview+editor area for the editor
+EDITOR_MAX = 960        # editor never grows past this, even on a huge window
+# Smallest window the edit target is allowed to shrink to; below this the pane
+# shrink policy (layout_panes) would already be at its hard floors.
+MIN_WINDOW_WIDTH = TOC_MIN_WIDTH + PREVIEW_HARD + EDITOR_HARD + SPLIT_HANDLE * 2
 
 
 def side_margin(width: int) -> int:

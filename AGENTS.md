@@ -182,14 +182,22 @@ build.bat                                       # сборка dist\MDViewer
     иначе панель остаётся над старым положением превью, пока мышь не дёрнется.
     Статусбара в приложении нет, версия только в заголовке.
 
-17. **Вход в правку не перекраивает превью.** `_enter_edit` запоминает
-    `_preview_width = self._browser.width()` **до** `_build_editor()`: добавление
-    даже скрытой панели в `QSplitter` сразу отдаёт ей место и сжимает превью.
-    Окно растёт до `toc + preview + EDITOR_PREF` (+ ручки), но **не шире экрана,
-    на котором окно** (`self.screen()`, не `primaryScreen()` — на нескольких
-    мониторах primary мог быть другой), с запасом `* 0.96`. Раскладка — общая
-    политика сжатия (`_relayout`, инвариант 25): превью — остаточная панель,
-    редактор при нехватке уступает первым, поэтому превью остаётся на месте.
+17. **Вход в правку не перекраивает превью и не двигает окно.** `_enter_edit`
+    запоминает `_preview_width = max(self._browser.width(), MIN_COLUMN)` **до**
+    `_build_editor()`: добавление даже скрытой панели в `QSplitter` сразу отдаёт
+    ей место и сжимает превью. Окно растит `_resize_for_edit` **только правый
+    край** (`setGeometry(x, y, target, h)`, `x/y` не меняются):
+    `target = min(desired, cap, screen_right − x)`, где
+    `cap = toc + handles + MEASURE + editor_cap` (B2), `editor_cap =
+    editor_cap_width(_editor_ratio)` (B3), `screen_right` — правый край
+    `availableGeometry()` экрана `window.screen()` (таскбар учтён), с нижним
+    клампом `MIN_WINDOW_WIDTH`. При `isMaximized()`/`isFullScreen()` окно не
+    ресайзится. `_leave_edit` (`_restore_after_edit`) возвращает `_pre_edit_rect`
+    через `setGeometry`, а не `restoreGeometry`, и только если окно ресайзилось
+    при входе и сейчас не maximized/fullscreen (развернули во время правки —
+    состояние не трогается). `saveGeometry`/`restoreGeometry` — только персист
+    (`closeEvent` → `QSettings("geometry")`, старт). Раскладка — общая политика
+    сжатия (`_relayout`, инвариант 25): превью — остаточная панель.
     Курсор редактора ставится на раздел, видимый сейчас в превью
     (`_move_editor_to_preview`), а не в конец файла; сопоставление идёт по тексту
     заголовка, т.к. HTML и markdown не совпадают по смещениям. Каретка
@@ -325,8 +333,12 @@ build.bat                                       # сборка dist\MDViewer
     (иначе однажды растянутое оглавление застревало бы скрытым). Два флага:
     `_toc_user_visible` (намерение, в QSettings) и `_toc_auto_hidden` (факт) —
     скрытое пользователем не возвращается само. Ручной drag (`splitterMoved`, не
-    программный `setSizes`) обновляет `toc_width` и `_editor_pref`; preview
-    своего pref не имеет (см. `EDITOR_PREF` в `theme.py`). Жёсткие `setMinimumWidth`
+    программный `setSizes`) обновляет `toc_width` и `QSettings("editor_ratio")`
+    (доля `editor/(editor+preview)`, B3); preview своего pref не имеет. Ширину
+    редактора из доли считает чистая `editor_width(avail − toc, ratio)` (клампы
+    `EDITOR_MIN`/`EDITOR_MAX`), её вызывает `_relayout`; `layout_panes` остаётся
+    политикой уступок **по ширине**. `editor_cap_width(ratio)` — ширина редактора,
+    дающая ровно `ratio` при превью `MEASURE` (для потолка B2). Жёсткие `setMinimumWidth`
     (`PREVIEW_HARD`, `EDITOR_HARD`, `TOC_MIN_WIDTH`) — только safety net (и
     минимальный размер окна); панель редактора содержит строку кнопок ~450 px,
     поэтому у `_panel` **обязателен** `setMinimumWidth(EDITOR_HARD)`, иначе её

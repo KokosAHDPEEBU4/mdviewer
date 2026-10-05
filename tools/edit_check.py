@@ -23,6 +23,9 @@ import viewer as viewer_mod
 from main import create_app
 from theme import (
     EDITOR_HARD,
+    EDITOR_MAX,
+    EDITOR_MIN,
+    EDITOR_RATIO,
     EDITOR_SELECTION,
     MEASURE,
     MIN_COLUMN,
@@ -31,7 +34,7 @@ from theme import (
     SPLIT_HANDLE,
     side_margin,
 )
-from viewer import layout_panes, toc_visible_for
+from viewer import editor_cap_width, editor_width, layout_panes, toc_visible_for
 from version import APP_NAME, APP_VERSION
 
 SOURCE = "# Title\r\n\r\nHello.\r\n"
@@ -297,7 +300,8 @@ def main() -> int:
         check("outline, preview and editor are three panes", len(sizes), 3 if win._toc.isVisible() else 2)
         check("splitter handle is wide enough to grab", win._splitter.handleWidth(), SPLIT_HANDLE)
         check("preview gets the middle", sizes[-2] > 400, True)
-        check("editor gets the right part", sizes[-1] > 400, True)
+        check("editor width follows the ratio (B3)",
+              abs(sizes[-1] - editor_width(sizes[-2] + sizes[-1], EDITOR_RATIO)) <= 2, True)
         # setViewportMargins shrinks the viewport itself, so its width *is* the column
         column = win._browser.viewport().width()
         check("preview column keeps a usable width", column > 500, True)
@@ -1470,6 +1474,107 @@ def main() -> int:
             app.processEvents()
         finally:
             os.environ.pop("MDVIEWER_STATE_DIR", None)
+
+    # --- window geometry: left edge pinned (A) and ratio-based split (B)
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "geo.md"
+        path.write_text("# T\n\n" + "text line\n" * 300, encoding="utf-8")
+        settings = QSettings(tempfile.mkdtemp(), "geo_check")
+
+        # B: pure ratio/cap helpers
+        for r in (0.22, 0.30, 0.40):
+            cap_editor = editor_cap_width(r)
+            check(f"cap editor pairs MEASURE with ratio {r}",
+                  abs(editor_width(MEASURE + cap_editor, r) - cap_editor) <= 2, True)
+        check("editor width clamps at EDITOR_MAX", editor_width(100000, 0.9), EDITOR_MAX)
+        check("editor width clamps at EDITOR_MIN", editor_width(10, 0.3), EDITOR_MIN)
+
+        win = viewer_mod.Viewer(path, settings)
+        win.resize(900, 600)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+        win.setGeometry(320, 160, 900, 600)
+        for _ in range(3):
+            app.processEvents()
+        x0, y0, w0 = win.geometry().x(), win.geometry().y(), win.geometry().width()
+        stable = True
+        for _ in range(10):
+            win._confirm_discard = lambda: True
+            win._enter_edit()
+            for _ in range(3):
+                app.processEvents()
+            win._confirm_discard = lambda: True
+            win._leave_edit()
+            for _ in range(3):
+                app.processEvents()
+            g = win.geometry()
+            if (g.x(), g.y()) != (x0, y0) or g.width() != w0:
+                stable = False
+                break
+        check("10 edit cycles keep x/y/width (A)", stable, True)
+
+        # maximized: entering edit must not resize, leaving must not unmaximize
+        win.showMaximized()
+        for _ in range(3):
+            app.processEvents()
+        win._confirm_discard = lambda: True
+        win._enter_edit()
+        for _ in range(3):
+            app.processEvents()
+        check("edit keeps the window maximized (A)", win.isMaximized(), True)
+        win._confirm_discard = lambda: True
+        win._leave_edit()
+        for _ in range(3):
+            app.processEvents()
+        check("leave keeps the window maximized (A)", win.isMaximized(), True)
+
+        # maximize *during* edit -> leaving must not unmaximize
+        win.showNormal()
+        win.setGeometry(200, 120, 900, 600)
+        for _ in range(3):
+            app.processEvents()
+        win._confirm_discard = lambda: True
+        win._enter_edit()
+        for _ in range(3):
+            app.processEvents()
+        win.showMaximized()
+        for _ in range(3):
+            app.processEvents()
+        win._confirm_discard = lambda: True
+        win._leave_edit()
+        for _ in range(3):
+            app.processEvents()
+        check("maximizing during edit survives the leave (A)", win.isMaximized(), True)
+
+        # B3: a manual splitter drag is stored as a ratio and reused next time
+        win.showNormal()
+        win.setGeometry(200, 120, 1600, 700)
+        for _ in range(3):
+            app.processEvents()
+        win._confirm_discard = lambda: True
+        win._enter_edit()
+        for _ in range(3):
+            app.processEvents()
+        win._splitter.setSizes([0, 1000, 500])
+        for _ in range(3):
+            app.processEvents()
+        sizes = win._splitter.sizes()
+        expected = sizes[-1] / max(1, sizes[-2] + sizes[-1])
+        win._on_splitter_moved()
+        stored = settings.value("editor_ratio", 0.0, type=float)
+        check("a manual drag stores the editor ratio", abs(stored - expected) < 0.02, True)
+        win._confirm_discard = lambda: True
+        win._leave_edit()
+        for _ in range(3):
+            app.processEvents()
+        win2 = viewer_mod.Viewer(path, settings)
+        check("the ratio is reused on the next view",
+              abs(win2._editor_ratio - stored) < 0.001, True)
+        win2.close()
+        win.close()
+        for _ in range(3):
+            app.processEvents()
 
     print("all checks passed" if not failures else f"{len(failures)} failure(s)")
     return 1 if failures else 0

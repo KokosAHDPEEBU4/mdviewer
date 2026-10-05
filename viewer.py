@@ -82,12 +82,16 @@ from theme import (
     CODE_BG,
     DEFAULT_THEME,
     EDITOR_HARD,
+    EDITOR_MAX,
     EDITOR_MIN,
     EDITOR_PREF,
+    EDITOR_RATIO,
     EDITOR_SELECTION,
     HYST,
     HL_OVERLAY_ALPHA,
+    MEASURE,
     MIN_COLUMN,
+    MIN_WINDOW_WIDTH,
     PREVIEW_HARD,
     PREVIEW_SELECTION,
     SCREEN_FALLBACK,
@@ -248,6 +252,26 @@ def layout_panes(avail: int, edit: bool, toc_visible: bool, toc_pref: int, edito
         preview = PREVIEW_HARD
         editor = max(0, avail - toc - preview)
     return toc, editor, preview
+
+
+def editor_width(content: int, ratio: float) -> int:
+    """Editor width from the editor/(editor+preview) ratio, clamped (B3).
+
+    `content` is the area shared by the preview and the editor (toc and handles
+    already removed). Pure, so the ratio policy is testable on its own.
+    """
+    ratio = min(max(float(ratio), 0.05), 0.95)
+    return max(EDITOR_MIN, min(EDITOR_MAX, round(ratio * max(0, int(content)))))
+
+
+def editor_cap_width(ratio: float) -> int:
+    """Editor width that pairs a MEASURE-wide preview with `ratio` (B2).
+
+    Solving `e = ratio * (MEASURE + e)` gives `e = ratio/(1-ratio) * MEASURE`,
+    so at the cap the editor/preview proportion is exactly `ratio`.
+    """
+    ratio = min(max(float(ratio), 0.05), 0.95)
+    return max(EDITOR_MIN, min(EDITOR_MAX, round(ratio / (1.0 - ratio) * MEASURE)))
 
 
 def toc_visible_for(main_avail: int, auto_hidden: bool, user_visible: bool, edit: bool) -> bool:
@@ -536,7 +560,7 @@ class DocumentView(QWidget):
         self._save_btn: QPushButton | None = None
         self._view_geometry = None
         self._dark_titled = False
-        self._preview_width = 0      # preview width to preserve when editing
+        self._preview_width = 0      # preview width measured just before edit
         self._outline: list[Heading] = []
         self._history: list[Path] = []   # files visited before the current one
         self._selected_section = None    # outline row the user last clicked
@@ -545,7 +569,15 @@ class DocumentView(QWidget):
         # window, so widening can bring it back without overriding the user
         self._toc_user_visible = True
         self._toc_auto_hidden = False
-        self._editor_pref = EDITOR_PREF
+        # the edit split is a ratio, not a fixed width, so 27" and 34" look the
+        # same (B3); persisted so a manual drag survives a restart
+        try:
+            stored_ratio = float(self._settings.value("editor_ratio", EDITOR_RATIO))
+        except (TypeError, ValueError):
+            stored_ratio = EDITOR_RATIO
+        self._editor_ratio = min(max(stored_ratio, 0.05), 0.95)
+        self._pre_edit_rect = None   # window geometry before entering edit (live)
+        self._edit_resized = False   # did `_enter_edit` actually resize the window
         self._in_relayout = False
         # reading mode (F11 host): outline hidden temporarily, overlay suppressed
         self._reading_mode = False
@@ -972,9 +1004,9 @@ class DocumentView(QWidget):
         """A user drag: remember the pane widths as the new preferences.
 
         `setSizes` does not emit `splitterMoved`, so anything seen here came from
-        the mouse; the `_in_relayout` guard is belt-and-braces. The preview is the
-        residual pane and has no preference of its own — dragging the editor
-        boundary only moves `_editor_pref`.
+        the mouse; the `_in_relayout` guard is belt-and-braces. Dragging the
+        editor boundary rewrites the saved `editor_ratio` (B3), so the same
+        proportion is reused on any window width.
         """
         self._set_margins()
         if self._in_relayout:
@@ -985,7 +1017,16 @@ class DocumentView(QWidget):
         if self._toc_panel.isVisible():
             self._settings.setValue("toc_width", max(TOC_MIN_WIDTH, sizes[0]))
         if self._editing() and self._panel is not None and self._panel.isVisible():
-            self._editor_pref = max(EDITOR_HARD, sizes[-1])
+            # sizes index every child (hidden included): [toc, preview, editor].
+            # Remember the share as a ratio, not px, so it carries between
+            # monitors of different widths (B3).
+            editor = sizes[-1]
+            preview = sizes[-2] if len(sizes) >= 2 else 0
+            span = editor + preview
+            if span > 0:
+                ratio = min(max(editor / span, 0.05), 0.95)
+                self._editor_ratio = ratio
+                self._settings.setValue("editor_ratio", ratio)
 
     # -- table of contents -------------------------------------------------
 
@@ -1540,24 +1581,7 @@ class DocumentView(QWidget):
         self._map_dirty = False  # editor content matches the last render
         self._panel.setVisible(True)
 
-        # Grow the window enough for the outline, the current preview and the
-        # preferred editor width (+ handles), capped by the screen the window is
-        # already on (not the primary one: on a multi-monitor desk that would size
-        # for the wrong monitor and let the window spill off its own screen). If
-        # the cap bites, `_relayout` shrinks the editor first, preview staying put.
-        window = self.window()
-        screen = window.screen() or QGuiApplication.primaryScreen()
-        available = screen.availableGeometry().width() if screen else SCREEN_FALLBACK
-        toc_w = self._toc_pref() if self._toc_panel.isVisible() else 0
-        panes = 2 + (1 if toc_w else 0)
-        target = min(
-            self._preview_width + self._editor_pref + toc_w + SPLIT_HANDLE * (panes - 1),
-            int(available * 0.96),
-        )
-        if window.width() < target:
-            # QByteArray, not QRect: this is what restoreGeometry expects
-            window._view_geometry = window.saveGeometry()
-            window.resize(target, window.height())
+        self._resize_for_edit()
         self._relayout()
         QTimer.singleShot(0, self._relayout)  # once the layout knows the child
 
@@ -2025,6 +2049,68 @@ class DocumentView(QWidget):
         """Whitespace is collapsed on the HTML side, so collapse both sides."""
         return re.sub(r"\s+", " ", text.replace("\u2029", " ")).strip()
 
+    def _resize_for_edit(self) -> None:
+        """Grow the window for the editor without moving the left edge (A).
+
+        `x/y` are never changed: only the right edge moves. Growth is capped so
+        the preview does not exceed `MEASURE` (B2) and so the window never leaves
+        the screen it is on (`availableGeometry`, taskbar aware). A maximized or
+        fullscreen window is left untouched — the editor just fits the current
+        width. The pre-edit geometry is remembered for `_leave_edit` (live) and
+        for `closeEvent` (persistence, invariant 14).
+        """
+        window = self.window()
+        if window is None:
+            return
+        # always remember where we were: persistence needs it even if no resize
+        window._view_geometry = window.saveGeometry()
+        self._pre_edit_rect = QRect(window.geometry())
+        self._edit_resized = False
+        if window.isMaximized() or window.isFullScreen():
+            return
+        x, y, w, h = window.geometry().getRect()
+        screen = window.screen() or QGuiApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            screen_right = avail.x() + avail.width()  # exclusive right edge
+        else:
+            screen_right = x + SCREEN_FALLBACK
+        toc_w = self._toc_pref() if self._toc_panel.isVisible() else 0
+        handles = SPLIT_HANDLE * (2 if toc_w else 1)  # preview + editor (+ toc)
+        editor_cap = editor_cap_width(self._editor_ratio)
+        # B2: widest edit window whose preview is still exactly MEASURE
+        cap = toc_w + handles + MEASURE + editor_cap
+        # B3: keep the current preview width, add the editor at the ratio
+        preview_now = max(self._preview_width, MIN_COLUMN)
+        desired = toc_w + handles + preview_now + editor_cap
+        target = min(desired, cap, screen_right - x)
+        if w > cap:
+            target = w  # already wider than the cap: only growth is capped
+        target = max(target, MIN_WINDOW_WIDTH)
+        if target != w:
+            window.setGeometry(x, y, target, h)  # same x/y -> left edge pinned
+            self._edit_resized = True
+
+    def _restore_after_edit(self) -> None:
+        """Put the window back exactly as before editing, never moving x/y (A).
+
+        Uses the remembered `QRect` (same x/y/w/h), not `restoreGeometry`, so the
+        left edge cannot move. If the window was not resized on entry, or is
+        maximized/fullscreen now (it was at entry, or the user maximized during
+        edit), the window state is left untouched — a deterministic rule.
+        """
+        window = self.window()
+        rect = self._pre_edit_rect
+        resized = self._edit_resized
+        self._pre_edit_rect = None
+        self._edit_resized = False
+        if window is None or not resized:
+            return
+        if window.isMaximized() or window.isFullScreen():
+            return
+        if rect is not None and rect.isValid() and window.geometry() != rect:
+            window.setGeometry(rect)
+
     def _leave_edit(self) -> None:
         if not self._confirm_discard():
             return
@@ -2043,9 +2129,9 @@ class DocumentView(QWidget):
             self._render(self._text)
             self._baseline = _normalized(self._text)
         window = self.window()
-        if getattr(window, "_view_geometry", None) is not None:
-            window.restoreGeometry(window._view_geometry)
-            window._view_geometry = None
+        self._restore_after_edit()
+        if window is not None:
+            window._view_geometry = None  # live cycle done; closeEvent persists
         self._edit_btn.setText("Редактировать")
         self._browser.setFocus()
         self._update_hits(self._find_edit.text())  # search back to the preview
@@ -2079,8 +2165,10 @@ class DocumentView(QWidget):
             self._toc_panel.setVisible(toc_visible)
             panes = main_panes + (1 if toc_visible else 0)
             avail = max(0, content - SPLIT_HANDLE * (panes - 1))
+            toc_w = max(TOC_MIN_WIDTH, self._toc_pref()) if toc_visible else 0
+            editor_w = editor_width(avail - toc_w, self._editor_ratio) if edit else 0
             toc, editor, preview = layout_panes(
-                avail, edit, toc_visible, self._toc_pref(), self._editor_pref
+                avail, edit, toc_visible, self._toc_pref(), editor_w
             )
             # `setSizes` indexes *children*, hidden ones included, so always pass
             # a full list (0 for a hidden pane) or the widths land on the wrong
