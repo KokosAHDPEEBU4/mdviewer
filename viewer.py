@@ -137,6 +137,25 @@ def _normalized(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
+def _standalone_html(title: str, body: str, theme: str) -> str:
+    """Wrap rendered `body` into a self-contained HTML page for `theme`.
+
+    The theme's `content_css` is embedded, the encoding is declared and the
+    title is the document's file name. Local images stay `file://` URLs (they
+    are already absolute), so the page makes no network requests.
+    """
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="ru">\n<head>\n'
+        '<meta charset="utf-8">\n'
+        f"<title>{escape(title)}</title>\n"
+        f"<style>\n{content_css(theme)}\n</style>\n"
+        "</head>\n<body>\n"
+        f"{body}\n"
+        "</body>\n</html>\n"
+    )
+
+
 # A file save is rarely one event (editors write a temp file and rename it), so
 # the external-change reload waits this long to coalesce the burst before it
 # reads the file once. Short enough to feel instant, long enough to be one read.
@@ -668,6 +687,52 @@ class DocumentView(QWidget):
             self._render(text)
         finally:
             QApplication.restoreOverrideCursor()
+
+    # -- export ------------------------------------------------------------
+
+    def export_html(self, dest: Path) -> bool:
+        """Write the current document as a standalone HTML file.
+
+        `self._map_source` is the markdown the preview currently shows (it is
+        refreshed only on load/convert/save, invariant 12), so the export
+        matches the preview even when the editor holds an un-converted draft.
+        Local images stay `file://` URLs; the theme's CSS is embedded. Nothing
+        is read from the network.
+        """
+        source = self._map_source if self._map_source is not None else self._text
+        body, _ = render_with_outline(source, self._path.parent)
+        body = retheme_tables(body, self._theme)
+        page = _standalone_html(self._path.name, body, self._theme)
+        try:
+            Path(dest).write_text(page, encoding="utf-8")
+        except OSError as exc:
+            self._export_error(exc)
+            return False
+        return True
+
+    def _export_error(self, exc) -> None:
+        QMessageBox.warning(self, "Экспорт", f"Не удалось сохранить файл:\n{exc}")
+
+    def export_via_dialog(self) -> bool:
+        """Ask for a destination, then export the document as HTML.
+
+        Returns True once a file is written. Cancelling the dialog writes
+        nothing and returns False; a write error is reported and also returns
+        False. The default name is `<имя файла>.html`.
+        """
+        default = self._path.with_suffix(".html")
+        name, _ = QFileDialog.getSaveFileName(
+            self, "Экспорт в HTML", str(default), "HTML (*.html)"
+        )
+        if not name:
+            return False
+        dest = Path(name)
+        if dest.suffix.lower() != ".html":
+            try:
+                dest = dest.with_suffix(".html")
+            except ValueError:
+                pass
+        return self.export_html(dest)
 
     # -- theme -------------------------------------------------------------
 
@@ -3473,23 +3538,25 @@ class MainWindow(QMainWindow):
     def _clear_recent(self) -> None:
         self._settings.setValue(RECENT_KEY, [])
 
-    def _show_tab_menu(self, pos: QPoint) -> None:
-        """Right-click on the tab strip: file actions, recents, session, zoom.
+    def _build_tab_menu(self, view: DocumentView | None) -> QMenu:
+        """Build the tab context menu for `view` (kept separate so it is testable).
 
-        The file actions (`Открыть содержащую папку`, `Копировать путь`) target
-        the tab under the pointer, falling back to the active tab. Paths are
-        always local (`DocumentView` only ever holds local files), so nothing
-        here reaches the network.
+        `_show_tab_menu` execs the result at the pointer. The file and export
+        actions target `view`; paths are always local (`DocumentView` only ever
+        holds local files), so nothing here reaches the network.
         """
         menu = QMenu(self)
-        bar = self._tabs.tabBar()
-        view = self._tab_view_at(pos)
         if view is not None:
             path = view._path
             folder = menu.addAction("Открыть содержащую папку")
             folder.triggered.connect(lambda _checked=False, p=path: self._open_folder(p))
             copy = menu.addAction("Копировать путь")
             copy.triggered.connect(lambda _checked=False, p=path: self._copy_path(p))
+            export_menu = menu.addMenu("Экспорт")
+            html = export_menu.addAction("HTML…")
+            html.triggered.connect(
+                lambda _checked=False, v=view: v.export_via_dialog()
+            )
             menu.addSeparator()
 
         recent_menu = menu.addMenu("Недавние")
@@ -3530,7 +3597,12 @@ class MainWindow(QMainWindow):
             action.triggered.connect(
                 lambda _checked=False, value=level: self._set_default_zoom(value)
             )
-        menu.exec(bar.mapToGlobal(pos))
+        return menu
+
+    def _show_tab_menu(self, pos: QPoint) -> None:
+        """Right-click on the tab strip: file/export actions, recents, session, zoom."""
+        menu = self._build_tab_menu(self._tab_view_at(pos))
+        menu.exec(self._tabs.tabBar().mapToGlobal(pos))
 
     def _set_restore_session(self, enabled: bool) -> None:
         """Persist the flag; turning it on snapshots the current session at once."""

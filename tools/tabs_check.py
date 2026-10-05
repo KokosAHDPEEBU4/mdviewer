@@ -564,6 +564,21 @@ def main() -> int:
         close_window(win)
         pump(app)
 
+        # --- 19. tab context menu offers the export submenu
+        win = MainWindow(settings_for("tabs_exportmenu"))
+        win._open_paths([a])
+        win.show()
+        pump(app)
+        menu = win._build_tab_menu(win._tabs.widget(0))
+        labels = [action.text() for action in menu.actions()]
+        check("the tab menu has an 'Экспорт' submenu", "Экспорт" in labels, True)
+        submenu = next(action.menu() for action in menu.actions()
+                       if action.text() == "Экспорт")
+        check("the export submenu offers HTML",
+              [action.text() for action in submenu.actions()], ["HTML…"])
+        close_window(win)
+        pump(app)
+
     print("all checks passed" if not failures else f"{len(failures)} failure(s)")
     return 1 if failures else 0
 
