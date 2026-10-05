@@ -1970,7 +1970,13 @@ class DocumentView(QWidget):
             and self._toc_filter.text()
         ):
             self._toc_filter.clear()
-        elif self._find_edit is not None and self._find_edit.hasFocus():
+        elif self._find_edit is not None and (
+            self._find_edit.hasFocus()
+            or (
+                getattr(self, "_replace_edit", None) is not None
+                and self._replace_edit.hasFocus()
+            )
+        ):
             self._close_find()
         elif self._editing():
             self._leave_edit()
@@ -1978,9 +1984,18 @@ class DocumentView(QWidget):
     # -- overlay (hover chrome) -------------------------------------------
 
     def _build_find_bar(self) -> None:
-        """The find row lives inside the overlay, not a status bar."""
+        """The find row lives inside the overlay, not a status bar.
+
+        The replace row (Ctrl+H) is built here as well but kept hidden until
+        the user asks for it, so the plain Ctrl+F bar is exactly as before.
+        """
         bar = QWidget()
-        layout = QHBoxLayout(bar)
+        bar.setObjectName("findBar")
+        outer = QVBoxLayout(bar)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+
+        layout = QHBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
@@ -2007,11 +2022,123 @@ class DocumentView(QWidget):
 
         for widget in (prev_btn, self._find_edit, next_btn, self._find_status, close_btn):
             layout.addWidget(widget)
+        outer.addLayout(layout)
+
+        # replace row: hidden until Ctrl+H (edit mode only)
+        self._replace_row = QWidget()
+        self._replace_row.setObjectName("replaceRow")
+        replace = QHBoxLayout(self._replace_row)
+        replace.setContentsMargins(0, 0, 0, 0)
+        replace.setSpacing(6)
+
+        self._replace_edit = QLineEdit()
+        self._replace_edit.setPlaceholderText("Заменить на")
+        self._replace_edit.setFixedWidth(220)
+        self._replace_edit.returnPressed.connect(self._replace_next)
+
+        self._replace_btn = QPushButton("Заменить")
+        self._replace_btn.clicked.connect(self._replace_next)
+
+        self._replace_all_btn = QPushButton("Заменить все")
+        self._replace_all_btn.clicked.connect(self._replace_all)
+
+        for widget in (self._replace_edit, self._replace_btn, self._replace_all_btn):
+            replace.addWidget(widget)
+        replace.addStretch(1)
+        outer.addWidget(self._replace_row)
+
+        self._replace_mode = False
+        self._replace_row.setVisible(False)
 
         self._find_bar = bar
         # the field stays in the overlay for good: showing/hiding it made the
         # overlay change width long after the search was over
         bar.setVisible(True)
+
+    def _set_replace_mode(self, active: bool) -> None:
+        """Show or hide the "Заменить на" row (Ctrl+H)."""
+        self._replace_mode = bool(active)
+        row = getattr(self, "_replace_row", None)
+        if row is not None:
+            row.setVisible(self._replace_mode)
+
+    def _open_replace(self) -> None:
+        """Ctrl+H: make sure there is an editor, then reveal the replace row."""
+        self._ensure_overlay()
+        if not self._editing():
+            self._enter_edit()
+        self._set_replace_mode(True)
+        self._show_overlay()
+        self._place_overlay()
+        self._find_edit.setFocus()
+        self._find_edit.selectAll()
+        self._update_hits(self._find_edit.text())
+
+    def _toggle_replace(self) -> None:
+        """Ctrl+H: open the replace bar, or refocus it when already open."""
+        if getattr(self, "_replace_mode", False):
+            self._replace_edit.setFocus()
+            self._replace_edit.selectAll()
+            return
+        self._open_replace()
+
+    def _replace_next(self) -> None:
+        """Replace the current match and select the next one (editor only)."""
+        if self._editor is None or not self._editing():
+            return
+        pattern = self._search_pattern(self._find_edit.text())
+        if pattern is None:  # empty query: nothing to do
+            return
+        document = self._editor.document()
+        cursor = self._editor.textCursor()
+        if cursor.hasSelection():
+            # only replace when the selection really is the current match
+            match = document.find(pattern, cursor.selectionStart())
+            if (
+                not match.isNull()
+                and match.selectionStart() == cursor.selectionStart()
+                and match.selectionEnd() == cursor.selectionEnd()
+            ):
+                cursor.beginEditBlock()
+                cursor.insertText(self._replace_edit.text())
+                cursor.endEditBlock()
+        self._find_next()
+        self._update_hits(self._find_edit.text())
+
+    def _replace_all(self) -> int:
+        """Replace every match in the editor; returns how many were replaced."""
+        if self._editor is None or not self._editing():
+            return 0
+        pattern = self._search_pattern(self._find_edit.text())
+        if pattern is None:  # empty query is a no-op
+            return 0
+        document = self._editor.document()
+        replacement = self._replace_edit.text()
+        # collect first, edit second: replacing while searching would shift the
+        # positions we are still walking over
+        spans = []
+        cursor = QTextCursor(document)
+        cursor.movePosition(QTextCursor.MoveOperation.Start)
+        while True:
+            found = document.find(pattern, cursor)
+            if found.isNull():
+                break
+            spans.append((found.selectionStart(), found.selectionEnd()))
+            cursor.setPosition(found.selectionEnd())
+        if not spans:
+            self._find_status.setText("0")
+            return 0
+        cursor.beginEditBlock()
+        try:
+            for start, end in reversed(spans):  # back to front keeps offsets valid
+                edit = QTextCursor(document)
+                edit.setPosition(start)
+                edit.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+                edit.insertText(replacement)
+        finally:
+            cursor.endEditBlock()
+        self._find_status.setText(f"Заменено: {len(spans)}")
+        return len(spans)
 
     def _ensure_overlay(self) -> None:
         """Build the hover chrome on first need (it is not free: the first
@@ -2236,6 +2363,7 @@ class DocumentView(QWidget):
             bar.setValue(bar.value() + step)
 
     def _toggle_find(self) -> None:
+        self._set_replace_mode(False)  # Ctrl+F is the plain search
         self._show_overlay()
         self._find_edit.setFocus()
         self._find_edit.selectAll()
@@ -2245,7 +2373,8 @@ class DocumentView(QWidget):
         """Clear the query; the field itself stays in the overlay."""
         self._find_edit.clear()
         self._find_status.setText("")
-        self._browser.setFocus()
+        self._set_replace_mode(False)
+        self._search_target().setFocus()
 
     def _search_pattern(self, text: str) -> QRegularExpression | None:
         """Whitespace-insensitive query.
@@ -2330,6 +2459,7 @@ class DocumentView(QWidget):
         actions = {
             "Esc": self._handle_esc,
             "Ctrl+F": self._toggle_find,
+            "Ctrl+H": self._toggle_replace,
             "F3": self._find_next,
             "Shift+F3": lambda: self._find_next(backward=True),
             "F5": self.load,

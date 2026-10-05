@@ -15,9 +15,10 @@ instance.py     single-instance: именованный мьютекс Win32 + �
                 запросов (QtNetwork вырезан из сборки, QLocalServer недоступен)
 viewer.py       DocumentView(QWidget) — содержимое одного файла: превью
                 (контейнер «крошки + QTextBrowser») + оглавление с фильтром +
-                QPlainTextEdit, оверлей, поиск, подсветка, zoom, история,
-                QSettings, dirty-state, режим чтения, QFileSystemWatcher
-                (автоперезагрузка при изменении файла на диске);
+                QPlainTextEdit, оверлей, поиск (Ctrl+F) и замена (Ctrl+H),
+                подсветка, zoom, история, QSettings, dirty-state, режим чтения,
+                QFileSystemWatcher (автоперезагрузка при изменении файла
+                на диске);
                 MainWindow(QMainWindow) — оболочка: QTabWidget, заголовок,
                 геометрия, режим чтения (F11), closeEvent по всем вкладкам,
                 реестр _WINDOWS;
@@ -475,6 +476,21 @@ build.bat                                       # сборка dist\MDViewer
     не трогает содержимое и просто снимает наблюдение. Перезагрузка — тот же
     документ и та же вкладка, а не новая (не ломает single-instance/сессию).
     Любая перерисовка здесь — по событию ФС, а не на `valueChanged` (инвариант 12).
+
+30. **Поиск с заменой живёт в редакторе (`Ctrl+H`).** Per-document хоткей
+    `Ctrl+H` (`WidgetWithChildrenShortcut`, рядом с `Ctrl+F`) зовёт
+    `_toggle_replace`/`_open_replace`: если редактора нет, сначала
+    `_enter_edit()`, затем показывается строка «Заменить на» — часть той же
+    ленивой панели `_find_bar` (второй ряд, `_replace_row`, по умолчанию
+    скрыт). `Ctrl+F` её прячет (`_set_replace_mode(False)`), `Esc` в поле
+    замены закрывает панель (`_handle_esc`). Замена работает только по
+    `self._editor` (`QTextDocument.find`): `_replace_next` меняет совпадение,
+    только если выделение и есть текущий матч, и уводит поиск к следующему;
+    `_replace_all` сначала собирает диапазоны, потом меняет их **с конца**, и
+    возвращает число замен (уведомление — в `_find_status`, без модальных
+    окон). Пустой паттерн (`_search_pattern` → `None`) — no-op. Правки идут
+    через `textChanged`, поэтому dirty и карта помечаются существующим путём
+    (`_update_state`/`_map_dirty`), а превью не перерисовывается (инвариант 12).
 
 Максимум контента — до `MEASURE` px, оглавление фиксируется по `TOC_WIDTH`,
 отступы уровней — `TOC_STEP`; всё в `theme.py`.

@@ -982,6 +982,69 @@ def main() -> int:
         win.close()
         app.processEvents()
 
+    # --- search & replace in the editor (Ctrl+H)
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "replace.md"
+        path.write_text("# Doc\n\nalpha one\nalpha two\nalpha three\n", encoding="utf-8")
+        win = viewer_mod.Viewer(path, QSettings(tempfile.mkdtemp(), "replace_check"))
+        win.resize(900, 600)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+
+        check("replace row starts hidden", win._replace_row.isVisible(), False)
+        win._toggle_replace()
+        for _ in range(3):
+            app.processEvents()
+        check("Ctrl+H enters edit mode", win._editing(), True)
+        check("Ctrl+H reveals the replace row", win._replace_row.isVisible(), True)
+        check("Ctrl+H sets replace mode", win._replace_mode, True)
+
+        # an empty pattern must be a no-op (both buttons)
+        win._find_edit.clear()
+        win._replace_edit.setText("omega")
+        check("empty pattern replaces nothing", win._replace_all(), 0)
+        win._replace_next()  # must not raise and must not edit
+        check("empty pattern leaves the text alone",
+              win._editor.toPlainText().count("omega"), 0)
+
+        # replace one: exactly one occurrence changes, search moves on
+        win._find_edit.setText("alpha")
+        app.processEvents()
+        win._find_first()
+        win._replace_edit.setText("beta")
+        win._replace_next()
+        check("replace changes exactly one occurrence",
+              win._editor.toPlainText().count("beta"), 1)
+        check("replace leaves the other matches",
+              win._editor.toPlainText().count("alpha"), 2)
+        check("replace selects the next match",
+              win._editor.textCursor().selectedText(), "alpha")
+        check("replace marks the editor dirty", win._is_unsaved(), True)
+        check("replace does not rerender the preview",
+              "beta" in win._browser.toPlainText(), False)
+
+        # replace all: changes N and reports it
+        count = win._replace_all()
+        check("replace-all changes every remaining match", count, 2)
+        check("replace-all leaves no match behind",
+              win._editor.toPlainText().count("alpha"), 0)
+        check("replace-all produces the right number",
+              win._editor.toPlainText().count("beta"), 3)
+        check("replace-all keeps the editor dirty", win._is_unsaved(), True)
+        check("replace-all keeps the preview untouched",
+              "beta" in win._browser.toPlainText(), False)
+
+        # Ctrl+F goes back to the plain search bar
+        win._toggle_find()
+        check("Ctrl+F hides the replace row", win._replace_row.isVisible(), False)
+        check("Ctrl+F clears replace mode", win._replace_mode, False)
+
+        win._confirm_discard = lambda: True
+        win._leave_edit()
+        win.close()
+        app.processEvents()
+
     print("all checks passed" if not failures else f"{len(failures)} failure(s)")
     return 1 if failures else 0
 
