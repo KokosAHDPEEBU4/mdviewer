@@ -37,6 +37,12 @@
   вкладку под курсором, иначе на активную) и подменю «Недавние» — до 10
   последних открытых файлов (свежие впереди, без повторов) с пунктом «Очистить
   список»;
+- экспорт вкладки через ПКМ → «Экспорт»: «PDF…» печатает текущее превью в PDF
+  (`QPrinter`, высокое разрешение, поля страницы 15 мм; реальный принтер не
+  нужен), «HTML…» сохраняет самодостаточную страницу с текстом документа,
+  встроенным CSS текущей темы, `<meta charset="utf-8">` и заголовком по имени
+  файла; локальные картинки остаются абсолютными `file:`-ссылками, сетевые
+  ресурсы не запрашиваются; отмена диалога ничего не записывает;
 - один экземпляр приложения: двойной клик по `.md` (или запуск exe с файлом)
   открывает вкладку в уже запущенном окне, а не новое окно;
 - поиск `Ctrl+F` (по активной панели: редактор в правке, иначе превью) и
@@ -167,8 +173,9 @@ dist\MDViewer\MDViewer.exe --uninstall-default
 main.py        CLI, QApplication, диалог открытия файла; один экземпляр
 instance.py    single-instance: мьютекс Win32 + очередь запросов
 viewer.py      DocumentView (файл: превью, оглавление, редактор, оверлей,
-               поиск, подсветка, наблюдение за файлом) + MainWindow (QTabWidget,
-               заголовок, геометрия, tear-off/merge) + TabBar + совместимый Viewer
+               поиск, подсветка, наблюдение за файлом, экспорт в HTML/PDF)
+               + MainWindow (QTabWidget, заголовок, геометрия, tear-off/merge,
+               ПКМ-меню вкладок) + TabBar + совместимый Viewer
 renderer.py    mistune -> HTML (код, картинки, чекбоксы, якоря заголовков)
 theme.py       палитры (тёмная/светлая), CSS для Qt rich text, размеры колонки,
                QSS приложения
@@ -207,7 +214,9 @@ tools/         make_icon.py (генерация assets/icon.ico), render_check.p
 ```bash
 .venv\Scripts\python tools\render_check.py   # рендер всех стилей -> PNG
 .venv\Scripts\python tools\debug_html.py    # HTML без запуска GUI
-.venv\Scripts\python tools\edit_check.py    # правка/конвертация/сохранение
-.venv\Scripts\python tools\tabs_check.py    # вкладки: дедуп/закрытие/tear-off
+.venv\Scripts\python tools\edit_check.py    # правка/конвертация/сохранение,
+                                            # экспорт в HTML/PDF
+.venv\Scripts\python tools\tabs_check.py    # вкладки: дедуп/закрытие/tear-off,
+                                            # ПКМ-меню с экспортом
 .venv\Scripts\python -m py_compile *.py
 ```

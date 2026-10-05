@@ -1221,6 +1221,105 @@ def main() -> int:
         win.close()
         app.processEvents()
 
+    # --- export: standalone HTML, PDF via QPrinter, cancel writes nothing
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "export.md"
+        path.write_text(
+            "# Заголовок\n\nтекст для экспорта\n\n## Раздел\n\nтело\n",
+            encoding="utf-8",
+        )
+        win = viewer_mod.Viewer(path, QSettings(tempfile.mkdtemp(), "export_check"))
+        win.resize(800, 600)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+
+        original_save = viewer_mod.QFileDialog.getSaveFileName
+
+        # HTML: the file is standalone, carries the heading, the title (file
+        # name), the charset and the active theme's CSS
+        html_dest = Path(folder) / "out.html"
+        viewer_mod.QFileDialog.getSaveFileName = staticmethod(
+            lambda *args, **kwargs: (str(html_dest), "HTML (*.html)")
+        )
+        try:
+            ok = win.export_via_dialog("html")
+        finally:
+            viewer_mod.QFileDialog.getSaveFileName = original_save
+        check("HTML export reports success", ok, True)
+        check("HTML export wrote a file", html_dest.is_file(), True)
+        html = html_dest.read_text(encoding="utf-8")
+        check("HTML export carries the document heading", "Заголовок" in html, True)
+        check("HTML export title is the file name",
+              "<title>export.md</title>" in html, True)
+        check("HTML export declares utf-8", '<meta charset="utf-8">' in html, True)
+        check("HTML export embeds a style block", "<style>" in html, True)
+        check("HTML export embeds the dark theme CSS",
+              theme_mod.palette("dark")["PAGE_BG"] in html, True)
+        check("HTML export keeps links/resource URLs local",
+              "http://" not in html and "https://" not in html, True)
+
+        # the light theme must be reflected in the exported page too
+        win._set_theme("light")
+        app.processEvents()
+        light_dest = Path(folder) / "light.html"
+        viewer_mod.QFileDialog.getSaveFileName = staticmethod(
+            lambda *args, **kwargs: (str(light_dest), "HTML (*.html)")
+        )
+        try:
+            win.export_via_dialog("html")
+        finally:
+            viewer_mod.QFileDialog.getSaveFileName = original_save
+        check("HTML export follows the active theme",
+              theme_mod.palette("light")["PAGE_BG"]
+              in light_dest.read_text(encoding="utf-8"), True)
+        win._set_theme("dark")
+        app.processEvents()
+
+        # PDF: a real, non-empty file written without any printer
+        pdf_dest = Path(folder) / "out.pdf"
+        viewer_mod.QFileDialog.getSaveFileName = staticmethod(
+            lambda *args, **kwargs: (str(pdf_dest), "PDF (*.pdf)")
+        )
+        try:
+            ok = win.export_via_dialog("pdf")
+        finally:
+            viewer_mod.QFileDialog.getSaveFileName = original_save
+        check("PDF export reports success", ok, True)
+        check("PDF export wrote a non-empty file",
+              pdf_dest.is_file() and pdf_dest.stat().st_size > 0, True)
+        check("PDF export is a real PDF",
+              pdf_dest.read_bytes()[:5], b"%PDF-")
+
+        # cancelling the dialog must write nothing at all
+        before = sorted(p.name for p in Path(folder).iterdir())
+        viewer_mod.QFileDialog.getSaveFileName = staticmethod(
+            lambda *args, **kwargs: ("", "")
+        )
+        try:
+            cancelled_html = win.export_via_dialog("html")
+            cancelled_pdf = win.export_via_dialog("pdf")
+        finally:
+            viewer_mod.QFileDialog.getSaveFileName = original_save
+        check("cancelled HTML export reports no success", cancelled_html, False)
+        check("cancelled PDF export reports no success", cancelled_pdf, False)
+        check("cancelling writes no file",
+              sorted(p.name for p in Path(folder).iterdir()), before)
+
+        # an extension-less destination still gets the right suffix
+        bare = Path(folder) / "bare"
+        viewer_mod.QFileDialog.getSaveFileName = staticmethod(
+            lambda *args, **kwargs: (str(bare), "HTML (*.html)")
+        )
+        try:
+            win.export_via_dialog("html")
+        finally:
+            viewer_mod.QFileDialog.getSaveFileName = original_save
+        check("a missing suffix is added", (Path(folder) / "bare.html").is_file(), True)
+
+        win.close()
+        app.processEvents()
+
     print("all checks passed" if not failures else f"{len(failures)} failure(s)")
     return 1 if failures else 0
 

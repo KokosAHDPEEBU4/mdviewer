@@ -17,7 +17,8 @@ viewer.py       DocumentView(QWidget) — содержимое одного фа
                 (контейнер «крошки + QTextBrowser») + оглавление с фильтром +
                 QPlainTextEdit, оверлей, поиск (Ctrl+F) и замена (Ctrl+H),
                 синхронизация прокрутки редактор ↔ превью, подсветка, zoom,
-                история, QSettings, dirty-state, режим чтения,
+                история, QSettings, dirty-state, режим чтения, экспорт активной
+                вкладки в HTML и PDF,
                 QFileSystemWatcher (автоперезагрузка при изменении файла
                 на диске);
                 MainWindow(QMainWindow) — оболочка: QTabWidget, заголовок,
@@ -32,7 +33,8 @@ theme.py        палитры (dark/light), CSS для Qt rich text, MEASURE/si
 syncsel.py      SourceMap: выравнивание источник <-> рендер для синхронизации выделения
 winassoc.py     регистрация .md в HKCU (ProgID, OpenWithProgids, RegisteredApplications)
 version.py      APP_NAME, APP_VERSION, PROG_ID, EXTENSIONS — общий источник истины
-MDViewer.spec   PyInstaller: иконка, версия, excludes, вырезание лишнего Qt
+MDViewer.spec   PyInstaller: иконка, версия, excludes, вырезание лишнего Qt,
+                hiddenimports (QtPrintSupport для экспорта в PDF)
 build.bat       venv + pip + PyInstaller, флаг --run
 tools/          make_icon.py, render_check.py, debug_html.py, edit_check.py,
                 tabs_check.py
@@ -399,12 +401,14 @@ build.bat                                       # сборка dist\MDViewer
       по умолчанию 0) заставляет `_add_tab` открывать новые вкладки на этом
       масштабе; выбор — подменю «Масштаб по умолчанию» в ПКМ-меню вкладок
       (`_set_default_zoom`, применяется и к текущей вкладке).
-    - **ПКМ-меню вкладок** (`_show_tab_menu`) действует на вкладку под курсором
-      (`tabBar().tabAt(pos)`, при `-1` — активная): «Открыть содержащую папку» и
-      «Копировать путь» (только локальные пути, инвариант 5), а также подменю
-      «Недавние» — список `QSettings("recent_files")` (свежие впереди, без
-      дублей, только существующие файлы, кэп `viewer.RECENT_LIMIT`=10). Список
-      пополняет модульный `remember_recent_file` из `_add_tab` и
+    - **ПКМ-меню вкладок** действует на вкладку под курсором
+      (`tabBar().tabAt(pos)`, при `-1` — активная). Меню строит `_build_tab_menu`
+      (отдельно от `_show_tab_menu`, чтобы его можно было проверять в тестах):
+      «Открыть содержащую папку» и «Копировать путь» (только локальные пути,
+      инвариант 5), подменю «Экспорт» (инвариант 33), подменю «Недавние» —
+      список `QSettings("recent_files")` (свежие впереди, без дублей, только
+      существующие файлы, кэп `viewer.RECENT_LIMIT`=10), сессия, тема, масштаб.
+      Список пополняет модульный `remember_recent_file` из `_add_tab` и
       `DocumentView._load_path` (навигация по ссылке/«Назад»).
 
 27. **Режим чтения (F11), крошки и фильтр оглавления.**
@@ -539,6 +543,33 @@ build.bat                                       # сборка dist\MDViewer
     хрома (`DISABLED_*`, `OVERLAY_BG`, `SEL_TEXT`). Правки — в
     `tools/edit_check.py` (палитры, переключение, перерисовка, DWM) и
     `tools/tabs_check.py` (переключение доходит до всех окон/вкладок).
+
+33. **Экспорт вкладки — «Экспорт → PDF…/HTML…» в ПКМ-меню вкладок.**
+    Оба пункта действуют на вкладку под курсором (иначе активную); диалог —
+    `QFileDialog.getSaveFileName` с дефолтным именем `<имя>.<html|pdf>`.
+    Отмена диалога и ошибка записи возвращают False и ничего не пишут
+    (ошибку показывает `QMessageBox.warning`, инвариант про падения).
+
+    - **HTML** (`DocumentView.export_html`): рендер последнего *показанного*
+      источника (`self._map_source`, обновляется только на load/convert/save —
+      инвариант 12, поэтому непереконвертированный черновик редактора в экспорт
+      не попадает) через `render_with_outline`, `retheme_tables` для активной
+      темы, обёртка `_standalone_html`: `<!DOCTYPE html>`, `<meta charset="utf-8">`,
+      `<title>` = имя файла и `<style>` = `content_css(theme)`. Локальные
+      картинки остаются абсолютными `file:`-URL (рендерер их уже такими и
+      делает) — файл самодостаточен и **не тянет сеть** (инвариант 5).
+    - **PDF** (`DocumentView.export_pdf`): `PyQt6.QtPrintSupport.QPrinter`
+      (`PrinterMode.HighResolution`, `OutputFormat.PdfFormat`,
+      `setOutputFileName`), поля `PDF_MARGIN_MM`=15 мм через `setPageMargins`.
+      Печатается **клон** документа (`document().clone()`), чтобы не
+      переразбивать превью; text wrap делает Qt, обрезки нет. PDF пишется
+      файлом без реального принтера — потому и проверяется в тестах.
+    - **Сборка.** `QtPrintSupport` должен попасть в onedir: он указан в
+      `hiddenimports` `MDViewer.spec`, а его dll/плагин (Windows print support)
+      в `DROP_BINARIES` не перечислены — не вырезай их. Тесты — секция export
+      в `tools/edit_check.py` (HTML: заголовок/`<style>`/тема; PDF: непустой
+      `%PDF-`; отмена ничего не пишет через замоканный `QFileDialog`) и проверка
+      подменю «Экспорт» в `tools/tabs_check.py`.
 
 Максимум контента — до `MEASURE` px, оглавление фиксируется по `TOC_WIDTH`,
 отступы уровней — `TOC_STEP`; всё в `theme.py`.

@@ -16,6 +16,7 @@ from PyQt6.QtCore import (
     QByteArray,
     QEvent,
     QFileSystemWatcher,
+    QMarginsF,
     QMimeData,
     QPoint,
     QRegularExpression,
@@ -36,12 +37,14 @@ from PyQt6.QtGui import (
     QFont,
     QGuiApplication,
     QKeySequence,
+    QPageLayout,
     QPainter,
     QPen,
     QShortcut,
     QTextCursor,
     QTextDocument,
 )
+from PyQt6.QtPrintSupport import QPrinter
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -135,6 +138,30 @@ def _newline_of(raw: bytes) -> str:
 def _normalized(text: str) -> str:
     """Qt text widgets hand back LF-only text, so compare like for like."""
     return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+# PDF export page margin (millimetres). Generous enough that the text never
+# touches the paper edge, while still leaving a wide reading column.
+PDF_MARGIN_MM = 15
+
+
+def _standalone_html(title: str, body: str, theme: str) -> str:
+    """Wrap rendered `body` into a self-contained HTML page for `theme`.
+
+    The theme's `content_css` is embedded, the encoding is declared and the
+    title is the document's file name. Local images stay `file://` URLs (they
+    are already absolute), so the page makes no network requests.
+    """
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="ru">\n<head>\n'
+        '<meta charset="utf-8">\n'
+        f"<title>{escape(title)}</title>\n"
+        f"<style>\n{content_css(theme)}\n</style>\n"
+        "</head>\n<body>\n"
+        f"{body}\n"
+        "</body>\n</html>\n"
+    )
 
 
 # A file save is rarely one event (editors write a temp file and rename it), so
@@ -668,6 +695,83 @@ class DocumentView(QWidget):
             self._render(text)
         finally:
             QApplication.restoreOverrideCursor()
+
+    # -- export ------------------------------------------------------------
+
+    def export_html(self, dest: Path) -> bool:
+        """Write the current document as a standalone HTML file.
+
+        `self._map_source` is the markdown the preview currently shows (it is
+        refreshed only on load/convert/save, invariant 12), so the export
+        matches the preview even when the editor holds an un-converted draft.
+        Local images stay `file://` URLs; the theme's CSS is embedded. Nothing
+        is read from the network.
+        """
+        source = self._map_source if self._map_source is not None else self._text
+        body, _ = render_with_outline(source, self._path.parent)
+        body = retheme_tables(body, self._theme)
+        page = _standalone_html(self._path.name, body, self._theme)
+        try:
+            Path(dest).write_text(page, encoding="utf-8")
+        except OSError as exc:
+            self._export_error(exc)
+            return False
+        return True
+
+    def export_pdf(self, dest: Path) -> bool:
+        """Print the preview's `QTextDocument` to a PDF file via `QPrinter`.
+
+        A clone is printed so the on-screen document is never repaginated, and
+        explicit margins keep the text off the paper edge. `PdfFormat` writes a
+        plain file, so no printer (or dialog) is required — which also makes it
+        safe to run from the automated checks.
+        """
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+        printer.setOutputFileName(str(dest))
+        printer.setPageMargins(
+            QMarginsF(PDF_MARGIN_MM, PDF_MARGIN_MM, PDF_MARGIN_MM, PDF_MARGIN_MM),
+            QPageLayout.Unit.Millimeter,
+        )
+        document = self._browser.document().clone()
+        try:
+            document.print(printer)
+        except Exception as exc:  # Qt can raise on a broken printer setup
+            self._export_error(exc)
+            return False
+        finally:
+            document.deleteLater()
+        if not Path(dest).is_file() or Path(dest).stat().st_size == 0:
+            self._export_error("файл не создан")
+            return False
+        return True
+
+    def _export_error(self, exc) -> None:
+        QMessageBox.warning(self, "Экспорт", f"Не удалось сохранить файл:\n{exc}")
+
+    def export_via_dialog(self, kind: str) -> bool:
+        """Ask for a destination, then export `kind` ('html' or 'pdf').
+
+        Returns True once a file is written. Cancelling the dialog writes
+        nothing and returns False; a write error is reported and also returns
+        False. The default name is `<имя файла>.<расширение>`.
+        """
+        suffix = "html" if kind == "html" else "pdf"
+        title = "Экспорт в HTML" if suffix == "html" else "Экспорт в PDF"
+        caption = "HTML (*.html)" if suffix == "html" else "PDF (*.pdf)"
+        default = self._path.with_suffix("." + suffix)
+        name, _ = QFileDialog.getSaveFileName(self, title, str(default), caption)
+        if not name:
+            return False
+        dest = Path(name)
+        if dest.suffix.lower() != "." + suffix:
+            try:
+                dest = dest.with_suffix("." + suffix)
+            except ValueError:
+                pass
+        if suffix == "html":
+            return self.export_html(dest)
+        return self.export_pdf(dest)
 
     # -- theme -------------------------------------------------------------
 
@@ -3473,23 +3577,29 @@ class MainWindow(QMainWindow):
     def _clear_recent(self) -> None:
         self._settings.setValue(RECENT_KEY, [])
 
-    def _show_tab_menu(self, pos: QPoint) -> None:
-        """Right-click on the tab strip: file actions, recents, session, zoom.
+    def _build_tab_menu(self, view: DocumentView | None) -> QMenu:
+        """Build the tab context menu for `view` (kept separate so it is testable).
 
-        The file actions (`Открыть содержащую папку`, `Копировать путь`) target
-        the tab under the pointer, falling back to the active tab. Paths are
-        always local (`DocumentView` only ever holds local files), so nothing
-        here reaches the network.
+        `_show_tab_menu` execs the result at the pointer. The file and export
+        actions target `view`; paths are always local (`DocumentView` only ever
+        holds local files), so nothing here reaches the network.
         """
         menu = QMenu(self)
-        bar = self._tabs.tabBar()
-        view = self._tab_view_at(pos)
         if view is not None:
             path = view._path
             folder = menu.addAction("Открыть содержащую папку")
             folder.triggered.connect(lambda _checked=False, p=path: self._open_folder(p))
             copy = menu.addAction("Копировать путь")
             copy.triggered.connect(lambda _checked=False, p=path: self._copy_path(p))
+            export_menu = menu.addMenu("Экспорт")
+            pdf = export_menu.addAction("PDF…")
+            pdf.triggered.connect(
+                lambda _checked=False, v=view: v.export_via_dialog("pdf")
+            )
+            html = export_menu.addAction("HTML…")
+            html.triggered.connect(
+                lambda _checked=False, v=view: v.export_via_dialog("html")
+            )
             menu.addSeparator()
 
         recent_menu = menu.addMenu("Недавние")
@@ -3530,7 +3640,12 @@ class MainWindow(QMainWindow):
             action.triggered.connect(
                 lambda _checked=False, value=level: self._set_default_zoom(value)
             )
-        menu.exec(bar.mapToGlobal(pos))
+        return menu
+
+    def _show_tab_menu(self, pos: QPoint) -> None:
+        """Right-click on the tab strip: file/export actions, recents, session, zoom."""
+        menu = self._build_tab_menu(self._tab_view_at(pos))
+        menu.exec(self._tabs.tabBar().mapToGlobal(pos))
 
     def _set_restore_session(self, enabled: bool) -> None:
         """Persist the flag; turning it on snapshots the current session at once."""
