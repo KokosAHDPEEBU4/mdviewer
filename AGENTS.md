@@ -13,12 +13,16 @@ main.py         CLI (файлы, --install-default/--uninstall-default/--assoc-s
                 экземпляр — второй запуск отдаёт пути через instance.py
 instance.py     single-instance: именованный мьютекс Win32 + файловая очередь
                 запросов (QtNetwork вырезан из сборки, QLocalServer недоступен)
+drafts.py       черновики несохранённых правок в каталоге состояния
+                (`state_dir()/drafts`): save/load/clear/pending, sha1-имя,
+                JSON с путём/текстом/временем
 viewer.py       DocumentView(QWidget) — содержимое одного файла: превью
                 (контейнер «крошки + QTextBrowser») + оглавление с фильтром +
                 QPlainTextEdit, оверлей, поиск (Ctrl+F) и замена (Ctrl+H),
                 синхронизация прокрутки редактор ↔ превью, подсветка, zoom,
                 история, QSettings, dirty-state, режим чтения, экспорт активной
-                вкладки в HTML и PDF,
+                вкладки в HTML и PDF, черновики несохранённых правок
+                (автосейв/восстановление после падения),
                 QFileSystemWatcher (автоперезагрузка при изменении файла
                 на диске);
                 MainWindow(QMainWindow) — оболочка: QTabWidget, заголовок,
@@ -570,6 +574,31 @@ build.bat                                       # сборка dist\MDViewer
       в `tools/edit_check.py` (HTML: заголовок/`<style>`/тема; PDF: непустой
       `%PDF-`; отмена ничего не пишет через замоканный `QFileDialog`) и проверка
       подменю «Экспорт» в `tools/tabs_check.py`.
+
+34. **Черновики несохранённых правок переживают падение.** `drafts.py` хранит
+    по одной JSON-записи (путь/текст/время) на файл в
+    `instance.state_dir()/drafts`, имя — sha1 от `str(Path(path).resolve())` +
+    `.json`; `MDVIEWER_STATE_DIR` переопределяет каталог (как у очереди
+    single-instance, инвариант 26). Запись атомарная (temp + `os.replace`).
+    Публичный API: `save_draft`, `load_draft`, `clear_draft`, `pending_drafts`.
+
+    `DocumentView`:
+    - пока есть несохранённые правки, `_update_state` **перезапускает**
+      single-shot `_draft_timer` (`DRAFT_AUTOSAVE_MS`=3000); его слот
+      `_autosave_draft` пишет `drafts.save_draft`. Как только правки исчезли,
+      таймер останавливается. `MainWindow.closeEvent` перед опросами зовёт
+      `_flush_draft()` по каждой вкладке — крэш-сейф на выходе.
+    - при `load`/`_load_path` после чтения диска вызывается отдельный
+      `_maybe_restore_draft()` (его можно звать/мокать без модальных окон,
+      инвариант про тесты): если черновик есть и **отличается** от содержимого
+      на диске (`_normalized`, инвариант 10) — `QMessageBox.question`
+      «Найден несохранённый черновик для <файл>. Восстановить?». «Да» —
+      `_restore_draft` входит в правку (`_enter_edit`), ставит текст черновика
+      и оставляет `_baseline` = диск → файл dirty; «Нет» — `clear_draft`.
+      Черновик, совпадающий с диском, удаляется молча.
+    - `_save` и `_confirm_discard` с ответом «Discard», а также выход из правки
+      (`_leave_edit`) удаляют черновик; после восстановления он живёт, пока не
+      сохранят или не откажутся.
 
 Максимум контента — до `MEASURE` px, оглавление фиксируется по `TOC_WIDTH`,
 отступы уровней — `TOC_STEP`; всё в `theme.py`.

@@ -69,6 +69,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+import drafts
+
 from renderer import Heading, render_with_outline
 from syncsel import SourceMap
 from theme import (
@@ -168,6 +170,11 @@ def _standalone_html(title: str, body: str, theme: str) -> str:
 # the external-change reload waits this long to coalesce the burst before it
 # reads the file once. Short enough to feel instant, long enough to be one read.
 FILE_WATCH_DEBOUNCE_MS = 200
+
+# Unsaved edits are copied to a crash-safe draft this long after the last
+# keystroke. Restarted on every change (single-shot), so it only fires once the
+# typist pauses; the text survives even a hard PyQt crash.
+DRAFT_AUTOSAVE_MS = 3000
 
 
 # How many files the "Недавние" submenu remembers. Stored newest-first, deduped
@@ -559,6 +566,13 @@ class DocumentView(QWidget):
         self._reload_timer.setInterval(FILE_WATCH_DEBOUNCE_MS)
         self._reload_timer.timeout.connect(self._on_file_changed)
 
+        # crash-safe draft: one single-shot timer, restarted on every edit, so
+        # the pending text reaches disk once the typist pauses (see drafts.py)
+        self._draft_timer = QTimer(self)
+        self._draft_timer.setSingleShot(True)
+        self._draft_timer.setInterval(DRAFT_AUTOSAVE_MS)
+        self._draft_timer.timeout.connect(self._autosave_draft)
+
         # the window title and geometry belong to MainWindow (see below)
 
         self._browser = OverlayTextBrowser()
@@ -657,6 +671,7 @@ class DocumentView(QWidget):
             self._map_dirty = False  # matches the render that just happened
         self._update_state()
         self._watch_current()  # the watch follows the file that is now shown
+        self._maybe_restore_draft()  # offer back a crash-safe draft, if any
         return True
 
     def _render(self, text: str) -> None:
@@ -2005,6 +2020,7 @@ class DocumentView(QWidget):
     def _leave_edit(self) -> None:
         if not self._confirm_discard():
             return
+        self._discard_draft()  # leaving edit mode always retires the draft
         self._ensure_overlay()
         self._sync_suppressed = True
         self._sync_timer.stop()
@@ -2115,6 +2131,7 @@ class DocumentView(QWidget):
         self._baseline = _normalized(text)
         self._editor.document().setModified(False)
         self._render_busy(text)  # a saved file should show what it will look like
+        self._discard_draft()  # the draft is no longer needed
         self._update_state()
         return True
 
@@ -2137,6 +2154,7 @@ class DocumentView(QWidget):
             return False
         if answer == QMessageBox.StandardButton.Save:
             return self._save()
+        self._discard_draft()  # "Discard": the pending draft goes with it
         return True
 
     def _mark_map_dirty(self) -> None:
@@ -2145,6 +2163,59 @@ class DocumentView(QWidget):
 
     def _is_unsaved(self) -> bool:
         return self._editing() and self._editor.toPlainText() != self._baseline
+
+    # -- crash-safe drafts -------------------------------------------------
+
+    def _autosave_draft(self) -> None:
+        """Timer slot: copy the unsaved editor text to the draft store."""
+        if self._is_unsaved():
+            drafts.save_draft(self._path, self._editor.toPlainText())
+
+    def _flush_draft(self) -> None:
+        """Crash-safe: persist the pending edit right now (on app exit)."""
+        if self._is_unsaved():
+            drafts.save_draft(self._path, self._editor.toPlainText())
+
+    def _discard_draft(self) -> None:
+        """Forget this file's draft (saved, discarded, or left clean)."""
+        self._draft_timer.stop()
+        drafts.clear_draft(self._path)
+
+    def _maybe_restore_draft(self) -> bool:
+        """Offer to restore a pending draft for the file that was just loaded.
+
+        Returns True when the draft text was put into the editor. Kept apart
+        from `load` so tests can call (or stub) it without a modal dialog. A
+        draft identical to the disk file is dropped silently (nothing to
+        restore); a draft the user refuses is deleted too.
+        """
+        draft = drafts.load_draft(self._path)
+        if draft is None:
+            return False
+        if _normalized(draft) == _normalized(self._text):
+            drafts.clear_draft(self._path)
+            return False
+        answer = QMessageBox.question(
+            self,
+            APP_NAME,
+            f"Найден несохранённый черновик для {self._path.name}. Восстановить?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            drafts.clear_draft(self._path)
+            return False
+        self._restore_draft(draft)
+        return True
+
+    def _restore_draft(self, draft: str) -> None:
+        """Enter edit mode with the draft text, dirty against the disk file."""
+        if not self._editing():
+            self._enter_edit()
+        self._editor.setPlainText(draft)
+        # stay dirty against the disk file: `_enter_edit` set the baseline to it
+        self._editor.document().setModified(True)
+        self._update_state()
 
     def _update_window_title(self, unsaved: bool) -> None:
         """The version is in the title on purpose: it tells builds apart when
@@ -2167,6 +2238,11 @@ class DocumentView(QWidget):
         text = self._editor.toPlainText() if editing else self._text
         unsaved = editing and text != self._baseline
         self._unsaved = unsaved
+        # restart the crash-safe autosave while dirty, stop it when clean
+        if unsaved:
+            self._draft_timer.start()
+        else:
+            self._draft_timer.stop()
         if self._convert_btn is not None:
             self._convert_btn.setEnabled(editing and text != self._rendered)
         if self._save_btn is not None:
@@ -3776,6 +3852,10 @@ class MainWindow(QMainWindow):
         # every tab must pass its unsaved check, not just the active one
         for index in range(self._tabs.count()):
             view = self._tabs.widget(index)
+            if view is not None:
+                # crash-safe: put the pending edit on disk before prompting, so
+                # edits survive even if the dialog (or the process) never returns
+                view._flush_draft()
             if view is not None and not view._confirm_discard():
                 event.ignore()
                 return

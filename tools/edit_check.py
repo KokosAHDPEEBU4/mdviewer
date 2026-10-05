@@ -17,6 +17,7 @@ from PyQt6.QtCore import QEvent, QPoint, QPointF, QSettings, Qt, QUrl
 from PyQt6.QtGui import QKeyEvent, QMouseEvent, QPalette, QTextCursor, QWheelEvent
 from PyQt6.QtWidgets import QApplication, QPlainTextEdit, QTextBrowser
 
+import drafts
 import theme as theme_mod
 import viewer as viewer_mod
 from main import create_app
@@ -1319,6 +1320,112 @@ def main() -> int:
 
         win.close()
         app.processEvents()
+
+    # --- crash-safe drafts: store, autosave, restore, refuse and clean save
+    with tempfile.TemporaryDirectory() as folder:
+        state = Path(folder) / "state"
+        os.environ["MDVIEWER_STATE_DIR"] = str(state)
+        try:
+            path = Path(folder) / "draft.md"
+            path.write_text("# Disk\n\noriginal\n", encoding="utf-8")
+
+            # store primitives, entirely under the redirected state directory
+            check("no draft before editing", drafts.load_draft(path), None)
+            drafts.save_draft(path, "# Disk\n\nunsaved\n")
+            check("a saved draft loads back", drafts.load_draft(path), "# Disk\n\nunsaved\n")
+            pending = drafts.pending_drafts()
+            check("one pending draft is reported", len(pending), 1)
+            check("the pending draft records its path",
+                  Path(pending[0]["path"]), path.resolve())
+            check("the pending draft records its text",
+                  pending[0]["text"], "# Disk\n\nunsaved\n")
+            check("the pending draft records a time",
+                  isinstance(pending[0]["time"], float), True)
+            drafts.clear_draft(path)
+            check("clearing removes the draft", drafts.load_draft(path), None)
+            drafts.clear_draft(path)  # a missing draft is not an error
+            check("pending is empty again", drafts.pending_drafts(), [])
+
+            settings = QSettings(tempfile.mkdtemp(), "drafts_check")
+            win = viewer_mod.Viewer(path, settings)
+            win.resize(900, 600)
+            win.show()
+            for _ in range(3):
+                app.processEvents()
+
+            win._enter_edit()
+            for _ in range(3):
+                app.processEvents()
+            win._editor.setPlainText("# Disk\n\nedited on screen\n")
+            check("editing counts as unsaved", win._is_unsaved(), True)
+            check("the autosave timer is armed", win._draft_timer.isActive(), True)
+            win._autosave_draft()
+            check("autosave wrote the draft",
+                  drafts.load_draft(path), "# Disk\n\nedited on screen\n")
+            check("autosave left the disk file alone",
+                  path.read_text(encoding="utf-8"), "# Disk\n\noriginal\n")
+
+            win._confirm_discard = lambda: True
+            win._leave_edit()
+            check("leaving edit retires the draft", drafts.load_draft(path), None)
+
+            # restore on confirm: the draft comes back, dirty against the disk
+            win2 = viewer_mod.Viewer(path, settings)
+            win2.resize(900, 600)
+            win2.show()
+            for _ in range(3):
+                app.processEvents()
+            drafts.save_draft(path, "# Disk\n\nrecovered\n")
+            original_question = viewer_mod.QMessageBox.question
+            try:
+                viewer_mod.QMessageBox.question = staticmethod(
+                    lambda *args, **kwargs: viewer_mod.QMessageBox.StandardButton.Yes
+                )
+                restored = win2._maybe_restore_draft()
+            finally:
+                viewer_mod.QMessageBox.question = original_question
+            check("confirming restores the draft", restored, True)
+            check("restore enters edit mode", win2._editing(), True)
+            check("restore puts the draft in the editor",
+                  win2._editor.toPlainText(), "# Disk\n\nrecovered\n")
+            check("restore is dirty against the disk file", win2._is_unsaved(), True)
+            check("restore keeps the draft until saved",
+                  drafts.load_draft(path), "# Disk\n\nrecovered\n")
+            win2._save()
+            check("a clean save clears the draft", drafts.load_draft(path), None)
+            check("saving wrote the recovered text",
+                  path.read_text(encoding="utf-8"), "# Disk\n\nrecovered\n")
+            win2._confirm_discard = lambda: True
+            win2._leave_edit()
+
+            # refuse deletes the draft and stays in read mode
+            win3 = viewer_mod.Viewer(path, settings)
+            win3.show()
+            for _ in range(3):
+                app.processEvents()
+            drafts.save_draft(path, "# Disk\n\nrefused\n")
+            try:
+                viewer_mod.QMessageBox.question = staticmethod(
+                    lambda *args, **kwargs: viewer_mod.QMessageBox.StandardButton.No
+                )
+                restored = win3._maybe_restore_draft()
+            finally:
+                viewer_mod.QMessageBox.question = original_question
+            check("refusing does not restore", restored, False)
+            check("refusing stays in read mode", win3._editing(), False)
+            check("refusing deletes the draft", drafts.load_draft(path), None)
+
+            # a draft identical to the disk file is dropped without asking
+            drafts.save_draft(path, path.read_text(encoding="utf-8"))
+            check("an identical draft is dropped", win3._maybe_restore_draft(), False)
+            check("an identical draft is cleared", drafts.load_draft(path), None)
+
+            win.close()
+            win2.close()
+            win3.close()
+            app.processEvents()
+        finally:
+            os.environ.pop("MDVIEWER_STATE_DIR", None)
 
     print("all checks passed" if not failures else f"{len(failures)} failure(s)")
     return 1 if failures else 0
