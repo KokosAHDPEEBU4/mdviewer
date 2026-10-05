@@ -313,6 +313,12 @@ class DocumentView(QWidget):
         self._toc_auto_hidden = False
         self._editor_pref = EDITOR_PREF
         self._in_relayout = False
+        # reading mode (F11 host): outline hidden temporarily, overlay suppressed
+        self._reading_mode = False
+        self._reading_toc_saved = None
+        self._crumbs = None
+        self._toc_filter = None
+        self._toc_panel = None
         self._edit_anchor = None     # label of the visible section when editing starts
         self._edit_visible = ""      # text of the paragraph at the viewport top
         self._edit_fraction = None   # how far into the section the viewport top is
@@ -1591,6 +1597,8 @@ class DocumentView(QWidget):
         self._overlay = panel
 
     def _show_overlay(self) -> None:
+        if self._reading_mode:  # reading mode: maximum text, no chrome
+            return
         self._ensure_overlay()
         self._overlay.setVisible(True)
         self._overlay.raise_()
@@ -2200,6 +2208,8 @@ class MainWindow(QMainWindow):
         "_settings",
         "_view_geometry",
         "_dark_titled",
+        "_reading_mode",
+        "_reading_view",
     }
 
     def __init__(self, settings: QSettings | None = None):
@@ -2209,6 +2219,8 @@ class MainWindow(QMainWindow):
         object.__setattr__(self, "_settings", settings or QSettings())
         object.__setattr__(self, "_view_geometry", None)  # QByteArray (invariant 14)
         object.__setattr__(self, "_dark_titled", False)
+        object.__setattr__(self, "_reading_mode", False)
+        object.__setattr__(self, "_reading_view", None)
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         geometry = self._settings.value("geometry")
         if geometry:
@@ -2455,6 +2467,12 @@ class MainWindow(QMainWindow):
         self._update_title(view._is_unsaved() if view is not None else False)
         if view is not None:
             QTimer.singleShot(0, view._relayout)
+        # switching tabs while fullscreen carries reading mode to the new view
+        if self._reading_mode and view is not None and view is not self._reading_view:
+            if self._reading_view is not None:
+                self._reading_view._set_reading_mode(False)
+            self._reading_view = view
+            view._set_reading_mode(True)
 
     def _on_view_state_changed(self, view: DocumentView) -> None:
         """A tab's dirty state moved: refresh its label; title if it is active."""
@@ -2586,11 +2604,44 @@ class MainWindow(QMainWindow):
             "Ctrl+Shift+T": self._reopen_closed_tab,
             "Ctrl+Tab": lambda: self._cycle_tab(1),
             "Ctrl+Shift+Tab": lambda: self._cycle_tab(-1),
+            "F11": self._toggle_reading_mode,
         }
         for number in range(1, 10):
             actions[f"Ctrl+{number}"] = lambda index=number - 1: self._select_tab(index)
         for keys, slot in actions.items():
             QShortcut(QKeySequence(keys), self, slot)
+
+    # -- reading mode / fullscreen (F11) -----------------------------------
+
+    def _toggle_reading_mode(self) -> None:
+        if self._reading_mode:
+            self._leave_reading_mode()
+        else:
+            self._enter_reading_mode()
+
+    def _enter_reading_mode(self) -> None:
+        """Fullscreen with maximum text: no tab strip, no outline, no overlay."""
+        if self._reading_mode:
+            return
+        self._reading_mode = True
+        self._tabs.tabBar().setVisible(False)
+        view = self._current_view()
+        self._reading_view = view
+        if view is not None:
+            view._set_reading_mode(True)
+        self.showFullScreen()
+
+    def _leave_reading_mode(self) -> None:
+        """Back to a normal window: restore the tab strip and the outline."""
+        if not self._reading_mode:
+            return
+        self._reading_mode = False
+        self._tabs.tabBar().setVisible(True)
+        view = self._reading_view if self._reading_view is not None else self._current_view()
+        self._reading_view = None
+        if view is not None:
+            view._set_reading_mode(False)
+        self.showNormal()
 
     def showEvent(self, event):
         super().showEvent(event)
