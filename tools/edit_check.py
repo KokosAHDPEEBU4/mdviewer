@@ -4,7 +4,9 @@ Run from the project root:
     .venv\\Scripts\\python tools\\edit_check.py
 """
 
+import inspect
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -15,6 +17,7 @@ from PyQt6.QtCore import QEvent, QPoint, QPointF, QSettings, Qt, QUrl
 from PyQt6.QtGui import QKeyEvent, QMouseEvent, QPalette, QTextCursor, QWheelEvent
 from PyQt6.QtWidgets import QApplication, QPlainTextEdit, QTextBrowser
 
+import theme as theme_mod
 import viewer as viewer_mod
 from main import create_app
 from theme import (
@@ -100,6 +103,88 @@ def main() -> int:
     check("user-hidden outline never auto-returns", toc_visible_for(2000, True, False, False), False)
     check("edit: outline hide threshold", toc_visible_for(900, False, True, True), False)
     check("edit: outline shown when comfortable", toc_visible_for(954, False, True, True), True)
+
+    # --- theme: both palettes build, expose the same tokens and differ
+    dark_tokens = set(theme_mod.palette("dark"))
+    light_tokens = set(theme_mod.palette("light"))
+    check("both palettes expose the same tokens", dark_tokens == light_tokens, True)
+    check("the palette is not trivially small", len(dark_tokens) >= 20, True)
+
+    def _referenced(func):
+        """Placeholder names the stylesheet f-string interpolates."""
+        return {m.group(1) for m in re.finditer(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", inspect.getsource(func))}
+
+    css_tokens = _referenced(theme_mod.content_css)
+    qss_tokens = _referenced(theme_mod.app_qss)
+    check("content_css only references known tokens",
+          css_tokens <= dark_tokens and css_tokens <= light_tokens, True)
+    check("app_qss only references known tokens",
+          qss_tokens <= dark_tokens and qss_tokens <= light_tokens, True)
+    check("light content css builds", bool(theme_mod.content_css("light")), True)
+    check("light app qss builds", bool(theme_mod.app_qss("light")), True)
+    check("light content css differs from dark",
+          theme_mod.content_css("light") != theme_mod.content_css("dark"), True)
+    check("light app qss differs from dark",
+          theme_mod.app_qss("light") != theme_mod.app_qss("dark"), True)
+    check("bare content_css is the dark one",
+          theme_mod.content_css() == theme_mod.content_css("dark"), True)
+    check("APP_QSS is the dark one", theme_mod.APP_QSS == theme_mod.app_qss("dark"), True)
+    check("an unknown theme falls back to dark",
+          theme_mod.normalize("solarized"), theme_mod.DEFAULT_THEME)
+    # a pure table retheme: the emitted dark attribute moves to the light palette
+    dark_row = f'<tr bgcolor="{theme_mod.palette("dark")["TABLE_ROW_A"]}"><td>x</td></tr>'
+    check("table rows are recoloured for the light theme",
+          theme_mod.palette("light")["TABLE_ROW_A"]
+          in theme_mod.retheme_tables(dark_row, "light"), True)
+    check("table retheme is a no-op for dark",
+          theme_mod.retheme_tables(dark_row, "dark"), dark_row)
+
+    # --- theme switch at runtime: QSS, QSettings, re-render and DWM title
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "theme.md"
+        path.write_text("# T\n\n| a | b |\n|---|---|\n| 1 | 2 |\n", encoding="utf-8")
+        settings = QSettings(tempfile.mkdtemp(), "theme_check")
+        win = viewer_mod.Viewer(path, settings)
+        win.resize(800, 600)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+        check("a new view starts on the dark theme", win._theme, "dark")
+        check("a fresh setting defaults to dark",
+              settings.value("theme", theme_mod.DEFAULT_THEME, type=str), "dark")
+        check("the app starts on the dark QSS",
+              app.styleSheet() == theme_mod.app_qss("dark"), True)
+        dark_html = win._browser.toHtml()
+
+        win._set_theme("light")
+        app.processEvents()
+        check("the runtime switch persists the theme",
+              settings.value("theme", "", type=str), "light")
+        check("the runtime switch sets the light QSS",
+              app.styleSheet() == theme_mod.app_qss("light"), True)
+        check("the view follows the theme", win._theme, "light")
+        check("the window reports the light theme", win._theme_name(), "light")
+        check("the light theme drops the dark caption", win._dark_titled, False)
+        check("the document uses the light stylesheet",
+              win._browser.document().defaultStyleSheet()
+              == theme_mod.content_css("light"), True)
+        light_html = win._browser.toHtml()
+        check("the document really re-rendered", light_html != dark_html, True)
+        check("table rows carry the light zebra",
+              theme_mod.palette("light")["TABLE_ROW_A"] in light_html, True)
+        check("table rows dropped the dark zebra",
+              theme_mod.palette("dark")["TABLE_ROW_A"] not in light_html, True)
+
+        win._set_theme("dark")
+        app.processEvents()
+        check("switching back restores the dark view", win._theme, "dark")
+        check("the dark theme restores the dark caption", win._dark_titled, True)
+        check("the dark theme is persisted too",
+              settings.value("theme", "", type=str), "dark")
+        check("the dark QSS is applied again",
+              app.styleSheet() == theme_mod.app_qss("dark"), True)
+        win.close()
+        app.processEvents()
 
     # --- mutual-highlight search survives markdown markup
     pattern = viewer_mod.Viewer._match_pattern("bold text")
