@@ -609,9 +609,22 @@ build.bat                                       # сборка dist\MDViewer
     применяет `MainWindow._apply_settings`: тема — через `_set_theme` (все окна и
     вкладки, QSS + перерисовка + DWM), сессия — `_set_restore_session`,
     масштаб — только в `QSettings` (новые вкладки; текущие не трогаются),
-    wrap/номера/синхро — `DocumentView._apply_settings` на каждый существующий
-    редактор. Полей `setToolTip` с хоткеями нет (инвариант 18). Тесты — секции
-    «settings dialog» в `tools/edit_check.py` и `tools/tabs_check.py`.
+    wrap/номера — `DocumentView._apply_settings` на каждый существующий
+    редактор (парная прокрутка — не настройка, см. инвариант 31). Полей
+    `setToolTip` с хоткеями нет (инвариант 18). Тесты — секции «settings
+    dialog» в `tools/edit_check.py` и `tools/tabs_check.py`.
+
+36. **Холодный старт — ленивый.** `main.py` на уровне модуля не импортирует Qt:
+    только `instance`/`version` (stdlib). Сначала `instance.acquire_singleton()`,
+    и лишь если мы владелец — `_run_owner` тянет `PyQt6`, `viewer`, `theme`
+    (импорты внутри функций). Второй запуск (двойной клик по `.md`) пишет запрос
+    в очередь и выходит, **не загружая Qt** (~0.1 с вместо ~1 с). `PyQt6.
+    QtPrintSupport` импортируется только в `DocumentView.export_pdf`.
+    `theme.APP_QSS` строится лениво через модульный `__getattr__` (обычная точка
+    входа — `app_qss(theme)`); `content_css` — функция. Не возвращать тяжёлые
+    импорты на верх `main.py`/`viewer.py`. `instance.RequestWatcher` заменён на
+    `instance.make_watcher(callback)` (Qt импортируется внутри). Поллинг очереди —
+    `POLL_MS` = 150.
 
 Максимум контента — до `MEASURE` px, оглавление фиксируется по `TOC_WIDTH`,
 отступы уровней — `TOC_STEP`; всё в `theme.py`.

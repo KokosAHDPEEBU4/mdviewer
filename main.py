@@ -1,4 +1,4 @@
-﻿"""MD Viewer вЂ” a fast, self-contained markdown viewer for Windows.
+﻿"""MD Viewer — a fast, self-contained markdown viewer for Windows.
 
 Usage:
     MDViewer [file.md ...]      open files in tabs (one window)
@@ -9,15 +9,8 @@ Usage:
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings
-from PyQt6.QtGui import QIcon
-from PyQt6.QtWidgets import QApplication, QMessageBox
-
 import instance
-import winassoc
-from theme import DEFAULT_THEME, app_qss
 from version import APP_NAME, APP_VERSION
-from viewer import MainWindow
 
 ICON_PATH = Path(__file__).with_name("assets") / "icon.ico"
 
@@ -48,28 +41,42 @@ def main(argv: list[str]) -> int:
             print(f"{APP_NAME} {APP_VERSION}")
             return 0
         if arg == "--install-default":
+            import winassoc
             return report(winassoc.install(prompt))
         if arg == "--uninstall-default":
+            import winassoc
             return report(winassoc.uninstall())
         if arg == "--assoc-status":
+            import winassoc
             return report(winassoc.status())
         if arg in ("--no-prompt", "--restore-session"):
             continue
         files.append(Path(arg))
 
-    app = create_app()
-    settings = QSettings()
-
-    # Single instance: a second launch (normally a .md double-click) hands its
-    # paths to the running viewer as tabs and exits. `handle` and `watcher`
-    # must outlive `app.exec()` below, hence they stay as locals here.
+    # Fast path for a second launch — usually a .md double-click. It must stay
+    # free of Qt: the mutex check and the file hand-off are stdlib only, so the
+    # running window picks the file up while this process is already gone.
     handle, already_running = instance.acquire_singleton()
     if already_running:
         instance.write_request([path for path in files if path.is_file()])
         return 0
 
+    return _run_owner(handle, files, force_restore)
+
+
+def _run_owner(handle, files, force_restore: bool) -> int:
+    """The owning process: now it is worth importing Qt and building the window."""
+    from PyQt6.QtCore import QSettings
+
+    from viewer import MainWindow
+
+    app = create_app()
+    settings = QSettings()
     window = MainWindow(settings)
-    watcher = instance.RequestWatcher(window.open_external)
+    # `handle` keeps the singleton mutex alive and `watcher` polls the queue;
+    # both must outlive `app.exec()` below.
+    watcher = instance.make_watcher(window.open_external)
+
     paths = [path for path in files if path.is_file()]
     if paths:
         window._open_paths(paths)
@@ -94,6 +101,8 @@ def report(result: tuple[int, str]) -> int:
     """The frozen build is windowed, so results go to a dialog, not stdout."""
     code, message = result
     if sys.stdout is None:
+        from PyQt6.QtWidgets import QMessageBox
+
         app = create_app()
         QMessageBox.information(None, APP_NAME, message)
         del app
@@ -102,7 +111,14 @@ def report(result: tuple[int, str]) -> int:
     return code
 
 
-def create_app() -> QApplication:
+def create_app():
+    """Build the QApplication; Qt and the theme are imported here, not at start."""
+    from PyQt6.QtCore import QSettings
+    from PyQt6.QtGui import QIcon
+    from PyQt6.QtWidgets import QApplication
+
+    from theme import DEFAULT_THEME, app_qss
+
     app = QApplication(sys.argv[:1])
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("MDViewer")

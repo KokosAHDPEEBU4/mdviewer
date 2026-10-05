@@ -3,8 +3,10 @@
 
 Kept deliberately slim: the app only needs QtCore/QtGui/QtWidgets/QtSvg, so
 network, pdf, web-engine, translations and the 20 MB software-OpenGL fallback
-are dropped from the bundle.  One-dir instead of one-file: startup is ~0.2 s
-instead of a couple of seconds, which is the whole point of a viewer.
+are dropped from the bundle.  One-dir instead of one-file: a cold start is
+~0.8-1.0 s instead of a couple of seconds, which is the whole point of a viewer.
+Qt is imported lazily by main.py, so a second launch (a .md double-click while
+the viewer is already open) forwards the path without loading Qt at all (~0.1 s).
 """
 
 import sys

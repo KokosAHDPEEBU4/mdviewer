@@ -43,7 +43,6 @@ from PyQt6.QtGui import (
     QTextCursor,
     QTextDocument,
 )
-from PyQt6.QtPrintSupport import QPrinter
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -771,6 +770,8 @@ class DocumentView(QWidget):
         plain file, so no printer (or dialog) is required — which also makes it
         safe to run from the automated checks.
         """
+        from PyQt6.QtPrintSupport import QPrinter  # lazy: only for an export
+
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
         printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
         printer.setOutputFileName(str(dest))

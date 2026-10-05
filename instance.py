@@ -21,11 +21,9 @@ import time
 from ctypes import wintypes
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QTimer
-
 MUTEX_NAME = "Local\\MDViewer-singleton"
 ERROR_ALREADY_EXISTS = 183
-POLL_MS = 400  # queue poll interval of the owning process
+POLL_MS = 150  # queue poll interval of the owning process
 
 
 def state_dir() -> Path:
@@ -88,20 +86,29 @@ def take_requests() -> list[list[str]]:
     return batch
 
 
-class RequestWatcher(QObject):
-    """Poll the queue on the owning process and forward paths to a callback."""
+def make_watcher(callback, interval_ms: int = POLL_MS):
+    """Build the owning process's queue poller (imports Qt lazily).
 
-    def __init__(self, callback, parent=None):
-        super().__init__(parent)
-        self._callback = callback
-        self._timer = QTimer(self)
-        self._timer.setInterval(POLL_MS)
-        self._timer.timeout.connect(self._poll)
-        self._timer.start()
+    The second-instance hand-off path must not import Qt at all, so the QObject
+    timer is created here on demand rather than at module import. The returned
+    object exposes `stop()` and keeps itself alive via its parent/timer.
+    """
+    from PyQt6.QtCore import QObject, QTimer
 
-    def _poll(self) -> None:
-        for paths in take_requests():
-            self._callback(paths)
+    class _Watcher(QObject):
+        def __init__(self, cb):
+            super().__init__()
+            self._callback = cb
+            self._timer = QTimer(self)
+            self._timer.setInterval(interval_ms)
+            self._timer.timeout.connect(self._poll)
+            self._timer.start()
 
-    def stop(self) -> None:
-        self._timer.stop()
+        def _poll(self) -> None:
+            for paths in take_requests():
+                self._callback(paths)
+
+        def stop(self) -> None:
+            self._timer.stop()
+
+    return _Watcher(callback)

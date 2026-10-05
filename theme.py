@@ -683,5 +683,16 @@ QLabel#breadcrumbs {{
 """
 
 
-# The default (dark) application stylesheet, kept for compatibility.
-APP_QSS = app_qss(DEFAULT_THEME)
+# The default (dark) application stylesheet, built lazily: `from theme import
+# APP_QSS` (and `theme.APP_QSS`) still work, but a cold start does not pay for
+# the big f-string unless the dark QSS is actually needed. `app_qss(theme)` is
+# the normal entry point.
+_APP_QSS_CACHE: dict[str, str] = {}
+
+
+def __getattr__(name: str) -> str:
+    if name == "APP_QSS":
+        if DEFAULT_THEME not in _APP_QSS_CACHE:
+            _APP_QSS_CACHE[DEFAULT_THEME] = app_qss(DEFAULT_THEME)
+        return _APP_QSS_CACHE[DEFAULT_THEME]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
