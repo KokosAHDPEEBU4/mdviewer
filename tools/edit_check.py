@@ -981,6 +981,57 @@ def main() -> int:
         win2.close()
         app.processEvents()
 
+    # --- settings dialog payload applies to a live editor (wrap/numbers/sync)
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "dialog.md"
+        path.write_text("# Doc\n\n" + "line\n" * 30, encoding="utf-8")
+        settings = QSettings(tempfile.mkdtemp(), "dialog_check")
+        win = viewer_mod.Viewer(path, settings)
+        win.resize(900, 600)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+        win._enter_edit()
+        for _ in range(3):
+            app.processEvents()
+
+        dialog = win._build_settings_dialog()
+        check("the settings dialog is filled from the current settings",
+              (dialog._zoom.currentData(), dialog._wrap.isChecked(),
+               dialog._numbers.isChecked(), dialog._sync.isChecked()),
+              (0, True, False, True))
+        check("the dialog offers the full zoom ladder",
+              [dialog._zoom.itemData(i) for i in range(dialog._zoom.count())],
+              [-2, -1, 0, 1, 2, 5, 10])
+
+        # change every editor-related option and apply, exactly as OK would
+        dialog._zoom.setCurrentIndex(dialog._zoom.findData(5))
+        dialog._wrap.setChecked(False)
+        dialog._numbers.setChecked(True)
+        dialog._sync.setChecked(False)
+        win._apply_settings(dialog.values())
+        for _ in range(2):
+            app.processEvents()
+        check("wrap from the dialog reaches the live editor",
+              win._editor.lineWrapMode(), QPlainTextEdit.LineWrapMode.NoWrap)
+        check("line numbers from the dialog reach the live editor",
+              win._editor.line_numbers_visible(), True)
+        check("the gutter is reserved after applying numbers",
+              win._editor.viewportMargins().left() > 0, True)
+        check("scroll sync from the dialog is persisted",
+              settings.value("sync_scroll", True, type=bool), False)
+        check("the default zoom from the dialog is persisted",
+              settings.value("default_zoom", 0, type=int), 5)
+        rebuilt = win._build_settings_dialog()
+        check("a rebuilt dialog reflects the saved values",
+              (rebuilt._wrap.isChecked(), rebuilt._numbers.isChecked()),
+              (False, True))
+
+        win._confirm_discard = lambda: True
+        win._leave_edit()
+        win.close()
+        app.processEvents()
+
     # --- external file changes: silent reload, dirty prompt, deleted file
     with tempfile.TemporaryDirectory() as folder:
         path = Path(folder) / "watch.md"

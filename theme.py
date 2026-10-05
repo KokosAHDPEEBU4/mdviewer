@@ -524,6 +524,42 @@ QLineEdit {{
     selection-background-color: {SELECTION};
 }}
 QLineEdit:focus {{ border: 1px solid {ACCENT_DIM}; }}
+/* Settings dialog: combos and checkboxes sit on the window surface. */
+QDialog {{
+    background-color: {BG};
+    color: {TEXT};
+}}
+QDialog QLabel {{ color: {TEXT}; }}
+QComboBox {{
+    background-color: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 5px;
+    padding: 3px 8px;
+    color: {TEXT};
+    min-width: 120px;
+}}
+QComboBox:hover {{ border-color: {ACCENT_DIM}; }}
+QComboBox::drop-down {{ border: none; width: 18px; }}
+QComboBox QAbstractItemView {{
+    background-color: {SURFACE};
+    border: 1px solid {BORDER};
+    color: {TEXT};
+    selection-background-color: {SELECTION};
+    selection-color: {SEL_TEXT};
+    outline: none;
+}}
+QCheckBox {{ color: {TEXT}; spacing: 8px; }}
+QCheckBox::indicator {{
+    width: 15px;
+    height: 15px;
+    border: 1px solid {BORDER};
+    border-radius: 3px;
+    background-color: {SURFACE};
+}}
+QCheckBox::indicator:checked {{
+    background-color: {ACCENT_DIM};
+    border-color: {ACCENT_DIM};
+}}
 QToolButton {{
     background-color: transparent;
     border: none;

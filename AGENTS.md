@@ -389,9 +389,9 @@ build.bat                                       # сборка dist\MDViewer
       переопределяет каталог очереди (для тестов).
     - **Сессия.** Флаг `QSettings("restore_session")` (по умолчанию выключен),
       снимок — `session_paths` + `session_active` (`_save_session` всех окон из
-      реестра `_WINDOWS`), восстановление — `_restore_session`. Тумблер — ПКМ по
-      полосе вкладок (`_show_tab_menu`), CLI — `--restore-session`. Открытие
-      файлов идёт через `MainWindow._open_paths`/`_add_tab`/`_open_files_dialog`.
+      реестра `_WINDOWS`), восстановление — `_restore_session`. Тумблер — диалог
+      «Настройки» (`Ctrl+,` или ПКМ, инвариант 35), CLI — `--restore-session`.
+      Открытие файлов идёт через `MainWindow._open_paths`/`_add_tab`/`_open_files_dialog`.
     - **Совместимость `tools/`.** `tools/edit_check.py` и `render_check.py`
       используют `viewer.Viewer(path, settings)` (подкласс `MainWindow`) и
       проксирование `MainWindow.__getattr__`/`__setattr__` в текущий `DocumentView`.
@@ -403,15 +403,17 @@ build.bat                                       # сборка dist\MDViewer
       (`_toggle_zoom_label`, `_toggle_editor_zoom_label`; `_reset_zoom` остаётся
       жёстким сбросом для `Ctrl+0`). `QSettings("default_zoom")` (уровень,
       по умолчанию 0) заставляет `_add_tab` открывать новые вкладки на этом
-      масштабе; выбор — подменю «Масштаб по умолчанию» в ПКМ-меню вкладок
-      (`_set_default_zoom`, применяется и к текущей вкладке).
+      масштабе; выбор — combo в диалоге «Настройки» и влияет **только на новые
+      вкладки**, уже открытые не трогаются.
     - **ПКМ-меню вкладок** действует на вкладку под курсором
       (`tabBar().tabAt(pos)`, при `-1` — активная). Меню строит `_build_tab_menu`
       (отдельно от `_show_tab_menu`, чтобы его можно было проверять в тестах):
       «Открыть содержащую папку» и «Копировать путь» (только локальные пути,
       инвариант 5), подменю «Экспорт» (инвариант 33), подменю «Недавние» —
       список `QSettings("recent_files")` (свежие впереди, без дублей, только
-      существующие файлы, кэп `viewer.RECENT_LIMIT`=10), сессия, тема, масштаб.
+      существующие файлы, кэп `viewer.RECENT_LIMIT`=10) и «Настройки…»
+      (инвариант 35). Разрозненные пункты «сессия/тема/масштаб» убраны — их
+      заменил единый диалог.
       Список пополняет модульный `remember_recent_file` из `_add_tab` и
       `DocumentView._load_path` (навигация по ссылке/«Назад»).
 
@@ -454,8 +456,8 @@ build.bat                                       # сборка dist\MDViewer
 
 28. **Редактор: необязательные перенос строк и номера строк.**
     Настройки `QSettings("editor_wrap")` (дефолт — вкл) и
-    `QSettings("editor_line_numbers")` (дефолт — выкл) переключаются кнопкой
-    «⋯» в шапке панели редактора и применяются сразу и к текущему, и к будущим
+    `QSettings("editor_line_numbers")` (дефолт — выкл) переключаются в диалоге
+    «Настройки» (инвариант 35) и применяются сразу и к текущему, и к будущим
     редакторам (`_apply_editor_options` при `_build_editor`). Перенос —
     `QPlainTextEdit.setLineWrapMode(WidgetWidth|NoWrap)`. Номера строк —
     классический жёлоб `LineNumberArea` в отступе `QPlainTextEdit`; место
@@ -503,8 +505,9 @@ build.bat                                       # сборка dist\MDViewer
     (`_update_state`/`_map_dirty`), а превью не перерисовывается (инвариант 12).
 
 31. **Синхронизация прокрутки редактор ↔ превью — только в правке.** Тумблер
-    `QSettings("sync_scroll")` (дефолт — вкл) в меню «⋯» редактора
-    (`_build_editor`). `valueChanged` обоих `verticalScrollBar` зовёт
+    `QSettings("sync_scroll")` (дефолт — вкл) живёт в диалоге «Настройки»
+    (инвариант 35) и применяется ко всем существующим `DocumentView`.
+    `valueChanged` обоих `verticalScrollBar` зовёт
     `_queue_scroll_sync`, которая взводит `_sync_timer` (`SYNC_SCROLL_MS` = 70,
     single-shot) — троттлинг пачки шагов. `_sync_scroll_now` применяет одно
     перемещение через карту `SourceMap` (`to_source`/`to_render`), а если карта
@@ -530,8 +533,8 @@ build.bat                                       # сборка dist\MDViewer
     Любой токен, который упоминает `content_css`/`app_qss`, обязан быть в
     **обеих** палитрах, иначе сборка стиля упадёт с `KeyError`.
 
-    Переключатель — checkable-пункт «Светлая тема» в ПКМ-меню вкладок
-    (`MainWindow._show_tab_menu` → `_set_light_theme` → `_set_theme`):
+    Переключатель — combo «Тема» в диалоге «Настройки» (инвариант 35,
+    `_apply_settings` → `_set_theme`):
     `_set_theme` пишет `QSettings`, ставит `QApplication.setStyleSheet(app_qss)`
     (это общий стиль всех окон) и для каждой вкладки каждого живого окна зовёт
     `DocumentView._apply_theme`, который переустанавливает
@@ -599,6 +602,21 @@ build.bat                                       # сборка dist\MDViewer
     - `_save` и `_confirm_discard` с ответом «Discard», а также выход из правки
       (`_leave_edit`) удаляют черновик; после восстановления он живёт, пока не
       сохранят или не откажутся.
+
+35. **Единый диалог «Настройки» — единственный источник разрозненных опций.**
+    `SettingsDialog(QDialog)` (в `viewer.py`, модальный) собирает тему, масштаб
+    по умолчанию, восстановление сессии, синхронизацию прокрутки, перенос строк
+    и номера строк. Доступ: оконный хоткей `Ctrl+,` (`_build_window_shortcuts`)
+    и пункт «Настройки…» в ПКМ-меню вкладок (`_build_tab_menu`). Старые пункты
+    (сессия/тема/масштаб в ПКМ-меню, меню «⋯» редактора) удалены — не возвращай
+    их. Диалог строит `MainWindow._build_settings_dialog` (отдельно, чтобы
+    проверять без `exec`), значения отдаёт `SettingsDialog.values()`, а
+    применяет `MainWindow._apply_settings`: тема — через `_set_theme` (все окна и
+    вкладки, QSS + перерисовка + DWM), сессия — `_set_restore_session`,
+    масштаб — только в `QSettings` (новые вкладки; текущие не трогаются),
+    wrap/номера/синхро — `DocumentView._apply_settings` на каждый существующий
+    редактор. Полей `setToolTip` с хоткеями нет (инвариант 18). Тесты — секции
+    «settings dialog» в `tools/edit_check.py` и `tools/tabs_check.py`.
 
 Максимум контента — до `MEASURE` px, оглавление фиксируется по `TOC_WIDTH`,
 отступы уровней — `TOC_STEP`; всё в `theme.py`.

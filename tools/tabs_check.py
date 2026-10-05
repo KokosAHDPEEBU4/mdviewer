@@ -579,6 +579,80 @@ def main() -> int:
         close_window(win)
         pump(app)
 
+        # --- 20. settings dialog: reflects QSettings, applies on OK
+        dialog_settings = QSettings(tempfile.mkdtemp(), "tabs_settings")
+        dialog_settings.clear()
+        win = MainWindow(dialog_settings)
+        win._open_paths([a, b])
+        win.show()
+        pump(app)
+
+        dialog = win._build_settings_dialog()
+        check("the settings dialog is modal", dialog.isModal(), True)
+        check("the dialog reflects the saved theme",
+              dialog._theme.currentData(), "dark")
+        check("the dialog reflects the default zoom",
+              dialog._zoom.currentData(), 0)
+        check("the dialog reflects session restore off",
+              dialog._session.isChecked(), False)
+        check("the dialog reflects wrap on", dialog._wrap.isChecked(), True)
+        check("the dialog reflects line numbers off",
+              dialog._numbers.isChecked(), False)
+        check("the dialog reflects scroll sync on", dialog._sync.isChecked(), True)
+
+        # flip everything and apply, exactly as "ОК" would
+        dialog._theme.setCurrentIndex(dialog._theme.findData("light"))
+        dialog._zoom.setCurrentIndex(dialog._zoom.findData(2))
+        dialog._session.setChecked(True)
+        dialog._wrap.setChecked(False)
+        dialog._numbers.setChecked(True)
+        dialog._sync.setChecked(False)
+        win._apply_settings(dialog.values())
+        pump(app)
+        check("OK persists the theme",
+              dialog_settings.value("theme", "", type=str), "light")
+        check("OK applies the theme to every tab",
+              [win._tabs.widget(i)._theme for i in range(win._tabs.count())],
+              ["light", "light"])
+        check("OK persists the default zoom",
+              dialog_settings.value("default_zoom", 0, type=int), 2)
+        check("OK persists session restore",
+              dialog_settings.value("restore_session", False, type=bool), True)
+        check("OK persists wrap off",
+              dialog_settings.value("editor_wrap", True, type=bool), False)
+        check("OK persists line numbers on",
+              dialog_settings.value("editor_line_numbers", False, type=bool), True)
+        check("OK persists scroll sync off",
+              dialog_settings.value("sync_scroll", True, type=bool), False)
+        check("applying the default zoom leaves open tabs alone",
+              [win._tabs.widget(i)._zoom for i in range(win._tabs.count())], [0, 0])
+        check("a rebuilt dialog reflects the saved theme",
+              win._build_settings_dialog()._theme.currentData(), "light")
+
+        menu_labels = [action.text() for action in win._build_tab_menu(win._tabs.widget(0)).actions()]
+        check("the tab menu offers the settings dialog",
+              "Настройки…" in menu_labels, True)
+        check("the tab menu dropped the session item",
+              "Восстанавливать прошлую сессию" in menu_labels, False)
+        check("the tab menu dropped the theme item",
+              "Светлая тема" in menu_labels, False)
+        check("the tab menu dropped the zoom submenu",
+              "Масштаб по умолчанию" in menu_labels, False)
+        check("Ctrl+, is a window key",
+              "Ctrl+," in [s.key().toString() for s in win.findChildren(QShortcut)
+                           if s.parent() is win], True)
+
+        # the default zoom from the dialog reaches tabs opened afterwards
+        c2 = Path(folder) / "c2.md"
+        c2.write_text("# C2\n", encoding="utf-8")
+        later = win._add_tab(c2)
+        check("a tab opened after OK uses the default zoom", later._zoom, 2)
+
+        win._set_theme("dark")
+        dialog_settings.setValue("default_zoom", 0)
+        close_window(win)
+        pump(app)
+
     print("all checks passed" if not failures else f"{len(failures)} failure(s)")
     return 1 if failures else 0
 
