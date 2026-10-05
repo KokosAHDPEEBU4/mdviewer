@@ -385,9 +385,15 @@ def main() -> int:
         check("dropping on another window merges the tab", right._tabs.indexOf(merged) >= 0, True)
         check("the merged view left the source window", left._tabs.indexOf(merged), -1)
         check("the merged view kept its file", merged._path, a.resolve())
-        before_idx = right._tabs.indexOf(merged)
-        _resolve_tab_drop(right, merged, inside_right)  # drop back on the source
-        check("dropping on the source window keeps the tab", right._tabs.indexOf(merged), before_idx)
+        # dropping on the source window's own body tears the tab off (browser)
+        _resolve_tab_drop(right, merged, inside_right)
+        pump(app)
+        check("dropping on the source body tears the tab off",
+              right not in viewer_mod._live_windows(), True)
+        check("the torn-off view lives in a fresh window",
+              merged.window() is not None and merged.window() is not right, True)
+        close_window(merged.window())
+        pump(app)
 
         torn = left._tabs.widget(0)
         _resolve_tab_drop(left, torn, far_away)
@@ -397,7 +403,6 @@ def main() -> int:
         check("the torn-off view lives in a fresh window",
               torn.window() is not None and torn.window() is not left, True)
         close_window(torn.window())
-        close_window(right)
         pump(app)
 
         # --- 12. single-instance hand-off queue

@@ -3048,10 +3048,10 @@ class DocumentView(QWidget):
 
 TAB_MIME = "application/x-mdviewer-tab"
 
-# How far below the tab strip the pointer must be pulled before a press-drag
-# becomes a tear-off (browser-style: drag along the strip reorders, pull it down
-# and the tab detaches). A small margin avoids tearing off on a slight dip.
-TAB_DETACH_MARGIN = 18
+# How far the pointer may leave the tab strip (up/down) before a press-drag
+# becomes a tear-off. Small, so pulling a tab out of the strip in any direction
+# detaches right away, like a browser; horizontal drags along the band reorder.
+TAB_DETACH_MARGIN = 12
 
 # The tab currently being dragged. `QDrag` is synchronous and in-process, so a
 # module global is a reliable second channel: Qt may hand the drop handler a
@@ -3099,14 +3099,14 @@ def _window_at(global_pos: QPoint) -> "MainWindow | None":
 def _resolve_tab_drop(source: "MainWindow", view: "DocumentView", global_pos: QPoint) -> None:
     """Finish a tab drag that no tab bar accepted.
 
-    The pointer decides the gesture: over another window -> merge the tab there;
-    over the source window -> leave it alone; anywhere else -> tear it off into
-    a new window at the pointer.
+    Dropping on *another* window merges the tab there. Dropping anywhere else —
+    including over the source window's own content, which is the browser gesture
+    of pulling a tab out of the strip — tears it off into a new window at the
+    pointer. (A drop back on the source *strip* is handled by `TabBar.dropEvent`,
+    so it never reaches here.)
     """
     target = _window_at(global_pos)
-    if target is source:
-        return
-    if target is not None:
+    if target is not None and target is not source:
         if source._take_view(view):
             target._adopt_view(view)
             target.activate()
@@ -3175,12 +3175,16 @@ class TabBar(QTabBar):
             and self._press_index >= 0
             and event.buttons() & Qt.MouseButton.LeftButton
         ):
-            gp = event.globalPosition().toPoint()
-            strip_bottom = self.mapToGlobal(QPoint(0, self.height())).y()
+            pos = event.position().toPoint()
             window = self.window()
-            pulled_down = gp.y() > strip_bottom + TAB_DETACH_MARGIN
-            outside = window is not None and not window.frameGeometry().contains(gp)
-            if pulled_down or outside:
+            # Leaving the strip band in *any* direction (above or below it), or
+            # out of the window, detaches the tab — the browser gesture. A drag
+            # that stays along the band is left to Qt for reordering.
+            left_band = pos.y() < -TAB_DETACH_MARGIN or pos.y() > self.height() + TAB_DETACH_MARGIN
+            outside = window is not None and not window.frameGeometry().contains(
+                event.globalPosition().toPoint()
+            )
+            if left_band or outside:
                 moved = (event.position().toPoint() - self._press_pos).manhattanLength()
                 if moved >= QApplication.startDragDistance():
                     if self._start_drag():
@@ -3222,9 +3226,12 @@ class TabBar(QTabBar):
             # `view`, so the global never outlives the drag
             _DRAG_VIEW = None
             self._dragging = False
-        # no tab bar accepted the drop: the pointer decides — merge into the
-        # window under it, or tear off into a new one (see `_resolve_tab_drop`)
-        if result == Qt.DropAction.IgnoreAction:
+        # no tab bar accepted the drop (releasing on the source strip is handled
+        # by `dropEvent`). A left button that is still down means the drag was
+        # cancelled with Esc, not dropped — then the tab stays put.
+        if result == Qt.DropAction.IgnoreAction and not (
+            QApplication.mouseButtons() & Qt.MouseButton.LeftButton
+        ):
             _resolve_tab_drop(window, view, QCursor.pos())
         return True
 
