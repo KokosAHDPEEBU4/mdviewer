@@ -982,6 +982,160 @@ def main() -> int:
         win.close()
         app.processEvents()
 
+    # --- search & replace in the editor (Ctrl+H)
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "replace.md"
+        path.write_text("# Doc\n\nalpha one\nalpha two\nalpha three\n", encoding="utf-8")
+        win = viewer_mod.Viewer(path, QSettings(tempfile.mkdtemp(), "replace_check"))
+        win.resize(900, 600)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+
+        check("replace row starts hidden", win._replace_row.isVisible(), False)
+        win._toggle_replace()
+        for _ in range(3):
+            app.processEvents()
+        check("Ctrl+H enters edit mode", win._editing(), True)
+        check("Ctrl+H reveals the replace row", win._replace_row.isVisible(), True)
+        check("Ctrl+H sets replace mode", win._replace_mode, True)
+
+        # an empty pattern must be a no-op (both buttons)
+        win._find_edit.clear()
+        win._replace_edit.setText("omega")
+        check("empty pattern replaces nothing", win._replace_all(), 0)
+        win._replace_next()  # must not raise and must not edit
+        check("empty pattern leaves the text alone",
+              win._editor.toPlainText().count("omega"), 0)
+
+        # replace one: exactly one occurrence changes, search moves on
+        win._find_edit.setText("alpha")
+        app.processEvents()
+        win._find_first()
+        win._replace_edit.setText("beta")
+        win._replace_next()
+        check("replace changes exactly one occurrence",
+              win._editor.toPlainText().count("beta"), 1)
+        check("replace leaves the other matches",
+              win._editor.toPlainText().count("alpha"), 2)
+        check("replace selects the next match",
+              win._editor.textCursor().selectedText(), "alpha")
+        check("replace marks the editor dirty", win._is_unsaved(), True)
+        check("replace does not rerender the preview",
+              "beta" in win._browser.toPlainText(), False)
+
+        # replace all: changes N and reports it
+        count = win._replace_all()
+        check("replace-all changes every remaining match", count, 2)
+        check("replace-all leaves no match behind",
+              win._editor.toPlainText().count("alpha"), 0)
+        check("replace-all produces the right number",
+              win._editor.toPlainText().count("beta"), 3)
+        check("replace-all keeps the editor dirty", win._is_unsaved(), True)
+        check("replace-all keeps the preview untouched",
+              "beta" in win._browser.toPlainText(), False)
+
+        # Ctrl+F goes back to the plain search bar
+        win._toggle_find()
+        check("Ctrl+F hides the replace row", win._replace_row.isVisible(), False)
+        check("Ctrl+F clears replace mode", win._replace_mode, False)
+
+        win._confirm_discard = lambda: True
+        win._leave_edit()
+        win.close()
+        app.processEvents()
+
+    # --- editor <-> preview scroll sync while editing
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "scrollsync.md"
+        body = "# Doc\n\n" + "\n\n".join(
+            f"## Section {i}\n\n" + "text line\n" * 8 for i in range(40)
+        )
+        path.write_text(body, encoding="utf-8")
+        settings = QSettings(tempfile.mkdtemp(), "scroll_sync")
+        win = viewer_mod.Viewer(path, settings)
+        win.resize(1000, 500)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+        check("scroll sync is on by default",
+              settings.value("sync_scroll", True, type=bool), True)
+
+        win._enter_edit()
+        for _ in range(4):
+            app.processEvents()
+        win._release_scroll_sync()  # let the settled mode accept user scrolls
+
+        # preview -> editor
+        win._sync_count = 0
+        preview_bar = win._browser.verticalScrollBar()
+        preview_bar.setValue(preview_bar.maximum() // 2)
+        app.processEvents()
+        check("a preview scroll queues a sync", win._sync_source is win._browser, True)
+        win._sync_scroll_now()
+        check("a preview scroll moves the editor",
+              win._editor.verticalScrollBar().value() > 0, True)
+        check("one user scroll applies one sync", win._sync_count, 1)
+        check("no loop is left pending", win._sync_source, None)
+
+        # editor -> preview
+        win._sync_count = 0
+        editor_bar = win._editor.verticalScrollBar()
+        editor_bar.setValue(max(0, editor_bar.value() - editor_bar.pageStep()))
+        app.processEvents()
+        check("an editor scroll queues a sync", win._sync_source is win._editor, True)
+        preview_before = win._browser.verticalScrollBar().value()
+        win._sync_scroll_now()
+        check("an editor scroll moves the preview",
+              win._browser.verticalScrollBar().value() != preview_before, True)
+        check("the reverse sync also fires once", win._sync_count, 1)
+        check("the reverse sync leaves no pending loop", win._sync_source, None)
+
+        # the guard really breaks the loop: a sync-driven scroll re-queues nothing
+        win._syncing_scroll = True
+        win._browser.verticalScrollBar().setValue(10)
+        app.processEvents()
+        check("a sync-driven scroll does not queue another sync",
+              win._sync_source, None)
+        win._syncing_scroll = False
+
+        # disabled toggle: scrolling one pane leaves the other alone
+        win._set_sync_scroll(False)
+        check("sync toggle is persisted",
+              settings.value("sync_scroll", True, type=bool), False)
+        editor_bar = win._editor.verticalScrollBar()
+        editor_bar.setValue(
+            min(editor_bar.maximum(), editor_bar.value() + editor_bar.pageStep())
+        )
+        app.processEvents()
+        check("a disabled sync queues nothing", win._sync_source, None)
+        preview_now = win._browser.verticalScrollBar().value()
+        win._sync_scroll_now()
+        check("a disabled sync does not move the preview",
+              win._browser.verticalScrollBar().value(), preview_now)
+        win._set_sync_scroll(True)
+
+        # entering edit must not disturb the preview position (invariant 15/17)
+        win._confirm_discard = lambda: True
+        win._leave_edit()
+        for _ in range(3):
+            app.processEvents()
+        anchor_block = win._browser.cursorForPosition(
+            win._browser.viewport().rect().topLeft()
+        ).block().blockNumber()
+        win._enter_edit()
+        for _ in range(4):
+            app.processEvents()
+        check("entering edit leaves the preview position alone",
+              win._browser.cursorForPosition(
+                  win._browser.viewport().rect().topLeft()
+              ).block().blockNumber(), anchor_block)
+
+        win._confirm_discard = lambda: True
+        win._leave_edit()
+        win.close()
+        app.processEvents()
+
     print("all checks passed" if not failures else f"{len(failures)} failure(s)")
     return 1 if failures else 0
 

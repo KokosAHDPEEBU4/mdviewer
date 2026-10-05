@@ -15,9 +15,11 @@ instance.py     single-instance: именованный мьютекс Win32 + �
                 запросов (QtNetwork вырезан из сборки, QLocalServer недоступен)
 viewer.py       DocumentView(QWidget) — содержимое одного файла: превью
                 (контейнер «крошки + QTextBrowser») + оглавление с фильтром +
-                QPlainTextEdit, оверлей, поиск, подсветка, zoom, история,
-                QSettings, dirty-state, режим чтения, QFileSystemWatcher
-                (автоперезагрузка при изменении файла на диске);
+                QPlainTextEdit, оверлей, поиск (Ctrl+F) и замена (Ctrl+H),
+                синхронизация прокрутки редактор ↔ превью, подсветка, zoom,
+                история, QSettings, dirty-state, режим чтения,
+                QFileSystemWatcher (автоперезагрузка при изменении файла
+                на диске);
                 MainWindow(QMainWindow) — оболочка: QTabWidget, заголовок,
                 геометрия, режим чтения (F11), closeEvent по всем вкладкам,
                 реестр _WINDOWS;
@@ -475,6 +477,39 @@ build.bat                                       # сборка dist\MDViewer
     не трогает содержимое и просто снимает наблюдение. Перезагрузка — тот же
     документ и та же вкладка, а не новая (не ломает single-instance/сессию).
     Любая перерисовка здесь — по событию ФС, а не на `valueChanged` (инвариант 12).
+
+30. **Поиск с заменой живёт в редакторе (`Ctrl+H`).** Per-document хоткей
+    `Ctrl+H` (`WidgetWithChildrenShortcut`, рядом с `Ctrl+F`) зовёт
+    `_toggle_replace`/`_open_replace`: если редактора нет, сначала
+    `_enter_edit()`, затем показывается строка «Заменить на» — часть той же
+    ленивой панели `_find_bar` (второй ряд, `_replace_row`, по умолчанию
+    скрыт). `Ctrl+F` её прячет (`_set_replace_mode(False)`), `Esc` в поле
+    замены закрывает панель (`_handle_esc`). Замена работает только по
+    `self._editor` (`QTextDocument.find`): `_replace_next` меняет совпадение,
+    только если выделение и есть текущий матч, и уводит поиск к следующему;
+    `_replace_all` сначала собирает диапазоны, потом меняет их **с конца**, и
+    возвращает число замен (уведомление — в `_find_status`, без модальных
+    окон). Пустой паттерн (`_search_pattern` → `None`) — no-op. Правки идут
+    через `textChanged`, поэтому dirty и карта помечаются существующим путём
+    (`_update_state`/`_map_dirty`), а превью не перерисовывается (инвариант 12).
+
+31. **Синхронизация прокрутки редактор ↔ превью — только в правке.** Тумблер
+    `QSettings("sync_scroll")` (дефолт — вкл) в меню «⋯» редактора
+    (`_build_editor`). `valueChanged` обоих `verticalScrollBar` зовёт
+    `_queue_scroll_sync`, которая взводит `_sync_timer` (`SYNC_SCROLL_MS` = 70,
+    single-shot) — троттлинг пачки шагов. `_sync_scroll_now` применяет одно
+    перемещение через карту `SourceMap` (`to_source`/`to_render`), а если карта
+    недоступна/устарела (`_map_dirty`) — по заголовку раздела
+    (`_editor_position_for_section` / `_editor_section_label` +
+    `_preview_index_for_label`), **не пересобирая HTML**. Петля рвётся флагом
+    `_syncing_scroll`: установка чужого скроллбара эмитит `valueChanged`, но
+    очередь при поднятом флаге выходит. Синхронизация не идёт вне правки, при
+    скрытой панели, при `_in_relayout` и выключенном тумблере. Вход/выход из
+    правки поднимают `_sync_suppressed` (`SYNC_SCROLL_SETTLE_MS` = 250, затем
+    `_release_scroll_sync`), иначе расстановка каретки/`_relayout` сами дёргали
+    бы прокрутку и «прыгали» (инварианты 15/17). `_scroll_editor_to` кладёт
+    `blockBoundingGeometry(block).top()` прямо в скроллбар: у `QPlainTextEdit`
+    он измеряется в пикселях, а геометрия блока — в координатах документа.
 
 Максимум контента — до `MEASURE` px, оглавление фиксируется по `TOC_WIDTH`,
 отступы уровней — `TOC_STEP`; всё в `theme.py`.

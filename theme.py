@@ -419,6 +419,11 @@ QListWidget#outline::item:selected {{
     background-color: {SURFACE_2};
     border-color: {ACCENT_DIM};
 }}
+/* Find / replace strip inside the overlay. The replace row appears only for
+   Ctrl+H; both rows are transparent so the overlay's own background shows. */
+#findBar, #replaceRow {{ background-color: transparent; }}
+#replaceRow QLineEdit {{ background-color: {SURFACE}; }}
+#replaceRow QPushButton {{ padding: 3px 10px; font-size: 12px; }}
 
 #editorPanel QToolButton {{
     color: {TEXT};
