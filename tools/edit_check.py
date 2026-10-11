@@ -1570,6 +1570,38 @@ def main() -> int:
             check("clearing the selection hides the strip",
                   win._copy_popup.isVisible(), False)
 
+            # --- the real mouse path: press -> drag -> release shows the strip
+            # (synthetic events exercise the viewport filter's release branch,
+            #  which is what a hand drag ends on)
+            doc = win._browser.document()
+            plain = doc.toPlainText()
+            at = plain.index("filler line")
+            word_start = QTextCursor(doc)
+            word_start.setPosition(at)
+            word_end = QTextCursor(doc)
+            word_end.setPosition(at + len("filler line"))
+            p1 = QPointF(win._browser.cursorRect(word_start).center())
+            p2 = QPointF(win._browser.cursorRect(word_end).center())
+            g1 = QPointF(win._browser.viewport().mapToGlobal(p1.toPoint()))
+            g2 = QPointF(win._browser.viewport().mapToGlobal(p2.toPoint()))
+            left = Qt.MouseButton.LeftButton
+            none = Qt.MouseButton.NoButton
+            QApplication.sendEvent(win._browser.viewport(), QMouseEvent(
+                QEvent.Type.MouseButtonPress, p1, g1, left, left,
+                Qt.KeyboardModifier.NoModifier))
+            QApplication.sendEvent(win._browser.viewport(), QMouseEvent(
+                QEvent.Type.MouseMove, p2, g2, left, left,
+                Qt.KeyboardModifier.NoModifier))
+            QApplication.sendEvent(win._browser.viewport(), QMouseEvent(
+                QEvent.Type.MouseButtonRelease, p2, g2, left, none,
+                Qt.KeyboardModifier.NoModifier))
+            app.processEvents()
+            check("a mouse drag-select ends with the strip visible",
+                  win._copy_popup.isVisible()
+                  and win._browser.textCursor().hasSelection(), True)
+            check("plain copy of the mouse selection",
+                  win._plain_selection(), "filler line")
+
             # --- the selection outlives its source: copy from the render cache
             _select("bold text and a link.")
             win._enter_edit()

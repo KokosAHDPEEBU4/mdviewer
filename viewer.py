@@ -2094,18 +2094,19 @@ class DocumentView(QWidget):
         panel.setVisible(False)
         self._copy_popup = panel
 
-    def _update_copy_popup(self, *_args) -> None:
+    def _update_copy_popup(self, *_args, from_release: bool = False) -> None:
         """Show or hide the copy strip for the current preview selection.
 
         While the left button is held the strip would only chase the pointer,
         so it waits for the release (the eventFilter calls this again on
-        `MouseButtonRelease`). A selection made from the search bar is
-        navigation, not a copy request: while the find field holds focus the
-        strip stays away.
+        `MouseButtonRelease` with `from_release`: the global button state is
+        not reliable mid-delivery of the release event itself). A selection
+        made from the search bar is navigation, not a copy request: while the
+        find field holds focus the strip stays away.
         """
         cursor = self._browser.textCursor()
         selected = cursor.hasSelection() and bool(cursor.selectedText().strip())
-        if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+        if not from_release and QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
             self._hide_copy_popup()
             return
         find_edit = getattr(self, "_find_edit", None)
@@ -2985,7 +2986,9 @@ class DocumentView(QWidget):
                 and event.button() == Qt.MouseButton.LeftButton
             ):
                 # the drag-select is over: the copy strip can come out now
-                self._update_copy_popup()
+                # (`from_release` skips the button-state check, which is not
+                # dependable while the release event is being delivered)
+                self._update_copy_popup(from_release=True)
         elif pane is self._toc and etype == QEvent.Type.Wheel:
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                 self._wheel_zoom(self._toc, event)
