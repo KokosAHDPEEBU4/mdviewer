@@ -1475,6 +1475,139 @@ def main() -> int:
         finally:
             os.environ.pop("MDVIEWER_STATE_DIR", None)
 
+    # --- copy strip: two copy flavours + the "deleted from editing" flag
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "copy.md"
+        path.write_text(
+            "# Title\r\n\r\nSome **bold** text and a [link](target.md).\r\n"
+            "\r\n- item one\r\n- item two\r\n\r\n" + "filler line\r\n\r\n" * 40,
+            encoding="utf-8",
+        )
+        win = viewer_mod.Viewer(path, QSettings(tempfile.mkdtemp(), "copy_check"))
+        win.resize(1000, 700)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+
+        check("no copy strip without a selection",
+              win._copy_popup is None or not win._copy_popup.isVisible(), True)
+
+        def _select(fragment: str) -> None:
+            plain = win._browser.document().toPlainText()
+            at = plain.index(fragment)
+            cursor = QTextCursor(win._browser.document())
+            cursor.setPosition(at)
+            cursor.setPosition(at + len(fragment), QTextCursor.MoveMode.KeepAnchor)
+            win._browser.setTextCursor(cursor)
+            for _ in range(2):
+                app.processEvents()
+
+        # the real Windows clipboard is contended (a clipboard manager holds it
+        # open, COM 0x800401d0), so the copy results are captured instead
+        class _FakeClipboard:
+            def __init__(self):
+                self.texts = []
+
+            def setText(self, text, *_args):
+                self.texts.append(text)
+
+            def text(self, *_args):
+                return self.texts[-1] if self.texts else ""
+
+        fake_clip = _FakeClipboard()
+        original_clipboard = viewer_mod.QApplication.clipboard
+        viewer_mod.QApplication.clipboard = staticmethod(lambda: fake_clip)
+        try:
+            _select("bold text and a link.")
+            check("copy strip appears on a preview selection",
+                  win._copy_popup.isVisible(), True)
+            check("strip is a child of the document view",
+                  win._copy_popup.parent() is win._current_view(), True)
+            check("plain copy is the rendered text",
+                  win._plain_selection(), "bold text and a link.")
+            md, stale = win._md_selection()
+            check("md copy restores the markup", md, "**bold** text and a [link](target.md)")
+            check("a fresh render is not stale", stale, False)
+            check("button mirrors the live state", win._copy_md_btn.property("stale"), False)
+            check("strip stays inside the view",
+                  win.rect().contains(win._copy_popup.geometry()), True)
+
+            # scrolling keeps the strip with its selection (or hides it when the
+            # selection leaves the viewport, and brings it back on return)
+            was = win._copy_popup.pos()
+            win._browser.verticalScrollBar().setValue(120)
+            app.processEvents()
+            check("scrolling moves or hides the strip",
+                  win._copy_popup.pos() != was or not win._copy_popup.isVisible(), True)
+            check("strip never leaves the view",
+                  not win._copy_popup.isVisible()
+                  or win.rect().contains(win._copy_popup.geometry()), True)
+            win._browser.verticalScrollBar().setValue(0)
+            app.processEvents()
+            check("scrolling back brings the strip back", win._copy_popup.isVisible(), True)
+
+            win._copy_selection_plain()
+            check("plain button copies the visible text",
+                  fake_clip.texts[-1], "bold text and a link.")
+            win._copy_selection_md()
+            check("md button copies the markup",
+                  fake_clip.texts[-1], "**bold** text and a [link](target.md)")
+
+            # markers of the enclosing constructs come along
+            _select("item one")
+            md, stale = win._md_selection()
+            check("md copy includes the list marker", md, "- item one")
+            check("list item is not stale either", stale, False)
+            _select("Title")
+            md, _ = win._md_selection()
+            check("md copy includes the heading marker", md, "# Title")
+
+            # an empty selection hides the strip again
+            cursor = QTextCursor(win._browser.document())
+            cursor.setPosition(0)
+            win._browser.setTextCursor(cursor)
+            app.processEvents()
+            check("clearing the selection hides the strip",
+                  win._copy_popup.isVisible(), False)
+
+            # --- the selection outlives its source: copy from the render cache
+            _select("bold text and a link.")
+            win._enter_edit()
+            for _ in range(3):
+                app.processEvents()
+            check("entering edit hides the strip", win._copy_popup.isVisible(), False)
+            win._editor.setPlainText("# Title\r\n\r\nCompletely different text.\r\n")
+            for _ in range(2):
+                app.processEvents()
+            md, stale = win._md_selection()
+            check("deleted block still copies from the cache",
+                  md, "**bold** text and a [link](target.md)")
+            check("the missing block is flagged stale", stale, True)
+            win._refresh_copy_popup_state()
+            check("the md button shows the deleted state",
+                  win._copy_md_btn.text(), "с md (удалено)")
+            check("the stale state reaches the button property",
+                  win._copy_md_btn.property("stale"), True)
+            win._copy_selection_md()
+            check("stale copy still puts the markdown on the clipboard",
+                  fake_clip.texts[-1], "**bold** text and a [link](target.md)")
+
+            # ...while a block that is still in the source stays live
+            win._editor.setPlainText(
+                "# Title\r\n\r\nSome **bold** text and a [link](target.md).\r\n\r\n- new\r\n"
+            )
+            for _ in range(2):
+                app.processEvents()
+            md, stale = win._md_selection()
+            check("a surviving block is not stale", stale, False)
+        finally:
+            viewer_mod.QApplication.clipboard = original_clipboard
+
+        win._confirm_discard = lambda: True
+        win._leave_edit()
+        win.close()
+        app.processEvents()
+
     # --- window geometry: left edge pinned (A) and ratio-based split (B)
     with tempfile.TemporaryDirectory() as folder:
         path = Path(folder) / "geo.md"

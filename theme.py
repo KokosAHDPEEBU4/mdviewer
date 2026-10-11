@@ -655,6 +655,26 @@ QListWidget#outline::item:selected {{
 #replaceRow QLineEdit {{ background-color: {SURFACE}; }}
 #replaceRow QPushButton {{ padding: 3px 10px; font-size: 12px; }}
 
+/* The copy strip that follows a preview selection. [stale] marks markdown
+   that no longer exists in the editable source: it is copied from the
+   render-time cache and the button says so ("с md (удалено)"). */
+#copyPopup {{
+    background-color: {OVERLAY_BG};
+    border: 1px solid {BORDER};
+    border-radius: 6px;
+}}
+#copyPopup QToolButton {{
+    color: {TEXT_HEAD};
+    background-color: transparent;
+    border: none;
+    border-radius: 4px;
+    padding: 3px 8px;
+    font-size: 12px;
+}}
+#copyPopup QToolButton:hover {{ background-color: {SURFACE_2}; }}
+#copyPopup QToolButton[stale="true"] {{ color: {TEXT_MUTED}; font-style: italic; }}
+#copyPopup QToolButton[stale="true"]:hover {{ color: {TEXT}; }}
+
 #editorPanel QToolButton {{
     color: {TEXT};
     background-color: {SURFACE};

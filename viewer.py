@@ -525,6 +525,7 @@ class DocumentView(QWidget):
     WHEEL_STEP = 40.0       # accumulated wheel units that make one zoom level
     CRUMB_LABEL_MAX = 40    # characters of a heading before the crumb is truncated
     CRUMB_SEGMENT_MAX = 4   # most crumbs shown; deeper paths collapse to "…"
+    COPY_FLASH_MS = 800     # how long the "Скопировано" state stays on the button
 
     # `state_changed` fires whenever the dirty state may have moved (the tab
     # label and the window title follow it); `link_requested` asks the host
@@ -657,7 +658,10 @@ class DocumentView(QWidget):
         self._browser.viewport().setMouseTracking(True)  # autoscroll follows the pointer
         self._browser.verticalScrollBar().valueChanged.connect(self._sync_outline)
         self._browser.verticalScrollBar().valueChanged.connect(self._sync_crumbs)
+        # the copy strip follows the selection and has to survive scrolls
+        self._browser.verticalScrollBar().valueChanged.connect(self._reposition_copy_popup)
         self._browser.selectionChanged.connect(self._highlight_editor_from_preview)
+        self._browser.selectionChanged.connect(self._update_copy_popup)
         self._preview_base_font = QFont(self._browser.document().defaultFont())
 
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -708,6 +712,12 @@ class DocumentView(QWidget):
         self._toc_btn = None
         self._overlay = None
         self._find_bar = None
+        # the copy strip that follows a preview selection (built on first use)
+        self._copy_popup = None
+        self._copy_plain_btn = None
+        self._copy_md_btn = None
+        self._copy_stale = False
+        self._copy_offscreen = False  # hidden because the selection left the view
 
         self.load()
         QTimer.singleShot(0, self._set_margins)
@@ -741,6 +751,7 @@ class DocumentView(QWidget):
         # setHtml rebuilds the document, so any stored highlight cursor would
         # dangle; drop the layers first
         self._clear_highlights()
+        self._hide_copy_popup()  # the selection the strip refers to is gone
         self._rendered = _normalized(text)
         # the stylesheet has to be in place before the HTML: Qt matches CSS while
         # importing, not afterwards
@@ -1299,6 +1310,7 @@ class DocumentView(QWidget):
                 self._toc_auto_hidden = False
             if self._overlay is not None:
                 self._overlay.setVisible(False)
+            self._hide_copy_popup()  # reading mode shows text, no chrome
             self._relayout()
         elif self._reading_toc_saved is not None:
             self._toc_user_visible = self._reading_toc_saved
@@ -1545,6 +1557,7 @@ class DocumentView(QWidget):
         # drop any pending pair scroll from a previous Alt+wheel gesture
         self._sync_timer.stop()
         self._sync_source = None
+        self._hide_copy_popup()  # the panes are about to move under it
         # the preview column shrinks a little when the editor opens (the window
         # may be capped by the screen), which rewraps the whole document; pin the
         # character at the top so the reader is not thrown to another section
@@ -2049,6 +2062,287 @@ class DocumentView(QWidget):
         """Whitespace is collapsed on the HTML side, so collapse both sides."""
         return re.sub(r"\s+", " ", text.replace("\u2029", " ")).strip()
 
+    # -- copy strip over a preview selection ------------------------------
+
+    _MD_EDGE_MARKS = "*_`"
+
+    def _ensure_copy_popup(self) -> None:
+        """Build the small copy strip on first need.
+
+        The buttons take no focus and the panel shows without activating the
+        window, so clicking them never disturbs the selection they act on.
+        """
+        if self._copy_popup is not None:
+            return
+        panel = QWidget(self)
+        panel.setObjectName("copyPopup")
+        panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        panel.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        row = QHBoxLayout(panel)
+        row.setContentsMargins(6, 3, 6, 3)
+        row.setSpacing(2)
+        self._copy_plain_btn = QToolButton()
+        self._copy_plain_btn.setText("без md")
+        self._copy_plain_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._copy_plain_btn.clicked.connect(self._copy_selection_plain)
+        self._copy_md_btn = QToolButton()
+        self._copy_md_btn.setText("с md")
+        self._copy_md_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._copy_md_btn.clicked.connect(self._copy_selection_md)
+        for widget in (self._copy_plain_btn, self._copy_md_btn):
+            row.addWidget(widget)
+        panel.setVisible(False)
+        self._copy_popup = panel
+
+    def _update_copy_popup(self, *_args) -> None:
+        """Show or hide the copy strip for the current preview selection.
+
+        While the left button is held the strip would only chase the pointer,
+        so it waits for the release (the eventFilter calls this again on
+        `MouseButtonRelease`). A selection made from the search bar is
+        navigation, not a copy request: while the find field holds focus the
+        strip stays away.
+        """
+        cursor = self._browser.textCursor()
+        selected = cursor.hasSelection() and bool(cursor.selectedText().strip())
+        if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+            self._hide_copy_popup()
+            return
+        find_edit = getattr(self, "_find_edit", None)
+        if (
+            not selected
+            or self._reading_mode
+            or (find_edit is not None and find_edit.hasFocus())
+        ):
+            self._hide_copy_popup()
+            return
+        self._ensure_copy_popup()
+        self._refresh_copy_popup_state()
+        if self._place_copy_popup():
+            self._copy_popup.setVisible(True)
+            self._copy_popup.raise_()
+
+    def _hide_copy_popup(self) -> None:
+        """Drop the strip and reset the button labels (the flash overwrote them)."""
+        self._copy_offscreen = False
+        popup = self._copy_popup
+        if popup is not None and popup.isVisible():
+            popup.setVisible(False)
+        if self._copy_plain_btn is not None:
+            self._copy_plain_btn.setText("без md")
+        if self._copy_md_btn is not None:
+            self._copy_md_btn.setText("с md")
+
+    def _reposition_copy_popup(self, *_args) -> None:
+        """Keep the strip glued to its selection while the preview scrolls.
+
+        The strip only resurrects by itself when it was hidden *because the
+        selection scrolled out of view* (`_copy_offscreen`); hidden on
+        purpose (edit-mode entry, re-render, reading mode) it stays away
+        until the next selection.
+        """
+        popup = self._copy_popup
+        if popup is None:
+            return
+        if popup.isVisible():
+            self._place_copy_popup()  # hides itself when the selection left the view
+        elif (
+            self._copy_offscreen
+            and self._browser.textCursor().hasSelection()
+            and not QApplication.mouseButtons() & Qt.MouseButton.LeftButton
+        ):
+            self._update_copy_popup()  # scrolled back into view: bring it out again
+
+    def _place_copy_popup(self) -> bool:
+        """Park the strip just under the selection's end, above it when tight.
+
+        The end (not the anchor) is where the eye finishes selecting, like the
+        browser copy affordance. When that line has scrolled out of the
+        viewport the strip is hidden instead of floating over unrelated text;
+        the return value says whether it is on screen.
+        """
+        popup = self._copy_popup
+        if popup is None:
+            return False
+        document = self._browser.document()
+        cursor = self._browser.textCursor()
+        end = QTextCursor(document)
+        end.setPosition(cursor.selectionEnd())
+        end_rect = self._browser.cursorRect(end)
+        view = self._browser.viewport().rect()
+        if not view.intersects(end_rect):
+            self._copy_offscreen = True
+            popup.setVisible(False)
+            return False
+        self._copy_offscreen = False
+        anchor = self._browser.viewport().mapTo(self, end_rect.bottomLeft())
+        size = popup.sizeHint()
+        popup.resize(size)
+        # right edge just past the selection's end, one line below it — the
+        # browser copy affordance spot; it clamps into the view on either side
+        x = max(4, min(anchor.x() + 8 - size.width(), self.width() - size.width() - 4))
+        y = anchor.y() + 4
+        if y + size.height() > self.height() - 4:
+            start = QTextCursor(document)
+            start.setPosition(cursor.selectionStart())
+            top = self._browser.viewport().mapTo(
+                self, self._browser.cursorRect(start).topLeft()
+            )
+            y = max(
+                4, min(top.y() - 4 - size.height(), self.height() - size.height() - 4)
+            )
+        popup.move(x, y)
+        return True
+
+    def _refresh_copy_popup_state(self) -> None:
+        """Flag the md button when the selection is gone from the editable text."""
+        _md, stale = self._md_selection()
+        self._copy_stale = stale
+        self._copy_plain_btn.setText("без md")  # undo a previous "Скопировано"
+        self._copy_md_btn.setText("с md (удалено)" if stale else "с md")
+        self._copy_md_btn.setProperty("stale", stale)
+        # dynamic properties need a re-polish before QSS picks them up
+        self._copy_md_btn.style().unpolish(self._copy_md_btn)
+        self._copy_md_btn.style().polish(self._copy_md_btn)
+
+    def _copy_selection_plain(self, _checked: bool = False) -> None:
+        """«без md»: the text exactly as the preview shows it."""
+        text = self._plain_selection()
+        if not text:
+            self._hide_copy_popup()
+            return
+        QApplication.clipboard().setText(text)
+        self._copy_done(self._copy_plain_btn, "Скопировано")
+
+    def _copy_selection_md(self, _checked: bool = False) -> None:
+        """«с md»: the markdown that produced the selected render text."""
+        md, stale = self._md_selection()
+        if not md:
+            self._hide_copy_popup()
+            return
+        QApplication.clipboard().setText(md)
+        self._copy_done(
+            self._copy_md_btn, "Скопировано (из кеша)" if stale else "Скопировано"
+        )
+
+    def _copy_done(self, button, label: str) -> None:
+        """Flash the confirmation, then let the strip disappear on its own."""
+        cursor = self._browser.textCursor()
+        span = (cursor.selectionStart(), cursor.selectionEnd())
+        button.setText(label)
+        self._copy_popup.adjustSize()
+        QTimer.singleShot(self.COPY_FLASH_MS, lambda: self._copy_flash_done(span))
+
+    def _copy_flash_done(self, span) -> None:
+        """Hide after the flash — unless a *new* selection has taken the strip."""
+        cursor = self._browser.textCursor()
+        if (cursor.selectionStart(), cursor.selectionEnd()) == span:
+            self._hide_copy_popup()
+
+    def _plain_selection(self) -> str:
+        """Selected preview text as plain lines; images contribute nothing."""
+        text = self._browser.textCursor().selectedText()
+        return text.replace("\u2029", "\n").replace("\uFFFC", "").strip("\n")
+
+    def _md_selection(self) -> tuple[str, bool]:
+        """Markdown behind the preview selection, and whether it is still editable.
+
+        The range is projected through the position map onto `_map_source` —
+        the exact text this render was built from — so the copy matches what
+        is on screen even while the editor holds an un-converted draft
+        (invariant 12; the map is built from the render, so `_map_dirty`
+        does not invalidate it). The flag is True when that text no longer
+        exists in the editable source (deleted or replaced without a
+        re-render): the copy still works, from the render-time cache, and
+        the button shows the "удалено" state.
+        """
+        cursor = self._browser.textCursor()
+        if not cursor.hasSelection():
+            return "", False
+        source = self._map_source or ""
+        source_map = self._ensure_map()
+        span = source_map.to_source(cursor.selectionStart(), cursor.selectionEnd()) \
+            if source_map is not None else None
+        if span is None:
+            span = self._find_source_span()
+        if span is None:
+            # no alignment at all (raw HTML): the visible text is the best md
+            return self._plain_selection(), False
+        start, end = self._md_span_absorbed(source, span[0], span[1])
+        md = source[start:end].strip("\n")
+        return md, not self._md_still_editable(md)
+
+    def _find_source_span(self):
+        """Word-pattern fallback when the map cannot follow the render."""
+        needle = self._collapse(self._browser.textCursor().selectedText())
+        pattern = self._match_pattern(needle)
+        if pattern is None or not self._map_source:
+            return None
+        match = pattern.match(self._map_source)
+        if match.hasMatch():
+            return match.capturedStart(), match.capturedEnd()
+        return None
+
+    def _md_still_editable(self, md: str) -> bool:
+        """Is the copied markdown still part of the text the user can edit?
+
+        The editor (while editing) or the file on disk is the editable truth;
+        the render can lag behind it by an un-converted draft. The comparison
+        ignores markup (`_plain_key`), so the block survives only while its
+        visible text is still there word for word.
+        """
+        current = (
+            self._editor.toPlainText()
+            if self._editing() and self._editor is not None
+            else self._text
+        )
+        current = _normalized(current)
+        if not self._map_dirty and current == self._map_source:
+            return True  # nothing changed since this render: no search needed
+        key = self._plain_key(md)
+        target = self._plain_key(current)
+        if key:
+            return key in target
+        return md.strip() in current
+
+    @staticmethod
+    def _md_span_absorbed(source: str, start: int, end: int) -> tuple[int, int]:
+        """Widen a mapped span so it carries whole markdown constructs.
+
+        The render drops markup, so a projected range lands *inside* the
+        markers: a selection starting at the first letter of bold text maps
+        after the opening `**`, and one covering a link's label ends before
+        its `](target)` tail. Emphasis/code runs touching either edge, a
+        surrounding `[label](target)` shell, and the line prefix the span
+        begins right after (heading, quote, list marker) are pulled in, so
+        «с md» copies markdown as it was written.
+        """
+        marks = DocumentView._MD_EDGE_MARKS
+        while start > 0 and source[start - 1] in marks:
+            start -= 1
+        while end < len(source) and source[end] in marks:
+            end += 1
+        if start > 0 and source[start - 1] == "[":
+            # a selection inside a link's label takes the whole link
+            close = source.find("]", end)
+            if close != -1 and source[close + 1 : close + 2] == "(":
+                tail = source.find(")", close + 2)
+                if tail != -1:
+                    start -= 1
+                    end = tail + 1
+        if end < len(source) and source[end] == "]" and source[end + 1 : end + 2] == "(":
+            # ...and a label-only selection takes the "] (target)" tail as well
+            tail = source.find(")", end + 2)
+            if tail != -1:
+                end = tail + 1
+        line_start = source.rfind("\n", 0, start) + 1
+        prefix = re.match(
+            r"(?:#{1,6}\s+|>\s*|[-*+]\s+|\d+[.)]\s+)", source[line_start:start]
+        )
+        if prefix is not None and prefix.end() == start - line_start:
+            start = line_start
+        return start, end
+
     def _resize_for_edit(self) -> None:
         """Grow the window for the editor without moving the left edge (A).
 
@@ -2118,6 +2412,7 @@ class DocumentView(QWidget):
         self._ensure_overlay()
         self._sync_timer.stop()
         self._sync_source = None
+        self._hide_copy_popup()  # the panes are about to move under it
         self._preview_anchor = None  # entering-edit pin must not outlive the edit
         self._edit_mode = False
         self._panel.setVisible(False)
@@ -2684,6 +2979,13 @@ class DocumentView(QWidget):
             elif etype == QEvent.Type.MouseMove and self._autoscroll_pane is pane:
                 self._move_autoscroll(event.position().toPoint())
                 return True
+            elif (
+                etype == QEvent.Type.MouseButtonRelease
+                and pane is self._browser
+                and event.button() == Qt.MouseButton.LeftButton
+            ):
+                # the drag-select is over: the copy strip can come out now
+                self._update_copy_popup()
         elif pane is self._toc and etype == QEvent.Type.Wheel:
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                 self._wheel_zoom(self._toc, event)
