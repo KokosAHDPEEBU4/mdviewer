@@ -531,6 +531,7 @@ class DocumentView(QWidget):
     WHEEL_STEP = 40.0       # accumulated wheel units that make one zoom level
     CRUMB_LABEL_MAX = 40    # characters of a heading before the crumb is truncated
     CRUMB_SEGMENT_MAX = 4   # most crumbs shown; deeper paths collapse to "…"
+    PATH_FOLDER_MAX = 240   # characters of the folder in the path strip before "…"
     COPY_FLASH_MS = 800     # how long the "Скопировано" state stays on the button
 
     # `state_changed` fires whenever the dirty state may have moved (the tab
@@ -678,24 +679,45 @@ class DocumentView(QWidget):
         # while the preview is being assembled, and `_pane_for` reads `_toc`.
         self._splitter.addWidget(self._build_outline())
 
-        # Breadcrumbs live in a thin strip above the preview. The browser is
-        # wrapped (not replaced): every `self._browser` lookup keeps working, and
-        # the splitter still owns three children (outline / preview / editor).
+        # Breadcrumbs and the file path share one thin strip above the preview.
+        # The browser is wrapped (not replaced): every `self._browser` lookup
+        # keeps working, and the splitter still owns three children (outline /
+        # preview / editor).
         self._preview_panel = QWidget()
         preview_layout = QVBoxLayout(self._preview_panel)
         preview_layout.setContentsMargins(0, 0, 0, 0)
         preview_layout.setSpacing(0)
+        self._path_strip = QWidget()
+        self._path_strip.setObjectName("pathStrip")
+        strip_layout = QHBoxLayout(self._path_strip)
+        strip_layout.setContentsMargins(0, 0, 0, 0)
+        strip_layout.setSpacing(0)
         self._crumbs = QLabel()
         self._crumbs.setObjectName("breadcrumbs")
         self._crumbs.setTextFormat(Qt.TextFormat.RichText)
         self._crumbs.setOpenExternalLinks(False)
         self._crumbs.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
-        # a long path must never widen the preview pane: the label is a strip
-        self._crumbs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        # the crumbs fill the strip left of the path; the strip must never
+        # widen the preview pane
+        self._crumbs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._crumbs.setWordWrap(False)
         self._crumbs.linkActivated.connect(self._crumb_clicked)
         self._crumbs.setVisible(False)
-        preview_layout.addWidget(self._crumbs)
+        strip_layout.addWidget(self._crumbs)
+        # the path itself: click anywhere on it -> Explorer in the file's folder
+        self._path_label = QLabel()
+        self._path_label.setObjectName("pathBar")
+        self._path_label.setTextFormat(Qt.TextFormat.RichText)
+        self._path_label.setOpenExternalLinks(False)
+        self._path_label.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        self._path_label.setWordWrap(False)
+        self._path_label.linkActivated.connect(self._reveal_folder)
+        self._path_label.setVisible(False)
+        strip_layout.addWidget(
+            self._path_label, 0,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        )
+        preview_layout.addWidget(self._path_strip)
         preview_layout.addWidget(self._browser, 1)
         self._splitter.addWidget(self._preview_panel)
         self._splitter.setStretchFactor(0, 0)
@@ -747,6 +769,7 @@ class DocumentView(QWidget):
             self._editor.document().setModified(False)
             self._map_dirty = False  # matches the render that just happened
         self._update_state()
+        self._update_path_bar()  # the strip shows the file just loaded
         self._watch_current()  # the watch follows the file that is now shown
         self._maybe_restore_draft()  # offer back a crash-safe draft, if any
         return True
@@ -1302,6 +1325,42 @@ class DocumentView(QWidget):
         separator = f'<span style="color:{muted}"> › </span>'
         self._crumbs.setText(separator.join(parts))
         self._crumbs.setVisible(True)
+
+    # -- file path strip ----------------------------------------------------
+
+    def _update_path_bar(self) -> None:
+        """Show the loaded file's path above the preview, folder + file name.
+
+        The whole strip is one link: a click opens the containing folder in
+        the system file manager (the tab-menu action does the same). The
+        folder side is truncated from the left, so a deeply nested file
+        cannot push the strip wider than the pane.
+        """
+        if self._path_label is None:
+            return
+        p = self._pal()
+        muted, accent = p["TEXT_MUTED"], p["ACCENT"]
+        folder = self._short_folder(str(self._path.parent))
+        self._path_label.setText(
+            f'<a href="folder" style="color:{muted}; text-decoration:none">'
+            f"{escape(folder)}\\</a>"
+            f'<a href="folder" style="color:{accent}; text-decoration:none">'
+            f"{escape(self._path.name)}</a>"
+        )
+        self._path_label.setToolTip(str(self._path))
+        self._path_label.setVisible(True)
+
+    @classmethod
+    def _short_folder(cls, folder: str) -> str:
+        """Folder path clipped from the left once it exceeds `PATH_FOLDER_MAX`."""
+        text = folder.rstrip("\\/")
+        if len(text) > cls.PATH_FOLDER_MAX:
+            text = "…" + text[-(cls.PATH_FOLDER_MAX - 1):]
+        return text
+
+    def _reveal_folder(self, _href: str = "") -> None:
+        """Open the containing folder in the file manager (local paths only)."""
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._path.parent)))
 
     # -- reading mode (driven by the host window's F11) --------------------
 

@@ -701,14 +701,26 @@ QLineEdit#tocFilter {{
 }}
 QLineEdit#tocFilter:focus {{ border-bottom: 1px solid {ACCENT_DIM}; }}
 
-/* Breadcrumb strip above the preview: the heading path of the current section.
-   Ancestor segments are links (inline colour), the last one is the accent. */
-QLabel#breadcrumbs {{
+/* The strip above the preview: heading crumbs on the left, the file's own
+   path on the right (a click opens the containing folder). The strip owns the
+   background and the bottom border so both halves read as one bar. */
+QWidget#pathStrip {{
     background-color: {BG};
+    border-bottom: 1px solid {BORDER};
+}}
+QLabel#breadcrumbs {{
+    background-color: transparent;
     color: {TEXT_MUTED};
     font-size: 11px;
-    padding: 4px 12px;
-    border-bottom: 1px solid {BORDER};
+    padding: 4px 0 4px 12px;
+    border: none;
+}}
+QLabel#pathBar {{
+    background-color: transparent;
+    color: {TEXT_MUTED};
+    font-size: 11px;
+    padding: 4px 12px 4px 0;
+    border: none;
 }}
 """
 

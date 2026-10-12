@@ -1640,6 +1640,56 @@ def main() -> int:
         win.close()
         app.processEvents()
 
+    # --- path strip: the file's path above the preview opens its folder
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "strip.md"
+        path.write_text("# T\n\ntext\n", encoding="utf-8")
+        win = viewer_mod.Viewer(path, QSettings(tempfile.mkdtemp(), "path_check"))
+        win.resize(1000, 700)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+
+        check("path strip shows the file name",
+              win._path.name in win._path_label.text(), True)
+        check("path strip shows the folder",
+              str(win._path.parent) in win._path_label.text(), True)
+        check("the path strip is visible", win._path_label.isVisible(), True)
+        check("the path lives in the strip above the preview",
+              win._path_label.parent() is win._path_strip, True)
+
+        opened = []
+        original_open = viewer_mod.QDesktopServices.openUrl
+        viewer_mod.QDesktopServices.openUrl = lambda url: opened.append(url.toString())
+        try:
+            win._path_label.linkActivated.emit("folder")
+            opened_path = Path(opened[-1].replace("file:///", "")) if opened else None
+            check("clicking the path opens the containing folder",
+                  opened_path is not None
+                  and opened_path.resolve() == win._path.parent.resolve(), True)
+        finally:
+            viewer_mod.QDesktopServices.openUrl = original_open
+
+        # navigation refreshes the strip
+        other = Path(folder) / "other.md"
+        other.write_text("# O\n\nmore\n", encoding="utf-8")
+        win._load_path(other)
+        for _ in range(3):
+            app.processEvents()
+        check("the strip follows navigation",
+              "other.md" in win._path_label.text()
+              and "strip.md" not in win._path_label.text(), True)
+        win.close()
+        app.processEvents()
+
+    # a deep folder collapses from the left, its tail survives
+    long_folder = "C:\\root" + "\\sub" * 200
+    short = viewer_mod.DocumentView._short_folder(long_folder)
+    check("a long folder collapses from the left",
+          short.startswith("…")
+          and len(short) <= viewer_mod.DocumentView.PATH_FOLDER_MAX, True)
+    check("the folder tail survives the clip", short.endswith("sub"), True)
+
     # --- window geometry: left edge pinned (A) and ratio-based split (B)
     with tempfile.TemporaryDirectory() as folder:
         path = Path(folder) / "geo.md"

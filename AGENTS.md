@@ -17,7 +17,8 @@ drafts.py       черновики несохранённых правок в к
                 (`state_dir()/drafts`): save/load/clear/pending, sha1-имя,
                 JSON с путём/текстом/временем
 viewer.py       DocumentView(QWidget) — содержимое одного файла: превью
-                (контейнер «крошки + QTextBrowser») + оглавление с фильтром +
+                (контейнер «крошки + путь + QTextBrowser») + оглавление с
+                фильтром +
                 QPlainTextEdit, оверлей, поиск (Ctrl+F) и замена (Ctrl+H),
                 синхронизация прокрутки редактор ↔ превью, подсветка, zoom,
                 история, QSettings, dirty-state, режим чтения, экспорт активной
@@ -444,18 +445,25 @@ build.bat                                       # сборка dist\MDViewer
       не пишется — режим временный. В правке (`_editing()`) оглавление и панель
       редактора **не двигаются**: `_set_reading_mode` трогает `_toc_*` только
       вне правки (раскладка по инварианту 25 не ломается).
-    - **Крошки** — `QLabel#breadcrumbs` над `_browser`, а сам браузер обёрнут в
-      `_preview_panel` (`QVBoxLayout`: крошки + браузер). В сплиттер добавлен
-      контейнер, а не браузер, поэтому детей по-прежнему три (оглавление /
-      превью-контейнер / редактор) и все ссылки на `self._browser`
-      (`_pane_for`, `_set_margins`, `_place_overlay`, eventFilter на viewport)
-      работают. Путь собирается `_crumb_path` из `self._outline` по
+    - **Крошки и путь файла** — одна полоса `#pathStrip` (`QWidget`) над
+      `_browser`, а сам браузер обёрнут в `_preview_panel` (`QVBoxLayout`:
+      полоса + браузер). В сплиттер добавлен контейнер, а не браузер, поэтому
+      детей по-прежнему три (оглавление / превью-контейнер / редактор) и все
+      ссылки на `self._browser` (`_pane_for`, `_set_margins`, `_place_overlay`,
+      eventFilter на viewport) работают. Слева крошки (`QLabel#breadcrumbs`,
+      Expanding): путь собирается `_crumb_path` из `self._outline` по
       `_current_section_index()` (предки — ближайшие заголовки со **строго**
       меньшим `level`), сегменты — `<a href="{row}">` (индекс строки, не текст!)
       и разделитель `›`, HTML экранируется, длинные обрезаются
-      (`CRUMB_LABEL_MAX`/`CRUMB_SEGMENT_MAX`). Клик — `_crumb_clicked` →
-      `_outline_clicked`. Строка видна только при ≥2 сегментах. Обновляется из
-      того же `valueChanged`, что и оглавление, **отдельным** `_sync_crumbs`
+      (`CRUMB_LABEL_MAX`/`CRUMB_SEGMENT_MAX`); клик — `_crumb_clicked` →
+      `_outline_clicked`; видны только при ≥2 сегментах. Справа путь файла
+      (`QLabel#pathBar`, AlignRight): папка приглушённым, имя акцентом, клик —
+      `_reveal_folder` (`QDesktopServices`, инвариант 5), длинная папка
+      обрезается слева (`PATH_FOLDER_MAX`/`_short_folder`), тултип — полный
+      путь; обновление — `_update_path_bar` из `load()` (навигация и F5
+      обновляют полосу). Фон и нижняя граница — у `#pathStrip`, обе подписи
+      прозрачные (QSS в `app_qss`, токены обеих палитр). Крошки обновляются
+      из того же `valueChanged`, что и оглавление, **отдельным** `_sync_crumbs`
       (в `_sync_outline` нельзя: он рано выходит при скрытом оглавлении), а
       также после `_render`, `_outline_clicked` и `_set_zoom`.
     - **Фильтр оглавления** — `QLineEdit#tocFilter` над `_toc` в `_build_outline`;
