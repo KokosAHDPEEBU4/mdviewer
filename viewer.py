@@ -8,6 +8,7 @@ from the edited text, "Сохранить" writes the file and refreshes the pre
 
 from pathlib import Path
 from html import escape
+from typing import TYPE_CHECKING
 import ctypes
 import re
 import sys
@@ -74,7 +75,9 @@ from PyQt6.QtWidgets import (
 
 import drafts
 
-from renderer import Heading, render_with_outline
+# mistune (+ its plugins) costs ~70 ms to import; the renderer module is loaded
+# on the first render instead, so the window chrome appears that much earlier
+# (invariant 36: no heavy imports on the path to the first frame)
 from syncsel import SourceMap
 from theme import (
     ACCENT,
@@ -109,6 +112,9 @@ from theme import (
     side_margin,
 )
 from version import APP_NAME, APP_VERSION
+
+if TYPE_CHECKING:
+    from renderer import Heading
 
 def read_document(path: Path) -> tuple[str, str, str]:
     """Read a markdown file, guessing the encoding (never fails on content).
@@ -748,6 +754,8 @@ class DocumentView(QWidget):
     def _render(self, text: str) -> None:
         """Re-render the preview. Called only on load/convert/save, never on
         resize (that would cost hundreds of milliseconds per step)."""
+        from renderer import render_with_outline  # lazy: mistune import cost
+
         # setHtml rebuilds the document, so any stored highlight cursor would
         # dangle; drop the layers first
         self._clear_highlights()
@@ -795,6 +803,8 @@ class DocumentView(QWidget):
         is read from the network.
         """
         source = self._map_source if self._map_source is not None else self._text
+        from renderer import render_with_outline  # lazy: mistune import cost
+
         body, _ = render_with_outline(source, self._path.parent)
         body = retheme_tables(body, self._theme)
         page = _standalone_html(self._path.name, body, self._theme)

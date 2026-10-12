@@ -79,8 +79,12 @@ def _run_owner(handle, files, force_restore: bool) -> int:
 
     paths = [path for path in files if path.is_file()]
     if paths:
-        window._open_paths(paths)
+        # Chrome first, content a beat later: an empty window paints fast, while
+        # the first tab carries the document layout (hundreds of ms on a code-
+        # heavy file). Showing before `_open_paths` puts a window on screen that
+        # much earlier instead of a blank desktop.
         window.show()
+        window._open_paths(paths)
         return app.exec()
     if files:
         return 0  # CLI paths were given, but none of them is a file

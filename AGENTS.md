@@ -635,11 +635,17 @@ build.bat                                       # сборка dist\MDViewer
     (импорты внутри функций). Второй запуск (двойной клик по `.md`) пишет запрос
     в очередь и выходит, **не загружая Qt** (~0.1 с вместо ~1 с). `PyQt6.
     QtPrintSupport` импортируется только в `DocumentView.export_pdf`.
-    `theme.APP_QSS` строится лениво через модульный `__getattr__` (обычная точка
-    входа — `app_qss(theme)`); `content_css` — функция. Не возвращать тяжёлые
-    импорты на верх `main.py`/`viewer.py`. `instance.RequestWatcher` заменён на
-    `instance.make_watcher(callback)` (Qt импортируется внутри). Поллинг очереди —
-    `POLL_MS` = 150.
+    **`renderer`/mistune (~70 мс импорта) тоже ленивый** — импорт стоит в
+    `DocumentView._render`/`export_html`, а `Heading` остаётся только в
+    `TYPE_CHECKING`-аннотации. `theme.APP_QSS` строится лениво через модульный
+    `__getattr__` (обычная точка входа — `app_qss(theme)`); `content_css` —
+    функция. Не возвращать тяжёлые импорты на верх `main.py`/`viewer.py`.
+    `instance.RequestWatcher` заменён на `instance.make_watcher(callback)`
+    (Qt импортируется внутри). Поллинг очереди — `POLL_MS` = 150.
+    **Chrome-first (2.8.1):** при CLI-путях `_run_owner` показывает пустое окно
+    **до** `_open_paths` — рамка/вкладки рисуются на ~350 мс, а вёрстка
+    документа (сотни мс у код-тяжёлых файлов, она же `show()`-фаза) приходит
+    на долю секунды позже; порядок «диалог → отмена» без окна не менялся.
 
 37. **Панель копирования следует за выделением в превью.** Ленивый дочерний
     виджет DocumentView `_copy_popup` (`WA_ShowWithoutActivating`, кнопки
