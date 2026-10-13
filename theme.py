@@ -478,7 +478,9 @@ QTabBar::tab:hover:!selected {{
     color: {TEXT};
 }}
 QTabBar::close-button {{
-    subcontrol-position: right;
+    subcontrol-position: right center;
+    position: relative;
+    right: 5px;  /* the ✕ must not sit flush against the tab's right wall */
 }}
 /* The splitter handle is the pane divider: keep it wide enough to grab easily
    and light it up under the pointer so the movable edge is obvious. */
