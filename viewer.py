@@ -3958,6 +3958,7 @@ class MainWindow(QMainWindow):
         "_tree_reading_saved",
         "_tree_sized",
         "_tree_wanted",
+        "_tree_toggle",
     }
 
     def __init__(self, settings: QSettings | None = None):
@@ -3982,6 +3983,7 @@ class MainWindow(QMainWindow):
         object.__setattr__(self, "_tree_reading_saved", False)
         object.__setattr__(self, "_tree_sized", False)
         object.__setattr__(self, "_tree_wanted", False)
+        object.__setattr__(self, "_tree_toggle", None)
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         geometry = self._settings.value("geometry")
         if geometry:
@@ -3991,7 +3993,20 @@ class MainWindow(QMainWindow):
 
         tabs = QTabWidget(self)
         tabs.setDocumentMode(True)
-        tabs.setCornerWidget(None)  # no "+" button: tabs come only from files
+        # The left corner of the tab strip hosts the tree-panel toggle: window
+        # chrome sitting right where the panel appears, and it hides with the
+        # strip in reading mode exactly like the panel does (Q32). The right
+        # corner stays button-free: tabs come only from files.
+        tree_toggle = QToolButton()
+        tree_toggle.setObjectName("treeToggle")
+        tree_toggle.setText("📁")
+        tree_toggle.setCheckable(True)
+        tree_toggle.setToolTip("Панель файлов")  # no hotkeys in tooltips (invariant 18)
+        tree_toggle.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # clicking never
+        # moves focus out of the document
+        tree_toggle.clicked.connect(self._toggle_tree)
+        tabs.setCornerWidget(tree_toggle, Qt.Corner.TopLeftCorner)
+        object.__setattr__(self, "_tree_toggle", tree_toggle)
         bar = TabBar(tabs)
         bar._window = self
         tabs.setTabBar(bar)  # tear-off + cross-window drops live in TabBar
@@ -4391,6 +4406,18 @@ class MainWindow(QMainWindow):
         if sizes and sizes[0] > 0:
             self._settings.setValue("tree_width", max(TREE_MIN_WIDTH, sizes[0]))
 
+    def _sync_tree_toggle_button(self) -> None:
+        """Keep the corner button's check state on the panel's real visibility.
+
+        Every visibility change funnels through here, so the button reads the
+        same no matter which of the three toggles (button, hotkey, context
+        menu) moved the panel.
+        """
+        if self._tree_toggle is not None:
+            self._tree_toggle.setChecked(
+                self._tree_panel is not None and self._tree_panel.isVisible()
+            )
+
     def _toggle_tree(self) -> None:
         """Ctrl+Shift+E / «Панель файлов»: flip the panel's visibility.
 
@@ -4420,6 +4447,7 @@ class MainWindow(QMainWindow):
             self._apply_tree_sizes()
         else:
             self._unwatch_tree()
+        self._sync_tree_toggle_button()
 
     def _sync_tree_folder(self, force: bool = False) -> None:
         """Point the panel at the active tab's folder (Q23: it follows tabs).
@@ -4965,6 +4993,7 @@ class MainWindow(QMainWindow):
             self._tree_reading_saved = True
             self._tree_panel.setVisible(False)
             self._unwatch_tree()
+            self._sync_tree_toggle_button()
         view = self._current_view()
         self._reading_view = view
         if view is not None:
@@ -4982,6 +5011,7 @@ class MainWindow(QMainWindow):
             self._tree_panel.setVisible(True)
             self._sync_tree_folder(force=True)
             self._apply_tree_sizes()
+            self._sync_tree_toggle_button()
         view = self._reading_view if self._reading_view is not None else self._current_view()
         self._reading_view = None
         if view is not None:

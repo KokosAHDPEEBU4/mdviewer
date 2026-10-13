@@ -70,6 +70,24 @@ def main() -> int:
         for _ in range(4):
             app.processEvents()
         check("panel visible after toggle", win._tree_panel.isVisible(), True)
+
+        # --- the corner button in the tab strip mirrors and drives the panel
+        from PyQt6.QtWidgets import QToolButton
+
+        toggle_btn = win._tabs.cornerWidget(Qt.Corner.TopLeftCorner)
+        check("the tab strip hosts the toggle button",
+              isinstance(toggle_btn, QToolButton) and toggle_btn.isCheckable(), True)
+        check("the button reflects the panel state", toggle_btn.isChecked(), True)
+        win._toggle_tree()  # the hotkey path must update the button too
+        for _ in range(2):
+            app.processEvents()
+        check("the button follows a hotkey toggle",
+              (toggle_btn.isChecked(), win._tree_panel.isVisible()), (False, False))
+        toggle_btn.click()
+        for _ in range(2):
+            app.processEvents()
+        check("clicking the button shows the panel",
+              (toggle_btn.isChecked(), win._tree_panel.isVisible()), (True, True))
         check("panel at least its minimum width", win._tree_panel.width() >= TREE_MIN_WIDTH - 2, True)
         check("default width preference", win._tree_width_pref(), TREE_WIDTH)
         check("folder badge shows the folder",
