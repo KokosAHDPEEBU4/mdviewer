@@ -1602,6 +1602,37 @@ def main() -> int:
             check("plain copy of the mouse selection",
                   win._plain_selection(), "filler line")
 
+            # --- a drag begun in the EMPTY area right of the text anchors at
+            # the nearest line and selects (no "must grab a glyph" requirement)
+            doc = win._browser.document()
+            item_cur = QTextCursor(doc)
+            item_cur.setPosition(doc.toPlainText().index("item two"))
+            filler_cur = QTextCursor(doc)
+            filler_cur.setPosition(doc.toPlainText().index("filler line"))
+            anchor_y = win._browser.cursorRect(item_cur).center().y()
+            end_y = win._browser.cursorRect(filler_cur).center().y()
+            far_x = win._browser.viewport().width() - 12
+            vp = win._browser.viewport()
+            g_from = QPointF(vp.mapToGlobal(QPoint(far_x, int(anchor_y))))
+            g_to = QPointF(vp.mapToGlobal(QPoint(far_x, int(end_y))))
+            QApplication.sendEvent(vp, QMouseEvent(
+                QEvent.Type.MouseButtonPress, QPointF(far_x, anchor_y),
+                g_from, left, left, Qt.KeyboardModifier.NoModifier))
+            QApplication.sendEvent(vp, QMouseEvent(
+                QEvent.Type.MouseMove, QPointF(far_x, end_y),
+                g_to, left, left, Qt.KeyboardModifier.NoModifier))
+            QApplication.sendEvent(vp, QMouseEvent(
+                QEvent.Type.MouseButtonRelease, QPointF(far_x, end_y),
+                g_to, left, none, Qt.KeyboardModifier.NoModifier))
+            app.processEvents()
+            check("a drag from the empty area beside the text selects",
+                  win._browser.textCursor().hasSelection(), True)
+            rects = win._preview_line_rects()
+            column = vp.width()
+            check("touched lines highlight across the whole column",
+                  bool(rects)
+                  and all(r.right() >= column - 2 for r in rects), True)
+
             # --- the selection outlives its source: copy from the render cache
             _select("bold text and a link.")
             win._enter_edit()
@@ -1637,6 +1668,35 @@ def main() -> int:
 
         win._confirm_discard = lambda: True
         win._leave_edit()
+        win.close()
+        app.processEvents()
+
+    # --- full-line bars: an empty paragraph inside the span gets one too
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "empty.md"
+        path.write_text(
+            "# E\n\nfirst paragraph\n\n<br>\n\nsecond paragraph\n\n"
+            + "pad line\n\n" * 10,
+            encoding="utf-8",
+        )
+        win = viewer_mod.Viewer(path, QSettings(tempfile.mkdtemp(), "empty_bars"))
+        win.resize(1000, 700)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+        doc = win._browser.document()
+        plain = doc.toPlainText()
+        sel = QTextCursor(doc)
+        sel.setPosition(plain.index("first paragraph"))
+        sel.setPosition(plain.index("second paragraph") + len("second paragraph"),
+                        QTextCursor.MoveMode.KeepAnchor)
+        win._browser.setTextCursor(sel)
+        app.processEvents()
+        rects = win._preview_line_rects()
+        column = win._browser.viewport().width()
+        check("an empty paragraph in the span gets a full-width bar",
+              any(r.left() == 0 and r.width() >= column - 2 for r in rects)
+              and len(rects) >= 3, True)
         win.close()
         app.processEvents()
 
