@@ -25,6 +25,8 @@ anything that would need real inner padding (code blocks) is rendered as a
 single-cell table by `renderer.py`.
 """
 
+from pathlib import Path
+
 # --- palettes --------------------------------------------------------------
 # Every token a stylesheet below references must exist in *both* palettes, or
 # building that stylesheet raises KeyError.  Values are plain Qt colour strings
@@ -71,6 +73,11 @@ DARK = {
     "TABLE_ROW_B": "#242424",
     "SANS": '"Segoe UI Variable Text", "Segoe UI", Inter, Arial, sans-serif',
     "MONO": '"Cascadia Mono", "Cascadia Code", Consolas, "Courier New", monospace',
+    # Tab close-button images (non-colour tokens, like the font stacks): QSS
+    # cannot move the native button widget, so the right-edge gap is baked
+    # into the PNGs (tools/make_close_icons.py).
+    "CLOSE_TAB": "close_tab_dark.png",
+    "CLOSE_TAB_HOVER": "close_tab_dark_hover.png",
 }
 
 LIGHT = {
@@ -108,6 +115,8 @@ LIGHT = {
     "TABLE_ROW_B": "#ffffff",
     "SANS": DARK["SANS"],
     "MONO": DARK["MONO"],
+    "CLOSE_TAB": "close_tab_light.png",
+    "CLOSE_TAB_HOVER": "close_tab_light_hover.png",
 }
 
 PALETTES = {"dark": DARK, "light": LIGHT}
@@ -412,6 +421,35 @@ dd {{ margin-left: 20px; color: {TEXT}; }}
 """
 
 
+def _asset(name: str) -> str:
+    """Absolute posix path for a QSS `url()`: relative image paths resolve
+    against the process working directory, which varies between launches."""
+    return (Path(__file__).resolve().parent / "assets" / name).as_posix()
+
+
+def _close_button_qss(theme: str) -> str:
+    """The tab close-button rules, built apart from `app_qss` on purpose.
+
+    The image paths are runtime file names (palette tokens, resolved through
+    `_asset`), not stylesheet colours, so they must not appear as `{tokens}`
+    inside the big f-string. The icon PNG carries the gap to the tab's right
+    wall inside it: QSS cannot move the native button widget (`position`,
+    `margin` and `subcontrol-origin` are all ignored for the subcontrol), so
+    the ✕ is drawn shifted left on a transparent canvas
+    (tools/make_close_icons.py).
+    """
+    p = palette(theme)
+    return (
+        "QTabBar::close-button {\n"
+        f'    image: url("{_asset(p["CLOSE_TAB"])}");\n'
+        "    subcontrol-position: right center;\n"
+        "}\n"
+        "QTabBar::close-button:hover {\n"
+        f'    image: url("{_asset(p["CLOSE_TAB_HOVER"])}");\n'
+        "}\n"
+    )
+
+
 def app_qss(theme: str = DEFAULT_THEME) -> str:
     """Application stylesheet (chrome, panes, overlay) for `theme`."""
     p = palette(theme)
@@ -440,7 +478,7 @@ def app_qss(theme: str = DEFAULT_THEME) -> str:
     DISABLED_BORDER = p["DISABLED_BORDER"]
     PRIMARY_TEXT = p["PRIMARY_TEXT"]
     OVERLAY_BG = p["OVERLAY_BG"]
-    return f"""
+    qss = f"""
 QMainWindow {{
     background-color: {BG};
 }}
@@ -479,8 +517,6 @@ QTabBar::tab:hover:!selected {{
 }}
 QTabBar::close-button {{
     subcontrol-position: right center;
-    position: relative;
-    right: 5px;  /* the ✕ must not sit flush against the tab's right wall */
 }}
 /* The splitter handle is the pane divider: keep it wide enough to grab easily
    and light it up under the pointer so the movable edge is obvious. */
@@ -766,6 +802,10 @@ QLabel#pathBar {{
     border: none;
 }}
 """
+    # the close-button rules go last: their image paths are runtime file
+    # names resolved through `_asset`, not palette colours, so they must stay
+    # out of the f-string above (the palette-token check scans its source)
+    return qss + _close_button_qss(theme)
 
 
 # The default (dark) application stylesheet, built lazily: `from theme import

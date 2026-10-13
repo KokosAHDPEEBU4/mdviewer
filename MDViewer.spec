@@ -105,7 +105,14 @@ def _kept(path: str, names: tuple[str, ...]) -> bool:
     return not any(name in parts for name in names) and parts[-1] not in names
 
 
-datas = [("assets/icon.ico", "assets")]
+datas = [
+    ("assets/icon.ico", "assets"),
+    # tab close-button images (theme.app_qss references them by absolute path)
+    ("assets/close_tab_dark.png", "assets"),
+    ("assets/close_tab_dark_hover.png", "assets"),
+    ("assets/close_tab_light.png", "assets"),
+    ("assets/close_tab_light_hover.png", "assets"),
+]
 
 a = Analysis(
     [str(PROJECT / "main.py")],
