@@ -208,6 +208,8 @@ TOC_WIDTH = 240         # default / preferred outline width (px)
 TOC_MIN_WIDTH = 120     # outline shrinks to this, then auto-hides
 TOC_STEP = 14           # indent per heading level
 TOC_ROW = "#0f0f0f"     # current section highlight in the outline
+TREE_WIDTH = 220        # default width of the «Файлы папки» panel (px)
+TREE_MIN_WIDTH = 140    # the file-tree panel never shrinks below this
 EDITOR_PREF = 520       # fallback editor width (kept for tools/compat)
 EDITOR_MIN = 360        # editor yields to this before the preview drops below MIN_COLUMN
 EDITOR_HARD = 220       # hard floor for the editor
@@ -628,6 +630,45 @@ QListWidget#outline::item:hover {{
     color: {TEXT};
 }}
 QListWidget#outline::item:selected {{
+    background-color: {SURFACE_2};
+    color: {TEXT_HEAD};
+}}
+
+/* The «Файлы папки» panel: the active tab's folder. Hidden by default; the
+   header carries the caption and the close button, the folder path sits in
+   its own badge, the list mirrors the outline styling. */
+QWidget#treePanel {{
+    background-color: {BG};
+    border-right: 1px solid {BORDER};
+}}
+QLabel#treeCaption {{
+    color: {TEXT_MUTED};
+    font-size: 11px;
+}}
+QLabel#treeFolder {{
+    color: {TEXT};
+    font-size: 12px;
+    background-color: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 4px;
+    padding: 3px 8px;
+    margin: 0 10px 8px;
+}}
+QListWidget#treeList {{
+    background-color: {BG};
+    border: none;
+    outline: none;
+    color: {TEXT};
+    font-size: 13px;
+}}
+QListWidget#treeList::item {{
+    padding: 3px 8px;
+    border-radius: 4px;
+}}
+QListWidget#treeList::item:hover {{
+    background-color: {SURFACE};
+}}
+QListWidget#treeList::item:selected {{
     background-color: {SURFACE_2};
     color: {TEXT_HEAD};
 }}

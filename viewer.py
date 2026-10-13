@@ -103,6 +103,8 @@ from theme import (
     TEXT_MUTED,
     TOC_MIN_WIDTH,
     TOC_WIDTH,
+    TREE_MIN_WIDTH,
+    TREE_WIDTH,
     app_qss,
     content_css,
     is_light,
@@ -293,6 +295,36 @@ def toc_visible_for(main_avail: int, auto_hidden: bool, user_visible: bool, edit
     if auto_hidden:
         return main_avail > threshold + HYST
     return main_avail >= threshold
+
+
+# --- tree panel helpers (pure, testable without Qt) ------------------------
+
+FILE_ATTRIBUTE_HIDDEN = 0x2   # Windows FILE_ATTRIBUTE_HIDDEN
+HIDDEN_FILE_NAMES = {"desktop.ini", "thumbs.db"}
+
+
+def natural_key(name: str):
+    """Sort key for file names: digit runs compare as numbers, the rest
+    case-insensitively (`b2.md` before `b10.md`, кириллица through casefold).
+    Each piece is a tuple so an int never compares against a str."""
+    return [
+        (0, int(part)) if part.isdigit() else (1, part.casefold())
+        for part in re.split(r"(\d+)", name)
+    ]
+
+
+def is_hidden_file(path: Path) -> bool:
+    """Windows-hidden by attribute (Q5), the shell noise pair, or a dotfile."""
+    if path.name.lower() in HIDDEN_FILE_NAMES or path.name.startswith("."):
+        return True
+    if sys.platform == "win32":
+        try:
+            attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+        except (AttributeError, OSError):
+            return False
+        if attributes != -1 and attributes & FILE_ATTRIBUTE_HIDDEN:
+            return True
+    return False
 
 
 # DwmSetWindowAttribute: the native caption is drawn light grey on Windows 10
@@ -654,6 +686,10 @@ class DocumentView(QWidget):
         self._browser.setOpenLinks(False)
         self._browser.setOpenExternalLinks(False)
         self._browser.anchorClicked.connect(self._open_link)
+        # a file dropped over the preview belongs to the window (Q18: new tab);
+        # the browser's own URL-drop handling would swallow the drag instead
+        self._browser.setAcceptDrops(False)
+        self._browser.viewport().setAcceptDrops(False)
         # hard floor (safety net for the shrink policy): the preview never
         # collapses to a sliver, and this gives the window its minimum width
         self._browser.setMinimumWidth(PREVIEW_HARD)
@@ -3603,6 +3639,68 @@ def _resolve_drag_view(mime) -> "DocumentView | None":
     return view
 
 
+FILE_MIME = "application/x-mdviewer-file"
+
+# The path being dragged out of the tree panel. Same fallback idea as
+# `_DRAG_VIEW`: Qt can hand the drop handler a plain base `QMimeData`,
+# dropping the Python subclass and its `.path` (invariant 26).
+_DRAG_FILE: Path | None = None
+
+
+def _resolve_drag_file(mime) -> Path | None:
+    """The dragged file path, from the payload or the module global."""
+    path = getattr(mime, "path", None)
+    if path is None:
+        path = _DRAG_FILE
+    return path if isinstance(path, Path) else None
+
+
+class _FileMimeData(QMimeData):
+    """Drag payload: a file dragged from the tree panel to a tab bar."""
+
+    def __init__(self, path: Path | None = None):
+        super().__init__()
+        self.path = path
+
+
+class TreeFileList(QListWidget):
+    """The file list of the tree panel; drags a viewable file to a tab bar.
+
+    Rows of non-viewable files are click-only (they open in the system), so
+    `startDrag` simply does nothing for them (Q17). A drop nothing accepts
+    opens nothing (Q19).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setDragEnabled(True)
+        self.setUniformItemSizes(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setWordWrap(False)
+        # clicking a row must not steal focus from the document (Q15)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    def startDrag(self, supported_actions) -> None:
+        item = self.currentItem()
+        path = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        if not isinstance(path, Path) or not DocumentView._viewable(path):
+            return
+        global _DRAG_FILE
+        mime = _FileMimeData(path)
+        mime.setData(FILE_MIME, QByteArray(b"file"))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        rect = self.visualItemRect(item)
+        if rect.isValid():
+            drag.setPixmap(self.grab(rect))
+            drag.setHotSpot(self.viewport().mapFromGlobal(QCursor.pos()) - rect.topLeft())
+        _DRAG_FILE = path
+        try:
+            drag.exec(Qt.DropAction.CopyAction)
+        finally:
+            _DRAG_FILE = None
+
+
 class TabBar(QTabBar):
     """A browser-style tab strip: drag to reorder, pull down to detach.
 
@@ -3712,6 +3810,21 @@ class TabBar(QTabBar):
             super().dragMoveEvent(event)
 
     def dropEvent(self, event):
+        if event.mimeData().hasFormat(FILE_MIME):
+            # a file dragged from the tree panel opens a tab where the pointer
+            # is (Q17); the appended tab is moved into place right after
+            path = _resolve_drag_file(event.mimeData())
+            window = self._window
+            if path is None or window is None or not DocumentView._viewable(path):
+                event.ignore()
+                return
+            to = self.tabAt(event.position().toPoint())
+            window._add_tab(path)
+            count = window._tabs.count()
+            if 0 <= to < count - 1:
+                self.moveTab(count - 1, to)
+            event.acceptProposedAction()
+            return
         if not event.mimeData().hasFormat(TAB_MIME):
             super().dropEvent(event)
             return
@@ -3831,6 +3944,20 @@ class MainWindow(QMainWindow):
         "_title_bar_ready",
         "_reading_mode",
         "_reading_view",
+        # the file-tree panel lives on the window (invariant 38); every one of
+        # these must stay here, or `__setattr__` would forward assignments to
+        # the current DocumentView
+        "_tree_splitter",
+        "_tree_panel",
+        "_tree_list",
+        "_tree_folder",
+        "_tree_folder_label",
+        "_tree_watcher",
+        "_tree_timer",
+        "_tree_state",
+        "_tree_reading_saved",
+        "_tree_sized",
+        "_tree_wanted",
     }
 
     def __init__(self, settings: QSettings | None = None):
@@ -3843,6 +3970,18 @@ class MainWindow(QMainWindow):
         object.__setattr__(self, "_title_bar_ready", False)
         object.__setattr__(self, "_reading_mode", False)
         object.__setattr__(self, "_reading_view", None)
+        # tree-panel state; built later in `_build_tree_widgets` (invariant 38)
+        object.__setattr__(self, "_tree_splitter", None)
+        object.__setattr__(self, "_tree_panel", None)
+        object.__setattr__(self, "_tree_list", None)
+        object.__setattr__(self, "_tree_folder", None)
+        object.__setattr__(self, "_tree_folder_label", None)
+        object.__setattr__(self, "_tree_watcher", None)
+        object.__setattr__(self, "_tree_timer", None)
+        object.__setattr__(self, "_tree_state", {})   # folder -> anchor file name
+        object.__setattr__(self, "_tree_reading_saved", False)
+        object.__setattr__(self, "_tree_sized", False)
+        object.__setattr__(self, "_tree_wanted", False)
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         geometry = self._settings.value("geometry")
         if geometry:
@@ -3868,7 +4007,12 @@ class MainWindow(QMainWindow):
         tabs.tabBar().customContextMenuRequested.connect(self._show_tab_menu)
         tabs.currentChanged.connect(self._on_current_changed)
         object.__setattr__(self, "_tabs", tabs)
-        self.setCentralWidget(tabs)
+        # The tree panel and the tab pages share the window width (invariant
+        # 38). It is a window-level pane on purpose: tabs switch whole
+        # DocumentViews, so the panel cannot live inside one of them.
+        self._build_tree_widgets(tabs)
+        self.setCentralWidget(self._tree_splitter)
+        self.setAcceptDrops(True)  # file drops open tabs (Q18/Q22)
         self._build_window_shortcuts()
         _WINDOWS.append(self)  # two windows exist after tear-off / merge
 
@@ -4043,6 +4187,55 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+    # -- file drops (panel drags and Explorer, Q18/Q22) ---------------------
+
+    @staticmethod
+    def _has_viewable_url(mime) -> bool:
+        return any(
+            url.isLocalFile() and DocumentView._viewable(Path(url.toLocalFile()))
+            for url in mime.urls()
+        )
+
+    def dragEnterEvent(self, event) -> None:
+        mime = event.mimeData()
+        if mime.hasFormat(FILE_MIME) or (mime.hasUrls() and self._has_viewable_url(mime)):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:
+        mime = event.mimeData()
+        if mime.hasFormat(FILE_MIME) or (mime.hasUrls() and self._has_viewable_url(mime)):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event) -> None:
+        """A drop on the window body (preview included) opens a new tab
+        (Q18); external Explorer drops take only local viewable files —
+        folders and other files are ignored, so a stray drop never launches
+        anything (Q22)."""
+        mime = event.mimeData()
+        if mime.hasFormat(FILE_MIME):
+            path = _resolve_drag_file(mime)
+            if path is not None:
+                self._add_tab(path)
+                event.acceptProposedAction()
+                return
+        if mime.hasUrls():
+            added = False
+            for url in mime.urls():
+                if not url.isLocalFile():
+                    continue
+                path = Path(url.toLocalFile())
+                if path.is_file() and DocumentView._viewable(path):
+                    self._add_tab(path)
+                    added = True
+            if added:
+                event.acceptProposedAction()
+                return
+        super().dropEvent(event)
+
     # -- closing / switching ----------------------------------------------
 
     def _close_tab(self, index: int) -> None:
@@ -4057,6 +4250,8 @@ class MainWindow(QMainWindow):
         _remember_closed(view._path)  # Ctrl+Shift+T can bring it back
         self._tabs.removeTab(index)
         view.deleteLater()
+        self._sync_tree_selection()  # its «•» bullet must go (closing a
+        # non-active tab fires no currentChanged)
         self._save_session()
         if self._tabs.count() == 0:
             self.close()
@@ -4087,12 +4282,393 @@ class MainWindow(QMainWindow):
             return
         self._tabs.setCurrentIndex((self._tabs.currentIndex() + step) % count)
 
+    # -- file-tree panel («Файлы папки», invariant 38) ----------------------
+
+    def _build_tree_widgets(self, tabs) -> None:
+        """Split the central area into [tree panel | tab pages].
+
+        The panel starts hidden; only the app's *first* window honours the
+        saved `tree_visible` toggle (Q30), tear-off windows always start
+        hidden (Q44) — they are created mid-gesture and must not reflow under
+        the pointer.
+        """
+        wanted = (not _WINDOWS) and self._settings.value("tree_visible", False, type=bool)
+        object.__setattr__(self, "_tree_wanted", wanted)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(SPLIT_HANDLE)
+        object.__setattr__(self, "_tree_splitter", splitter)
+        object.__setattr__(self, "_tree_panel", self._build_tree_panel())
+        splitter.addWidget(self._tree_panel)
+        splitter.addWidget(tabs)
+        # a user drag of the panel edge persists the width (Q29); `setSizes`
+        # does not emit `splitterMoved`, so this only sees the mouse
+        splitter.splitterMoved.connect(self._on_tree_splitter_moved)
+        # folder watch: one debounce per burst, rewatch after every event
+        # (Q35, invariant 29 — editors save via temp+rename)
+        watcher = QFileSystemWatcher(self)
+        watcher.directoryChanged.connect(self._on_tree_dir_changed)
+        object.__setattr__(self, "_tree_watcher", watcher)
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(FILE_WATCH_DEBOUNCE_MS)
+        timer.timeout.connect(self._refresh_tree)
+        object.__setattr__(self, "_tree_timer", timer)
+
+    def _build_tree_panel(self) -> QWidget:
+        """The panel body: caption + close button, folder badge, the list."""
+        panel = QWidget()
+        panel.setObjectName("treePanel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        header = QWidget()
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(12, 8, 8, 4)
+        header_layout.setSpacing(4)
+        caption = QLabel("ФАЙЛЫ ПАПКИ")
+        caption.setObjectName("treeCaption")
+        close_btn = QToolButton()
+        close_btn.setText("✕")
+        close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # no tooltip (invariant 18)
+        close_btn.clicked.connect(self._toggle_tree)
+        header_layout.addWidget(caption)
+        header_layout.addStretch(1)
+        header_layout.addWidget(close_btn)
+
+        # the folder badge: long paths clip instead of widening the panel
+        folder_label = QLabel()
+        folder_label.setObjectName("treeFolder")
+        folder_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        folder_label.setWordWrap(False)
+
+        tree_list = TreeFileList()
+        tree_list.setObjectName("treeList")  # the QSS targets QListWidget#treeList
+        tree_list.itemClicked.connect(self._on_tree_clicked)
+        tree_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        tree_list.customContextMenuRequested.connect(self._show_tree_menu)
+        tree_list.viewport().installEventFilter(self)  # middle click (Q12)
+
+        layout.addWidget(header)
+        layout.addWidget(folder_label)
+        layout.addWidget(tree_list, 1)
+        object.__setattr__(self, "_tree_list", tree_list)
+        object.__setattr__(self, "_tree_folder_label", folder_label)
+        panel.setMinimumWidth(TREE_MIN_WIDTH)
+        panel.setVisible(False)
+        return panel
+
+    def _tree_palette(self) -> dict:
+        """Colour tokens for per-item painting (the window owns no `_theme`)."""
+        return palette(normalize(self._settings.value("theme", DEFAULT_THEME)))
+
+    def _apply_tree_sizes(self) -> None:
+        """Panel at its saved width, the tab pages take the rest.
+
+        A hidden panel must stay at 0: `setSizes` indexes every child,
+        hidden ones included (invariant 20).
+        """
+        if self._tree_splitter is None:
+            return
+        avail = max(0, self._tree_splitter.width() - SPLIT_HANDLE)
+        if self._tree_panel.isVisible():
+            width = min(
+                self._tree_width_pref(), max(TREE_MIN_WIDTH, avail - 320)
+            )
+        else:
+            width = 0
+        self._tree_splitter.setSizes([width, max(0, avail - width)])
+
+    def _tree_width_pref(self) -> int:
+        return max(TREE_MIN_WIDTH, int(self._settings.value("tree_width", TREE_WIDTH)))
+
+    def _on_tree_splitter_moved(self, *_args) -> None:
+        """A user drag of the panel edge: remember the width (Q29)."""
+        if not self._tree_panel.isVisible():
+            return
+        sizes = self._tree_splitter.sizes()
+        if sizes and sizes[0] > 0:
+            self._settings.setValue("tree_width", max(TREE_MIN_WIDTH, sizes[0]))
+
+    def _toggle_tree(self) -> None:
+        """Ctrl+Shift+E / «Панель файлов»: flip the panel's visibility.
+
+        No-op while reading mode hides the chrome (Q32): F11 owns the
+        visibility until it exits.
+        """
+        if self._reading_mode:
+            return
+        self._set_tree_visible(not self._tree_panel.isVisible())
+
+    def _set_tree_visible(self, visible: bool, persist: bool = True) -> None:
+        """Show or hide the panel; persist unless it is an ephemeral change.
+
+        Showing rebuilds the list (the folder may have changed on disk while
+        hidden) and re-arms the folder watch; hiding drops the watch.
+        """
+        if self._tree_panel is None:
+            return
+        visible = bool(visible)
+        if persist:
+            self._settings.setValue("tree_visible", visible)
+        if self._tree_panel.isVisible() == visible:
+            return
+        self._tree_panel.setVisible(visible)
+        if visible:
+            self._sync_tree_folder(force=True)
+            self._apply_tree_sizes()
+        else:
+            self._unwatch_tree()
+
+    def _sync_tree_folder(self, force: bool = False) -> None:
+        """Point the panel at the active tab's folder (Q23: it follows tabs).
+
+        A folder change rebuilds the list and restores the reading anchor
+        (Q16); a same-folder switch only refreshes the «•» bullets and the
+        highlight. While the panel is hidden only the folder itself is
+        tracked, so showing it is one rebuild.
+        """
+        if self._tree_panel is None:
+            return
+        view = self._current_view()
+        folder = view._path.parent if view is not None else None
+        if not force and folder == self._tree_folder:
+            if self._tree_panel.isVisible():
+                self._sync_tree_selection()
+            return
+        # anchor the folder we are leaving: its highlighted row (Q16)
+        if self._tree_folder is not None:
+            item = self._tree_list.currentItem()
+            if item is not None:
+                path = item.data(Qt.ItemDataRole.UserRole)
+                if isinstance(path, Path):
+                    self._tree_state[str(self._tree_folder)] = path.name
+        self._tree_folder = folder
+        if self._tree_panel.isVisible():
+            self._populate_tree()
+            self._restore_tree_scroll()
+            self._update_tree_header()
+            self._rewatch_tree()
+
+    def _populate_tree(self) -> None:
+        """Rebuild the file list for `_tree_folder`.
+
+        Files only (Q2), natural name sort (Q4), hidden/system files dropped
+        (Q5); viewable files normal and the rest dimmed (Q1), files open in
+        this window's tabs carry the «•» bullet (Q6). A folder that cannot be
+        read shows a notice instead of failing (Q38).
+        """
+        lst = self._tree_list
+        lst.setUpdatesEnabled(False)  # Q37: one paint, however many files
+        try:
+            lst.clear()
+            folder = self._tree_folder
+            if folder is None:
+                self._append_tree_notice("Нет открытой папки")
+                return
+            try:
+                entries = sorted(
+                    (p for p in folder.iterdir() if p.is_file()),
+                    key=lambda p: natural_key(p.name),
+                )
+            except OSError:
+                self._append_tree_notice("Папка недоступна")
+                return
+            entries = [p for p in entries if not is_hidden_file(p)]
+            if not entries:
+                self._append_tree_notice("Папка пуста")
+                return
+            muted = QColor(self._tree_palette()["TEXT_MUTED"])
+            open_paths = self._open_tab_paths()
+            view = self._current_view()
+            current_path = view._path if view is not None else None
+            for path in entries:
+                label = path.name + ("  •" if path in open_paths else "")
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, path)
+                item.setToolTip(str(path))  # the full path (Q41), no hotkeys
+                if not DocumentView._viewable(path):
+                    item.setForeground(muted)
+                lst.addItem(item)
+                if path == current_path:
+                    lst.setCurrentItem(item)
+        finally:
+            lst.setUpdatesEnabled(True)
+
+    def _append_tree_notice(self, text: str) -> None:
+        """A non-interactive row («Папка недоступна», «Папка пуста»)."""
+        item = QListWidgetItem(text)
+        item.setFlags(Qt.ItemFlag.NoItemFlags)
+        self._tree_list.addItem(item)
+
+    def _open_tab_paths(self) -> set:
+        """Resolved paths of every tab in this window (for the «•» bullets)."""
+        return {
+            widget._path
+            for index in range(self._tabs.count())
+            if (widget := self._tabs.widget(index)) is not None
+        }
+
+    def _sync_tree_selection(self) -> None:
+        """Refresh the «•» bullets and the active-file highlight in place."""
+        lst = self._tree_list
+        open_paths = self._open_tab_paths()
+        view = self._current_view()
+        current_path = view._path if view is not None else None
+        target = None
+        for row in range(lst.count()):
+            item = lst.item(row)
+            path = item.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(path, Path):
+                continue
+            label = path.name + ("  •" if path in open_paths else "")
+            if item.text() != label:
+                item.setText(label)
+            if current_path is not None and path == current_path:
+                target = item
+        lst.setCurrentItem(target)  # None clears the highlight
+
+    def _remember_tree_scroll(self) -> None:
+        """Anchor the folder being left at its highlighted row (Q16)."""
+        if self._tree_folder is None:
+            return
+        item = self._tree_list.currentItem()
+        if item is None:
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(path, Path):
+            self._tree_state[str(self._tree_folder)] = path.name
+
+    def _restore_tree_scroll(self) -> None:
+        """Bring the anchor row into view: the active file, else the one
+        remembered for this folder — never a raw row index (Q16)."""
+        lst = self._tree_list
+        target = None
+        view = self._current_view()
+        if view is not None:
+            target = self._tree_item_for(view._path)
+        if target is None and self._tree_folder is not None:
+            anchor = self._tree_state.get(str(self._tree_folder))
+            if anchor:
+                target = self._tree_item_for(self._tree_folder / anchor)
+        if target is not None:
+            lst.scrollToItem(target, QListWidget.ScrollHint.PositionAtTop)
+            lst.setCurrentItem(target)
+
+    def _tree_item_for(self, path: Path):
+        for row in range(self._tree_list.count()):
+            item = self._tree_list.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) == path:
+                return item
+        return None
+
+    def _update_tree_header(self) -> None:
+        """The folder badge; a long path clips (Ignored policy), the tooltip
+        carries the whole folder."""
+        folder = str(self._tree_folder) if self._tree_folder is not None else ""
+        self._tree_folder_label.setText(folder)
+        self._tree_folder_label.setToolTip(folder)
+
+    def _rewatch_tree(self) -> None:
+        """Watch the shown folder; the watch is re-armed after every event
+        because editors replace files atomically (invariant 29)."""
+        watched = self._tree_watcher.directories()
+        if watched:
+            self._tree_watcher.removePaths(watched)
+        if self._tree_folder is not None and self._tree_folder.is_dir():
+            self._tree_watcher.addPath(str(self._tree_folder))
+
+    def _unwatch_tree(self) -> None:
+        watched = self._tree_watcher.directories()
+        if watched:
+            self._tree_watcher.removePaths(watched)
+
+    def _on_tree_dir_changed(self, _path: str) -> None:
+        self._rewatch_tree()
+        self._tree_timer.start()
+
+    def _refresh_tree(self) -> None:
+        """Timer slot: the folder changed on disk — rebuild quietly (Q36)."""
+        if self._tree_panel is None or not self._tree_panel.isVisible():
+            return
+        self._populate_tree()
+        self._restore_tree_scroll()
+
+    def _on_tree_clicked(self, item) -> None:
+        """A click on a tree row: viewable opens here (or in a new tab with
+        Ctrl, Q11/Q12); non-viewable goes to the system (Q10); notice rows
+        are inert."""
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(path, Path):
+            return
+        new_tab = bool(
+            QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier
+        )
+        self._open_tree_path(path, new_tab=new_tab)
+
+    def _open_tree_path(self, path: Path, new_tab: bool = False) -> None:
+        """Open a tree row: dedup first (Q14), then navigate the current tab
+        with history (Q11) or add a tab (Q12); focus returns to the document
+        (Q15). Clicking the active file is a no-op (Q11)."""
+        if not DocumentView._viewable(path):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))  # invariant 5
+            return
+        if new_tab:
+            self._add_tab(path)
+        else:
+            index = self._find_tab(path)
+            if index >= 0:
+                self._tabs.setCurrentIndex(index)
+            else:
+                view = self._current_view()
+                if view is not None and path != view._path:
+                    view._navigate(path)
+        view = self._current_view()
+        if view is not None:
+            view._browser.setFocus()
+
+    def _build_tree_menu(self, item) -> QMenu:
+        """Context menu of a tree row (Q40); kept separate so it is testable."""
+        menu = QMenu(self)
+        path = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        if isinstance(path, Path):
+            open_action = menu.addAction("Открыть")
+            open_action.triggered.connect(
+                lambda _checked=False, p=path: self._open_tree_path(p)
+            )
+            open_tab = menu.addAction("Открыть в новой вкладке")
+            open_tab.triggered.connect(
+                lambda _checked=False, p=path: self._open_tree_path(p, new_tab=True)
+            )
+            copy_action = menu.addAction("Копировать путь")
+            copy_action.triggered.connect(
+                lambda _checked=False, p=path: self._copy_path(p)
+            )
+            folder_action = menu.addAction("Открыть в проводнике")
+            folder_action.triggered.connect(
+                lambda _checked=False, p=path: self._open_folder(p)
+            )
+        return menu
+
+    def _show_tree_menu(self, pos) -> None:
+        self._build_tree_menu(self._tree_list.itemAt(pos)).exec(
+            self._tree_list.mapToGlobal(pos)
+        )
+
+    def _refresh_tree_after_theme(self) -> None:
+        """Theme switch: per-item colours are baked into the rows, so the
+        visible list is rebuilt."""
+        if self._tree_panel is not None and self._tree_panel.isVisible():
+            self._populate_tree()
+
     def _on_current_changed(self, index: int) -> None:
         view = self._tabs.widget(index) if self._tabs is not None else None
         object.__setattr__(self, "_view", view)
         self._update_title(view._is_unsaved() if view is not None else False)
         if view is not None:
             QTimer.singleShot(0, view._relayout)
+        self._sync_tree_folder()  # the panel follows the active tab (Q23)
         # switching tabs while fullscreen carries reading mode to the new view
         if self._reading_mode and view is not None and view is not self._reading_view:
             if self._reading_view is not None:
@@ -4242,6 +4818,13 @@ class MainWindow(QMainWindow):
             empty.setEnabled(False)
 
         menu.addSeparator()
+        tree_action = menu.addAction("Панель файлов")
+        tree_action.setCheckable(True)
+        tree_action.setChecked(
+            self._tree_panel is not None and self._tree_panel.isVisible()
+        )
+        tree_action.triggered.connect(lambda _checked=False: self._toggle_tree())
+        menu.addSeparator()
         settings_action = menu.addAction("Настройки…")
         settings_action.triggered.connect(
             lambda _checked=False: self._open_settings_dialog()
@@ -4331,6 +4914,7 @@ class MainWindow(QMainWindow):
                 if view is not None:
                     view._apply_theme(name)
             window._apply_title_bar()
+            window._refresh_tree_after_theme()  # per-item colours (invariant 38)
 
     # -- window chrome -----------------------------------------------------
 
@@ -4353,6 +4937,7 @@ class MainWindow(QMainWindow):
             "Ctrl+Tab": lambda: self._cycle_tab(1),
             "Ctrl+Shift+Tab": lambda: self._cycle_tab(-1),
             "Ctrl+,": self._open_settings_dialog,
+            "Ctrl+Shift+E": self._toggle_tree,
             "F11": self._toggle_reading_mode,
         }
         for number in range(1, 10):
@@ -4374,6 +4959,12 @@ class MainWindow(QMainWindow):
             return
         self._reading_mode = True
         self._tabs.tabBar().setVisible(False)
+        # the tree panel is window chrome too (Q32); F11 owns its visibility
+        # until reading mode exits
+        if self._tree_panel is not None and self._tree_panel.isVisible():
+            self._tree_reading_saved = True
+            self._tree_panel.setVisible(False)
+            self._unwatch_tree()
         view = self._current_view()
         self._reading_view = view
         if view is not None:
@@ -4386,6 +4977,11 @@ class MainWindow(QMainWindow):
             return
         self._reading_mode = False
         self._tabs.tabBar().setVisible(True)
+        if self._tree_reading_saved:
+            self._tree_reading_saved = False
+            self._tree_panel.setVisible(True)
+            self._sync_tree_folder(force=True)
+            self._apply_tree_sizes()
         view = self._reading_view if self._reading_view is not None else self._current_view()
         self._reading_view = None
         if view is not None:
@@ -4400,6 +4996,13 @@ class MainWindow(QMainWindow):
         view = self._current_view()
         if view is not None:
             QTimer.singleShot(0, view._relayout)
+        # first show: honour the saved toggle, then pin the panel width once
+        # the splitter knows its real size
+        if not self._tree_sized:
+            object.__setattr__(self, "_tree_sized", True)
+            if self._tree_wanted:
+                self._set_tree_visible(True, persist=False)
+            QTimer.singleShot(0, self._apply_tree_sizes)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -4470,6 +5073,17 @@ class MainWindow(QMainWindow):
             index = self._tabs.tabBar().tabAt(event.position().toPoint())
             if index >= 0:
                 self._close_tab(index)
+                return True
+        if (
+            self._tree_list is not None
+            and obj is self._tree_list.viewport()
+            and event.type() == QEvent.Type.MouseButtonPress
+            and event.button() == Qt.MouseButton.MiddleButton
+        ):
+            item = self._tree_list.itemAt(event.position().toPoint())
+            path = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+            if isinstance(path, Path) and DocumentView._viewable(path):
+                self._add_tab(path)  # Q12: middle click opens a new tab
                 return True
         view = self._current_view()
         if view is not None:
