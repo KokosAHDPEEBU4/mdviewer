@@ -20,6 +20,7 @@ from PyQt6.QtCore import (
     QMarginsF,
     QMimeData,
     QPoint,
+    QPointF,
     QRegularExpression,
     QRect,
     QSettings,
@@ -37,6 +38,7 @@ from PyQt6.QtGui import (
     QFont,
     QGuiApplication,
     QKeySequence,
+    QMouseEvent,
     QPageLayout,
     QPainter,
     QPen,
@@ -2110,20 +2112,14 @@ class DocumentView(QWidget):
             self._editor.setExtraSelections([])
 
     def _paint_selection_overlay(self, widget, painter) -> None:
-        """Draw the preview's full-line selection bars and the newest mirror.
+        """Draw the newest mirror on top of `widget` (Qt paints native over extra).
 
-        Qt paints the native selection over `extraSelections`, so the newest
-        mirror needs this hand-painted pass. The preview's *own* selection is
-        extended to whole column lines here as well: a drag that starts in the
-        empty area beside the text anchors fine, but native selection paints
-        nothing until the pointer crosses glyphs — the full-width bars give
-        the touched line an immediate highlight (the side margins can be
-        hundreds of pixels wide, see invariant 2).
+        Only the mirror needs this: when the pane's own selection is newest it is
+        already the native one, painted above everything. (A full-line extension
+        of the preview's own selection was tried here and deliberately rolled
+        back: opaque bars painted *after* the native pass cover the text, so
+        the selected line could no longer be read through its highlight.)
         """
-        if widget is self._browser:
-            colour = QColor(self._pal()["PREVIEW_SELECTION"])
-            for rect in self._preview_line_rects():
-                painter.fillRect(rect, colour)
         other = self._editor if widget is self._browser else self._browser
         layers = self._hl_layers.get(widget, [])
         if not layers or other is None:
@@ -2136,63 +2132,6 @@ class DocumentView(QWidget):
         for cursor in cursors:
             for rect in self._cursor_rects(widget, cursor):
                 painter.fillRect(rect, tint)
-
-    def _preview_line_rects(self):
-        """Full-column viewport rects of the preview's own selection.
-
-        Every layout line the selection touches becomes one bar spanning from
-        its first selected character to the column's right edge, so a line
-        reads as selected even where it has no glyphs. Empty paragraphs inside
-        the span get a bar too (otherwise the highlight would come out
-        dotted). Table cells stay glyph-wide: a column-wide bar there would
-        light up neighbouring cells.
-        """
-        cursor = self._browser.textCursor()
-        if not cursor.hasSelection():
-            return []
-        start, end = cursor.selectionStart(), cursor.selectionEnd()
-        document = self._browser.document()
-        viewport_width = self._browser.viewport().width()
-        last_position = max(0, document.characterCount() - 1)
-        rects = []
-        block = document.findBlock(start)
-        while block.isValid() and block.position() < end:
-            in_table = QTextCursor(block).currentTable() is not None
-            layout = block.layout()
-            base = block.position()
-            if layout is not None:
-                for index in range(layout.lineCount()):
-                    line = layout.lineAt(index)
-                    line_start = base + line.textStart()
-                    line_end = line_start + line.textLength()
-                    segment_start = max(start, line_start)
-                    segment_end = min(end, line_end)
-                    spans_glyphs = segment_end > segment_start
-                    inside_span = start <= line_start < end
-                    if not (spans_glyphs or inside_span):
-                        continue
-                    probe = QTextCursor(document)
-                    probe.setPosition(min(max(line_start, start), last_position))
-                    line_rect = self._browser.cursorRect(probe)
-                    if spans_glyphs:
-                        seg_cursor = QTextCursor(document)
-                        seg_cursor.setPosition(segment_start)
-                        left = self._browser.cursorRect(seg_cursor).left()
-                    else:
-                        left = 0  # an empty paragraph: the bar spans the column
-                    if in_table:
-                        tail = QTextCursor(document)
-                        tail.setPosition(min(segment_end, last_position))
-                        right = self._browser.cursorRect(tail).right()
-                    else:
-                        right = viewport_width
-                    top, bottom = line_rect.top(), line_rect.bottom()
-                    if right > left and bottom > top:
-                        rects.append(
-                            QRect(int(left), int(top), int(right - left), int(bottom - top))
-                        )
-            block = block.next()
-        return rects
 
     @staticmethod
     def _cursor_rects(widget, cursor):
@@ -3126,6 +3065,42 @@ class DocumentView(QWidget):
             return super().eventFilter(obj, event)
         etype = event.type()
         if pane in (self._browser, self._editor):
+            # A left-button PRESS landing on the QTextBrowser WIDGET (the
+            # side-margin strips beside the column, invariant 2) reaches
+            # QTextControl in widget coordinates, but the document lives in
+            # viewport coordinates — un-translated, the offset moves the
+            # anchor and a drag started beside the text selects nothing.
+            # Translate the press into viewport coordinates (clamped) and
+            # re-send it there; after the accepted press Qt's implicit grab
+            # delivers the following moves/releases to the viewport itself,
+            # already in viewport coordinates. Do NOT translate move/release:
+            # re-sending a release into the viewport makes the release path
+            # re-enter this filter and recurse (checked: press-only is safe).
+            if (
+                pane is self._browser
+                and obj is self._browser
+                and etype in (
+                    QEvent.Type.MouseButtonPress,
+                    QEvent.Type.MouseButtonDblClick,
+                )
+                and event.button() == Qt.MouseButton.LeftButton
+            ):
+                viewport = self._browser.viewport()
+                point = event.position().toPoint() - viewport.pos()
+                point = QPoint(
+                    max(0, min(point.x(), viewport.width() - 1)),
+                    max(0, min(point.y(), viewport.height() - 1)),
+                )
+                translated = QMouseEvent(
+                    etype,
+                    QPointF(point),
+                    event.globalPosition(),
+                    Qt.MouseButton.LeftButton,
+                    event.buttons(),
+                    event.modifiers(),
+                )
+                QApplication.sendEvent(viewport, translated)
+                return True
             if etype == QEvent.Type.Wheel:
                 if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                     self._wheel_zoom(pane, event)
