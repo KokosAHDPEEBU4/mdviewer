@@ -1,11 +1,11 @@
 """Draws the tab close-button images into assets/.
 
-QSS cannot move the native close-button widget (`position`, `margin` and
-`subcontrol-origin` are all ignored for `QTabBar::close-button`, and the
-widget keeps its native 16x16 size), so the right-edge gap is baked into the
-image: the 9px glyph square hugs the left edge of the canvas, leaving 7
-transparent pixels (+1px of tab border) — an ~8px gap between the tab's
-right wall and the ✕. Four variants: dark/light x normal/hover.
+QSS cannot move the native close-button widget (`position`, `margin`,
+`subcontrol-origin` and `width` are all ignored for `QTabBar::close-button`,
+and the widget keeps its native 16x16 size), so the right-edge gap is baked
+into the image: the 7px glyph square hugs the left edge of the canvas,
+leaving 9 transparent pixels (+1px of tab border) — an ~10px gap between the
+tab's right wall and the ✕. Four variants: dark/light x normal/hover.
 
 Run from the project root:
     .venv\\Scripts\\python tools\\make_close_icons.py
@@ -23,8 +23,8 @@ from PyQt6.QtWidgets import QApplication
 from theme import palette
 
 SIZE = 16
-GLYPH = QRectF(0, 3.5, 9, 9)   # the ✕ square; x=9..16 stays transparent (the gap)
-BG = QRectF(0, 2, 11, 12)      # hover backing plate
+GLYPH = QRectF(0, 4.5, 7, 7)   # the ✕ square; x=7..16 stays transparent (the gap)
+BG = QRectF(0, 3, 9, 10)       # hover backing plate
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
 
 VARIANTS = {
@@ -50,7 +50,7 @@ def draw(path: Path, theme: str, hover: bool) -> None:
         pen_colour = p["TEXT_MUTED"]
     inset = 1.0
     pen = QPen(QColor(pen_colour))
-    pen.setWidthF(1.6)
+    pen.setWidthF(1.4)
     pen.setCapStyle(Qt.PenCapStyle.FlatCap)
     painter.setPen(pen)
     square = GLYPH.adjusted(inset, inset, -inset, -inset)
