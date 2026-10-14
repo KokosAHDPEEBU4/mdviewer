@@ -3,9 +3,9 @@
 QSS cannot move the native close-button widget (`position`, `margin` and
 `subcontrol-origin` are all ignored for `QTabBar::close-button`, and the
 widget keeps its native 16x16 size), so the right-edge gap is baked into the
-image: the glyph square ends at x=11 of the 16px canvas, leaving 5
-transparent pixels (+1px of tab border) between the ✕ and the tab's right
-wall. Four variants: dark/light x normal/hover.
+image: the 9px glyph square hugs the left edge of the canvas, leaving 7
+transparent pixels (+1px of tab border) — an ~8px gap between the tab's
+right wall and the ✕. Four variants: dark/light x normal/hover.
 
 Run from the project root:
     .venv\\Scripts\\python tools\\make_close_icons.py
@@ -23,8 +23,8 @@ from PyQt6.QtWidgets import QApplication
 from theme import palette
 
 SIZE = 16
-GLYPH = QRectF(1, 3, 10, 10)   # the ✕ square; x=11..16 stays transparent (the gap)
-BG = QRectF(0, 2, 13, 12)      # hover backing plate
+GLYPH = QRectF(0, 3.5, 9, 9)   # the ✕ square; x=9..16 stays transparent (the gap)
+BG = QRectF(0, 2, 11, 12)      # hover backing plate
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
 
 VARIANTS = {
