@@ -25,6 +25,7 @@ viewer.py       DocumentView(QWidget) — содержимое одного фа
                 вкладки в HTML и PDF, черновики несохранённых правок
                 (автосейв/восстановление после падения), панель копирования
                 выделения превью («без md»/«с md», инвариант 37),
+                кнопка копирования блока кода (инвариант 39),
                 QFileSystemWatcher (автоперезагрузка при изменении файла
                 на диске);
                 MainWindow(QMainWindow) — оболочка: QTabWidget, панель
@@ -34,11 +35,13 @@ viewer.py       DocumentView(QWidget) — содержимое одного фа
                 TabBar(QTabBar) — tear-off/merge вкладок; совместимый
                 Viewer(MainWindow) для tools/
 renderer.py     mistune -> HTML: код, картинки, чекбоксы, сноски, якоря заголовков
-                и оглавление (render_with_outline)
+                и оглавление (render_with_outline); JSON -> pretty-printed HTML
+                с подсветкой и оглавлением верхних ключей (render_json)
 theme.py        палитры (dark/light), CSS для Qt rich text, MEASURE/side_margin,
                 QSS приложения; content_css(theme)/app_qss(theme), retheme_tables
 syncsel.py      SourceMap: выравнивание источник <-> рендер для синхронизации выделения
-winassoc.py     регистрация .md в HKCU (ProgID, OpenWithProgids, RegisteredApplications)
+winassoc.py     регистрация .md/.json в HKCU (ProgID, OpenWithProgids,
+                RegisteredApplications)
 version.py      APP_NAME, APP_VERSION, PROG_ID, EXTENSIONS — общий источник истины
 MDViewer.spec   PyInstaller: иконка, версия, excludes, вырезание лишнего Qt,
                 hiddenimports (QtPrintSupport для экспорта в PDF)
@@ -178,12 +181,21 @@ build.bat                                       # сборка dist\MDViewer
     Порядок важен: `_update_hits` при входе в правку вызывается без `jump=True`,
     иначе остаточный поисковый запрос уводит каретку с выбранного раздела.
 
-16. **Всплывающая панель — дочерний виджет окна**, а не элемент layout:
-    `_overlay` живёт поверх сплиттера (`self._overlay.raise_()`), поэтому не
-    отнимает место у текста. Первое появление — на `enterEvent` главного окна,
-    но при входе/выходе из правки `_show_overlay()` вызывается принудительно:
-    иначе панель остаётся над старым положением превью, пока мышь не дёрнется.
-    Статусбара в приложении нет, версия только в заголовке.
+16. **Всплывающая панель — дочерний виджет окна, живёт у верхней кромки.**
+    `_overlay` лежит поверх сплиттера (`self._overlay.raise_()`), поэтому не
+    отнимает место у текста. Показывается **только** когда курсор в полосе
+    `OVERLAY_HOT_ZONE` (=60 px) от верхней кромки превью
+    (`_hover_overlay` из MouseMove вьюпорта), и уходит, как только курсор
+    опускается в текст. `enterEvent` окна её больше не показывает: раньше она
+    всплывала при каждом входе мыши в окно и висела поверх контента, и убрать
+    её было нельзя. Уход с превью/панели дебаунсится `_overlay_hide` (150 мс)
+    с проверкой позиции курсора (`mapFromGlobal`) и `Enter` самой панели —
+    иначе вход на панель (для вьюпорта это `Leave`) гасил бы её.
+    `_show_overlay(pin=True)` ставит `_overlay_pin`: Ctrl+F и Ctrl+H держат
+    панель открытой, пока идёт поиск; `_close_find`, Esc, режим чтения и
+    `FocusOut` поля поиска (`_release_overlay_pin`) снимают пин (`force`).
+    При входе/выходе из правки панель только переставляется, если была
+    видима. Статусбара в приложении нет, версия только в заголовке.
 
 17. **Вход в правку не перекраивает превью и не двигает окно.** `_enter_edit`
     запоминает `_preview_width = max(self._browser.width(), MIN_COLUMN)` **до**
@@ -770,6 +782,55 @@ build.bat                                       # сборка dist\MDViewer
       runtime-имена через `_asset`, проверка токенов сканирует источник
       `app_qss` и упадёт на любом не-палитровом `{имени}` — не писать
       фигурные скобки даже в комментариях внутри неё).
+
+39. **Кнопка копирования — на каждом блоке кода, по наведению.** Qt rich text не
+    умеет виджеты внутри документа, поэтому кнопка — дочерний виджет `viewport`
+    превью (`_code_copy_btn`, objectName `codeCopy`), а не HTML: она плавает над
+    карточкой кода справа сверху, не занимает место и не берёт фокус
+    (`NoFocus`, `WA_ShowWithoutActivating`). Появляется на `MouseMove` по
+    вьюпорту (`_hover_code_copy`), прячется при уходе на обычный текст, из
+    вьюпорта (с задержкой `_code_copy_hide`: вход на саму кнопку тоже шлёт
+    `Leave` родителю, поэтому `_maybe_hide_code_copy` проверяет `underMouse`),
+    при выделении текста (панель копирования выделения приоритетнее), входе в
+    правку/режим чтения, `_relayout`, зуме и `_render`.
+
+    **Как находятся карточки.** Qt разбивает `<pre>` на блок на каждую строку;
+    каждый такой блок наследует фон `CODE_BG` и `textIndent` из
+    `content_css`. `_scan_code_blocks` (вызывается в конце `_render`) собирает
+    подряд идущие блоки с `blockFormat().background() == CODE_BG` и
+    `textIndent > 0` в `_CodeRun(start, end, text, card_start)`; подпись языка
+    (`p.code-lang`) отличается приглушённым `foreground == TEXT_MUTED` и в
+    копию **не входит**, но её блок входит в карточку (`card_start`) и тоже
+    подсвечивает кнопку — иначе она гасла бы при переходе с кода на подпись.
+    `text` — строки через `\n` с `rstrip()`: CRLF-файл
+    оставляет `\r` в `<pre>`, Qt рисует его пробелом, и в буфер попадал хвост.
+    Позиция кнопки — `_code_run_rect` (верх подписи, если она есть) + `+8` от
+    верха, с клампом в вьюпорт; на скролле `_reposition_code_copy` либо
+    пересчитывает hover под курсором, либо ведёт кнопку за её карточкой и
+    прячет, если та ушла из вида.
+
+    Клик кладёт в буфер весь текст карточки и мигает «Скопировано»
+    (`COPY_FLASH_MS`, потом `_reset_code_copy_label`). Стили — `#codeCopy` в
+    `app_qss` (токены обеих палитр, без `setToolTip` — инвариант 18).
+    Тесты — секция «code card copy button» в `tools/edit_check.py` (карточки,
+    подпись, hover, копия, скролл, правка).
+
+40. **JSON — отдельный рендер, не markdown.** `DocumentView._render` (и
+    `export_html`) выбирают `renderer.render_json(text)` по суффиксу `.json`
+    (иначе `render_with_outline`). JSON pretty-printed в обычной карточке
+    `<pre class="code-body json">` (работают фон/отступ кода и кнопка
+    копирования, инвариант 39), токены — `<span class="json-key/string/number/
+    bool/null">`; цвета — токены `JSON_*` в **обеих** палитрах (инвариант 32),
+    правила — в `content_css`. Верхние ключи корневого объекта получают якоря
+    `md-hN` (именно этот префикс ищет `_anchored_index`, инвариант 15) и
+    попадают в оглавление; вложенные ключи — нет (иначе оглавление длиной с
+    документ). Битый JSON не исключение: `JSONDecodeError` → `<p
+    class="json-error">` со строкой/колонкой и исходный текст в карточке,
+    `outline=[]`. BOM и CRLF нормализуются. `_viewable` включает `.json`
+    (ссылки/дерево/драг), `version.EXTENSIONS = (".md", ".json")` — `winassoc`
+    регистрирует оба (Windows default всё равно выбирает пользователь,
+    инвариант 6), диалоги открытия фильтруют `*.json`. Тесты — секция «JSON» в
+    `tools/edit_check.py` и `_check_json` в `tools/render_check.py`.
 
 Максимум контента — до `MEASURE` px, оглавление фиксируется по `TOC_WIDTH`,
 отступы уровней — `TOC_STEP`; всё в `theme.py`.

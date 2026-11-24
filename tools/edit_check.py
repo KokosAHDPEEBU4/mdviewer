@@ -18,6 +18,7 @@ from PyQt6.QtGui import QKeyEvent, QMouseEvent, QPalette, QTextCursor, QWheelEve
 from PyQt6.QtWidgets import QApplication, QPlainTextEdit, QTextBrowser
 
 import drafts
+import renderer as renderer_mod
 import theme as theme_mod
 import viewer as viewer_mod
 from main import create_app
@@ -399,6 +400,25 @@ def main() -> int:
         win._show_overlay()
         check("overlay appears on demand", win._overlay.isVisible(), True)
         check("overlay carries the edit button", win._edit_btn.parent() is win._overlay, True)
+        # the panel is summoned by the preview's top edge and gets out of the
+        # way as soon as the pointer moves down into the text
+        win._overlay.setVisible(False)
+        win._hover_overlay(QPoint(40, 10))
+        check("overlay appears at the preview top edge", win._overlay.isVisible(), True)
+        win._hover_overlay(QPoint(40, win._browser.viewport().height() // 2))
+        check("overlay leaves when the pointer leaves the top edge",
+              win._overlay.isVisible(), False)
+        win._toggle_find()
+        check("Ctrl+F pins the overlay",
+              win._overlay.isVisible() and win._overlay_pin, True)
+        win._hover_overlay(QPoint(40, win._browser.viewport().height() // 2))
+        check("a pinned find bar survives the pointer moving away",
+              win._overlay.isVisible(), True)
+        win._close_find()
+        check("closing the find bar releases the panel", win._overlay_pin, False)
+        win._hover_overlay(QPoint(40, 10))
+        win._handle_esc()
+        check("Esc dismisses the hover panel", win._overlay.isVisible(), False)
         # zoom scales both panes and the label reflects it
         check("zoom label starts at 100%", win._zoom_label.text(), "100%")
         win._set_zoom(win._zoom + 1)
@@ -502,7 +522,8 @@ def main() -> int:
         check("search ignores extra spaces", int(win._find_status.text()) > 0, True)
         win._close_find()
         check("search clears the query", win._find_edit.text(), "")
-        check("search field stays in the overlay", win._find_bar.isVisible(), True)
+        check("search field stays in the overlay",
+              win._find_bar.parent() is win._overlay and not win._find_bar.isHidden(), True)
 
         # --- search targets the editor while editing
         win._enter_edit()
@@ -1691,6 +1712,99 @@ def main() -> int:
         win.close()
         app.processEvents()
 
+    # --- code card copy button: chat-style hover affordance on fenced blocks
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "codes.md"
+        path.write_text(
+            "# Title\n\n```css\n.pill { display: inline-flex; }\n.chip { gap: 6px; }\n```\n\n"
+            "Text between cards.\n\n```\nplain\nline two\n```\n\n"
+            + "filler line\n\n" * 40,
+            encoding="utf-8",
+        )
+        win = viewer_mod.Viewer(path, QSettings(tempfile.mkdtemp(), "code_copy_check"))
+        win.resize(1000, 700)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+
+        runs = win._code_runs
+        check("one copy card per fenced block", len(runs), 2)
+        check("the language caption is not copied",
+              runs[0].text, ".pill { display: inline-flex; }\n.chip { gap: 6px; }")
+        check("a card without a language is copied whole",
+              runs[1].text, "plain\nline two")
+        win._hide_code_copy()  # a live cursor may have hovered during show()
+        check("no copy button without a hover",
+              win._code_copy_btn is None or not win._code_copy_btn.isVisible(), True)
+
+        def _move_to(needle: str) -> None:
+            # direct call: the live cursor may be anywhere on the desktop, so
+            # real MouseMove events must not decide what this test sees
+            document = win._browser.document()
+            cursor = QTextCursor(document)
+            cursor.setPosition(document.toPlainText().index(needle))
+            win._hover_code_copy(win._browser.cursorRect(cursor).center())
+
+        _move_to(".chip")
+        button = win._code_copy_btn
+        check("hovering a code card shows its copy button",
+              button is not None and button.isVisible(), True)
+        check("the button floats over the preview viewport",
+              button.parent() is win._browser.viewport(), True)
+        check("the button sits inside the viewport",
+              win._browser.viewport().rect().contains(button.geometry()), True)
+        check("the card under the pointer is remembered",
+              win._code_copy_run is runs[0], True)
+
+        _move_to("css")
+        check("the language caption keeps the button up", button.isVisible(), True)
+        _move_to(".chip")
+
+        class _FakeClip:
+            def __init__(self):
+                self.texts = []
+
+            def setText(self, text, *_args):
+                self.texts.append(text)
+
+            def text(self, *_args):
+                return self.texts[-1] if self.texts else ""
+
+        fake_clip = _FakeClip()
+        original_clipboard = viewer_mod.QApplication.clipboard
+        viewer_mod.QApplication.clipboard = staticmethod(lambda: fake_clip)
+        try:
+            button.click()
+            check("clicking copies the whole card", fake_clip.texts[-1], runs[0].text)
+            check("the click flashes a confirmation", button.text(), "Скопировано")
+        finally:
+            viewer_mod.QApplication.clipboard = original_clipboard
+
+        _move_to("Text between cards.")
+        check("leaving the card hides the button", button.isVisible(), False)
+
+        _move_to("line two")
+        check("every card has its own button",
+              button.isVisible() and win._code_copy_run is runs[1], True)
+
+        win._browser.verticalScrollBar().setValue(
+            win._browser.verticalScrollBar().maximum()
+        )
+        app.processEvents()
+        check("scrolling the card away hides the button", button.isVisible(), False)
+
+        win._browser.verticalScrollBar().setValue(0)
+        app.processEvents()
+        _move_to("line two")
+        win._enter_edit()
+        check("edit mode hides the card button", button.isVisible(), False)
+        for _ in range(3):
+            app.processEvents()
+        win._confirm_discard = lambda: True
+        win._leave_edit()
+        win.close()
+        app.processEvents()
+
     # --- path strip: the file's path above the preview opens its folder
     with tempfile.TemporaryDirectory() as folder:
         path = Path(folder) / "strip.md"
@@ -1840,6 +1954,48 @@ def main() -> int:
         win2.close()
         win.close()
         for _ in range(3):
+            app.processEvents()
+
+    # --- JSON: pretty-printed, coloured, top-level outline, broken input
+    with tempfile.TemporaryDirectory() as folder:
+        good = Path(folder) / "good.json"
+        good.write_text(
+            '{"name": "md", "count": 3, "ok": true, "items": [1, null], "nested": {"k": "v"}}',
+            encoding="utf-8",
+        )
+        bad = Path(folder) / "bad.json"
+        bad.write_text('{"a": }', encoding="utf-8")
+
+        html, outline = renderer_mod.render_json(good.read_text(encoding="utf-8"))
+        check("json renders key spans", 'class="json-key"' in html, True)
+        check("json renders string spans", 'class="json-string"' in html, True)
+        check("json renders number spans", 'class="json-number"' in html, True)
+        check("json renders bool/null spans",
+              'class="json-bool"' in html and 'class="json-null"' in html, True)
+        check("json outline lists top-level keys",
+              [h.label for h in outline], ["name", "count", "ok", "items", "nested"])
+        check("json anchors use the md-h prefix",
+              all(h.anchor.startswith("md-h") for h in outline), True)
+        check("json anchors are injected", html.count('<a name="md-h') == len(outline), True)
+
+        bad_html, bad_outline = renderer_mod.render_json(bad.read_text(encoding="utf-8"))
+        check("broken json does not crash", bad_outline, [])
+        check("broken json shows an error", 'class="json-error"' in bad_html, True)
+        check("broken json keeps the raw text", '{"a": }' in bad_html, True)
+
+        settings = QSettings(tempfile.mkdtemp(), "json_check")
+        win = viewer_mod.Viewer(good, settings)
+        win.resize(900, 600)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+        preview = win._browser.toPlainText()
+        check("json opens in the viewer", '"name": "md"' in preview, True)
+        check("json is pretty-printed", '\n  "count": 3' in preview, True)
+        check("json outline is populated in the viewer", len(win._outline), 5)
+        check("json is viewable", viewer_mod.DocumentView._viewable(good), True)
+        win.close()
+        for _ in range(2):
             app.processEvents()
 
     print("all checks passed" if not failures else f"{len(failures)} failure(s)")

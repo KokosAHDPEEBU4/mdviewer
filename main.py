@@ -16,8 +16,8 @@ ICON_PATH = Path(__file__).with_name("assets") / "icon.ico"
 
 USAGE = f"""\
 {APP_NAME} {APP_VERSION}
-  MDViewer [файл ...]            открыть markdown-файлы вкладками в одном окне
-  MDViewer --install-default     установить и назначить обработчиком .md
+  MDViewer [файл ...]            открыть markdown/JSON-файлы вкладками в одном окне
+  MDViewer --install-default     установить и назначить обработчиком .md/.json
   MDViewer --no-prompt           ... без диалога «Открыть с помощью»
   MDViewer --uninstall-default   удалить регистрацию
   MDViewer --assoc-status        показать, что зарегистрировано в Windows

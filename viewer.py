@@ -6,6 +6,7 @@ the source is just what is on disk.  "Конвертировать" re-renders t
 from the edited text, "Сохранить" writes the file and refreshes the preview.
 """
 
+from collections import namedtuple
 from pathlib import Path
 from html import escape
 from typing import TYPE_CHECKING
@@ -36,6 +37,7 @@ from PyQt6.QtGui import (
     QDesktopServices,
     QDrag,
     QFont,
+    QFontMetrics,
     QGuiApplication,
     QKeySequence,
     QMouseEvent,
@@ -206,6 +208,13 @@ SYNC_SCROLL_MS = 70
 # Zoom levels offered as the default for new tabs (the dialog's combo and the
 # "масштаб по умолчанию" setting). Stored as steps of 10% on top of 100%.
 DEFAULT_ZOOM_LEVELS = (-2, -1, 0, 1, 2, 5, 10)
+
+# One fenced code card in the current render. Qt splits a `<pre>` into one block
+# per line (each block carries the code background), so a run is a contiguous
+# range of blocks; `start`/`end` are block numbers, `card_start` includes the
+# language caption above the code, and `text` is what the copy button puts on the
+# clipboard (lines joined with "\n", language caption left out).
+_CodeRun = namedtuple("_CodeRun", "start end text card_start")
 
 
 def zoom_percent(level: int) -> int:
@@ -567,6 +576,10 @@ class DocumentView(QWidget):
     CRUMB_SEGMENT_MAX = 4   # most crumbs shown; deeper paths collapse to "…"
     PATH_FOLDER_MAX = 240   # characters of the folder in the path strip before "…"
     COPY_FLASH_MS = 800     # how long the "Скопировано" state stays on the button
+    CODE_COPY_LABEL = "Копировать"
+    CODE_COPY_DONE = "Скопировано"
+    OVERLAY_HOT_ZONE = 60   # px from the preview's top edge that summons the panel
+    OVERLAY_HIDE_MS = 150   # delay before the panel goes away after the pointer leaves
 
     # `state_changed` fires whenever the dirty state may have moved (the tab
     # label and the window title follow it); `link_requested` asks the host
@@ -705,6 +718,8 @@ class DocumentView(QWidget):
         self._browser.verticalScrollBar().valueChanged.connect(self._sync_crumbs)
         # the copy strip follows the selection and has to survive scrolls
         self._browser.verticalScrollBar().valueChanged.connect(self._reposition_copy_popup)
+        # the code-block copy button is glued to its card, so it follows too
+        self._browser.verticalScrollBar().valueChanged.connect(self._reposition_code_copy)
         self._browser.selectionChanged.connect(self._highlight_editor_from_preview)
         self._browser.selectionChanged.connect(self._update_copy_popup)
         self._preview_base_font = QFont(self._browser.document().defaultFont())
@@ -777,6 +792,11 @@ class DocumentView(QWidget):
         self._back_btn = None
         self._toc_btn = None
         self._overlay = None
+        self._overlay_pin = False  # find/replace holds the panel open
+        self._overlay_hide = QTimer(self)
+        self._overlay_hide.setSingleShot(True)
+        self._overlay_hide.setInterval(self.OVERLAY_HIDE_MS)
+        self._overlay_hide.timeout.connect(self._maybe_hide_overlay)
         self._find_bar = None
         # the copy strip that follows a preview selection (built on first use)
         self._copy_popup = None
@@ -784,6 +804,21 @@ class DocumentView(QWidget):
         self._copy_md_btn = None
         self._copy_stale = False
         self._copy_offscreen = False  # hidden because the selection left the view
+        # the copy button that appears over a fenced code block on hover
+        self._code_runs = []           # `_CodeRun` cards of the current render
+        self._code_run_by_block = {}   # block number -> `_CodeRun`
+        self._code_copy_btn = None     # built lazily, child of the viewport
+        self._code_copy_run = None     # card the visible button belongs to
+        self._code_copy_flash = QTimer(self)
+        self._code_copy_flash.setSingleShot(True)
+        self._code_copy_flash.setInterval(self.COPY_FLASH_MS)
+        self._code_copy_flash.timeout.connect(self._reset_code_copy_label)
+        # leaving the preview towards the button itself sends a Leave first; the
+        # delayed check keeps the button alive under the pointer
+        self._code_copy_hide = QTimer(self)
+        self._code_copy_hide.setSingleShot(True)
+        self._code_copy_hide.setInterval(150)
+        self._code_copy_hide.timeout.connect(self._maybe_hide_code_copy)
 
         self.load()
         QTimer.singleShot(0, self._set_margins)
@@ -815,17 +850,21 @@ class DocumentView(QWidget):
     def _render(self, text: str) -> None:
         """Re-render the preview. Called only on load/convert/save, never on
         resize (that would cost hundreds of milliseconds per step)."""
-        from renderer import render_with_outline  # lazy: mistune import cost
+        from renderer import render_json, render_with_outline  # lazy: mistune cost
 
         # setHtml rebuilds the document, so any stored highlight cursor would
         # dangle; drop the layers first
         self._clear_highlights()
         self._hide_copy_popup()  # the selection the strip refers to is gone
+        self._hide_code_copy()  # the code cards are about to be rebuilt
         self._rendered = _normalized(text)
         # the stylesheet has to be in place before the HTML: Qt matches CSS while
         # importing, not afterwards
         self._browser.document().setDefaultStyleSheet(content_css(self._theme))
-        html, self._outline = render_with_outline(text, self._path.parent)
+        if self._path.suffix.lower() == ".json":
+            html, self._outline = render_json(text)
+        else:
+            html, self._outline = render_with_outline(text, self._path.parent)
         # renderer bakes the dark table colours into `bgcolor`; recolour them
         # for the light theme (a no-op for the default dark palette)
         html = retheme_tables(html, self._theme)
@@ -842,6 +881,7 @@ class DocumentView(QWidget):
         self._populate_outline()
         self._set_margins()
         self._browser.verticalScrollBar().setValue(0)
+        self._scan_code_blocks()  # card ranges for the hover copy button
         self._sync_crumbs()
 
     def _render_busy(self, text: str) -> None:
@@ -864,9 +904,12 @@ class DocumentView(QWidget):
         is read from the network.
         """
         source = self._map_source if self._map_source is not None else self._text
-        from renderer import render_with_outline  # lazy: mistune import cost
+        from renderer import render_json, render_with_outline  # lazy: mistune cost
 
-        body, _ = render_with_outline(source, self._path.parent)
+        if self._path.suffix.lower() == ".json":
+            body, _ = render_json(source)
+        else:
+            body, _ = render_with_outline(source, self._path.parent)
         body = retheme_tables(body, self._theme)
         page = _standalone_html(self._path.name, body, self._theme)
         try:
@@ -1416,8 +1459,9 @@ class DocumentView(QWidget):
                 self._toc_user_visible = False
                 self._toc_auto_hidden = False
             if self._overlay is not None:
-                self._overlay.setVisible(False)
+                self._hide_overlay(force=True)
             self._hide_copy_popup()  # reading mode shows text, no chrome
+            self._hide_code_copy()
             self._relayout()
         elif self._reading_toc_saved is not None:
             self._toc_user_visible = self._reading_toc_saved
@@ -1475,7 +1519,7 @@ class DocumentView(QWidget):
 
     @staticmethod
     def _viewable(path: Path) -> bool:
-        return path.suffix.lower() in {".md", ".markdown", ".txt"}
+        return path.suffix.lower() in {".md", ".markdown", ".txt", ".json"}
 
     def _middle_click_link(self, viewport_point: QPoint) -> bool:
         """Open the link under a middle click in a new tab. False when none.
@@ -1665,6 +1709,7 @@ class DocumentView(QWidget):
         self._sync_timer.stop()
         self._sync_source = None
         self._hide_copy_popup()  # the panes are about to move under it
+        self._hide_code_copy()
         # the preview column shrinks a little when the editor opens (the window
         # may be capped by the screen), which rewraps the whole document; pin the
         # character at the top so the reader is not thrown to another section
@@ -1712,7 +1757,8 @@ class DocumentView(QWidget):
         self._move_editor_to_preview()
         self._update_hits(self._find_edit.text())  # search now targets the editor
         self._highlight_editor_from_preview()  # keep an existing preview selection in view
-        self._show_overlay()  # move it over the (now narrower) preview at once
+        if self._overlay is not None and self._overlay.isVisible():
+            self._place_overlay()  # over the (now narrower) preview at once
         self._update_state()
 
     def _visible_paragraph(self) -> str:
@@ -2228,6 +2274,7 @@ class DocumentView(QWidget):
             self._hide_copy_popup()
             return
         self._ensure_copy_popup()
+        self._hide_code_copy()  # the selection strip takes precedence
         self._refresh_copy_popup_state()
         if self._place_copy_popup():
             self._copy_popup.setVisible(True)
@@ -2349,6 +2396,248 @@ class DocumentView(QWidget):
         cursor = self._browser.textCursor()
         if (cursor.selectionStart(), cursor.selectionEnd()) == span:
             self._hide_copy_popup()
+
+    # -- copy button over a fenced code block -----------------------------
+
+    def _scan_code_blocks(self) -> None:
+        """Collect fenced-code cards from the document just rendered.
+
+        Qt's rich-text importer turns every line of a `<pre>` into its own
+        block; each of them carries the code background and the left inset from
+        the stylesheet. A card is therefore a contiguous run of such blocks,
+        optionally preceded by the language caption (`p.code-lang`, same
+        background but a muted foreground). The caption is kept out of the
+        copied text.
+        """
+        self._code_runs = []
+        self._code_run_by_block = {}
+        document = self._browser.document()
+        code_bg = self._pal()["CODE_BG"].lower()
+        muted = self._pal()["TEXT_MUTED"].lower()
+        start = None
+        last = None
+        card_start = None
+        pending_caption = None
+        lines: list[str] = []
+        block = document.begin()
+        while block.isValid():
+            caption = self._is_code_line(block, code_bg) and self._is_code_caption(
+                block, muted
+            )
+            if caption:
+                if start is not None:
+                    self._add_code_run(start, last, lines, card_start)
+                start, last, lines = None, None, []
+                pending_caption = block.blockNumber()
+            elif self._is_code_line(block, code_bg):
+                if start is None:
+                    start = block.blockNumber()
+                    # the caption only belongs to a card when it is directly
+                    # above the first code line
+                    card_start = (
+                        pending_caption
+                        if pending_caption == start - 1
+                        else start
+                    )
+                    lines = []
+                lines.append(block.text())
+                last = block.blockNumber()
+                pending_caption = None
+            else:
+                if start is not None:
+                    self._add_code_run(start, last, lines, card_start)
+                start, last, lines = None, None, []
+                pending_caption = None
+            block = block.next()
+        if start is not None:
+            self._add_code_run(start, last, lines, card_start)
+
+    def _add_code_run(
+        self, start: int, end: int, lines: list[str], card_start: int
+    ) -> None:
+        # a CRLF fence leaves a trailing "\r" that Qt shows as a space on the
+        # last line; the copy should mirror the code, not that artefact
+        text = "\n".join(lines).rstrip()
+        if not text.strip():
+            return
+        run = _CodeRun(start, end, text, card_start)
+        self._code_runs.append(run)
+        for number in range(card_start, end + 1):
+            self._code_run_by_block[number] = run
+
+    @staticmethod
+    def _is_code_line(block, code_bg: str) -> bool:
+        """A block painted with the code card background (one code line)."""
+        fmt = block.blockFormat()
+        background = fmt.background()
+        return (
+            background.style() != Qt.BrushStyle.NoBrush
+            and background.color().name().lower() == code_bg
+            and fmt.textIndent() > 0
+        )
+
+    @staticmethod
+    def _is_code_caption(block, muted: str) -> bool:
+        """The language label above a code card (muted text on the code bg)."""
+        foreground = block.charFormat().foreground()
+        return (
+            foreground.style() != Qt.BrushStyle.NoBrush
+            and foreground.color().name().lower() == muted
+        )
+
+    def _code_run_at(self, point: QPoint):
+        """The code card under viewport point `point`, if any."""
+        if not self._code_runs:
+            return None
+        block = self._browser.cursorForPosition(point).block()
+        return self._code_run_by_block.get(block.blockNumber())
+
+    def _code_run_rect(self, run) -> QRect:
+        """Viewport rectangle the card covers (the language caption included,
+        so the button parks over the card's header rather than over code)."""
+        document = self._browser.document()
+        top_block = document.findBlockByNumber(run.card_start)
+        last = document.findBlockByNumber(run.end)
+        if not top_block.isValid() or not last.isValid():
+            return QRect()
+        top = self._browser.cursorRect(QTextCursor(top_block)).top()
+        bottom_cursor = QTextCursor(last)
+        bottom_cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+        bottom = self._browser.cursorRect(bottom_cursor).bottom()
+        return QRect(0, top, self._browser.viewport().width(), max(1, bottom - top))
+
+    def _ensure_code_copy(self) -> None:
+        """Build the card copy button on first hover.
+
+        It is a child of the preview viewport (not of the document), so it
+        floats over the code like the chat-window affordance and never takes
+        focus or space from the text.
+        """
+        if self._code_copy_btn is not None:
+            return
+        button = QToolButton(self._browser.viewport())
+        button.setObjectName("codeCopy")
+        button.setText(self.CODE_COPY_LABEL)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        button.setCursor(Qt.CursorShape.ArrowCursor)
+        button.clicked.connect(self._copy_code_block)
+        button.installEventFilter(self)  # keeps it up while the pointer is on it
+        button.hide()
+        # QSS gives the button an 11 px font; measure with it so the fixed
+        # width matches what is actually painted (the flash label swaps text)
+        probe = QFont(button.font())
+        probe.setPixelSize(11)
+        metrics = QFontMetrics(probe)
+        label_width = max(
+            metrics.horizontalAdvance(self.CODE_COPY_LABEL),
+            metrics.horizontalAdvance(self.CODE_COPY_DONE),
+        )
+        button.setFixedWidth(label_width + 24)  # QSS padding + border
+        self._code_copy_btn = button
+
+    def _hover_code_copy(self, point: QPoint) -> None:
+        """Show the button over the card under the pointer, hide it otherwise."""
+        if self._reading_mode or QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+            self._hide_code_copy()
+            return
+        run = self._code_run_at(point)
+        if run is None:
+            self._hide_code_copy()
+            return
+        self._ensure_code_copy()
+        self._code_copy_hide.stop()
+        self._code_copy_run = run
+        if self._place_code_copy(run):
+            button = self._code_copy_btn
+            if not button.isVisible():
+                button.show()
+            button.raise_()
+
+    def _place_code_copy(self, run) -> bool:
+        """Park the button in the card's top-right corner, clamped to the view."""
+        button = self._code_copy_btn
+        if button is None:
+            return False
+        viewport = self._browser.viewport()
+        rect = self._code_run_rect(run)
+        if rect.isNull() or rect.bottom() < 0 or rect.top() > viewport.height():
+            return False
+        size = button.size()
+        x = max(6, viewport.width() - size.width() - 10)
+        y = max(6, min(rect.top() + 8, viewport.height() - size.height() - 6))
+        button.move(x, y)
+        return True
+
+    def _reposition_code_copy(self, *_args) -> None:
+        """Keep the button glued to its card while the preview scrolls.
+
+        After a scroll the pointer may sit over another card, so the hover is
+        re-evaluated when the viewport is under it; otherwise the button just
+        follows the card it was opened on (or hides once that card is gone).
+        """
+        button = self._code_copy_btn
+        if button is None or not button.isVisible():
+            return
+        viewport = self._browser.viewport()
+        if viewport.underMouse():
+            self._hover_code_copy(viewport.mapFromGlobal(QCursor.pos()))
+            return
+        if self._code_copy_run is None or not self._place_code_copy(self._code_copy_run):
+            self._hide_code_copy()
+
+    def _on_preview_leave(self) -> None:
+        """Schedule a hide when the pointer leaves the preview.
+
+        Entering the button itself (or the control panel) also leaves the
+        viewport, so the decision is deferred: the delayed checks keep either
+        while the pointer is still on it.
+        """
+        if self._code_copy_btn is not None and self._code_copy_btn.isVisible():
+            self._code_copy_hide.start()
+        if self._overlay is not None and self._overlay.isVisible():
+            self._overlay_hide.start()
+
+    def _maybe_hide_code_copy(self) -> None:
+        button = self._code_copy_btn
+        if button is not None and button.isVisible() and button.underMouse():
+            return
+        self._hide_code_copy()
+
+    def _hide_code_copy(self) -> None:
+        self._code_copy_hide.stop()
+        self._code_copy_run = None
+        self._code_copy_flash.stop()
+        button = self._code_copy_btn
+        if button is None:
+            return
+        if button.isVisible():
+            button.hide()
+        self._reset_code_copy_label()
+
+    def _copy_code_block(self, _checked: bool = False) -> None:
+        """Put the whole card's code on the clipboard and flash confirmation."""
+        run = self._code_copy_run
+        if run is None:
+            return
+        QApplication.clipboard().setText(run.text)
+        button = self._code_copy_btn
+        if button is None:
+            return
+        button.setText(self.CODE_COPY_DONE)
+        button.setProperty("copied", True)
+        button.style().unpolish(button)
+        button.style().polish(button)
+        self._code_copy_flash.start()
+
+    def _reset_code_copy_label(self) -> None:
+        button = self._code_copy_btn
+        if button is None:
+            return
+        button.setText(self.CODE_COPY_LABEL)
+        button.setProperty("copied", False)
+        button.style().unpolish(button)
+        button.style().polish(button)
 
     def _plain_selection(self) -> str:
         """Selected preview text as plain lines; images contribute nothing."""
@@ -2524,6 +2813,7 @@ class DocumentView(QWidget):
         self._sync_timer.stop()
         self._sync_source = None
         self._hide_copy_popup()  # the panes are about to move under it
+        self._hide_code_copy()
         self._preview_anchor = None  # entering-edit pin must not outlive the edit
         self._edit_mode = False
         self._panel.setVisible(False)
@@ -2541,7 +2831,8 @@ class DocumentView(QWidget):
         self._edit_btn.setText("Редактировать")
         self._browser.setFocus()
         self._update_hits(self._find_edit.text())  # search back to the preview
-        self._show_overlay()  # back over the full-width preview
+        if self._overlay is not None and self._overlay.isVisible():
+            self._place_overlay()  # back over the full-width preview
         self._update_state()
 
     def _relayout(self, content: int | None = None) -> None:
@@ -2555,6 +2846,7 @@ class DocumentView(QWidget):
         if self._in_relayout:
             return
         self._in_relayout = True
+        self._hide_code_copy()  # the panes are about to move under the button
         try:
             if content is None:
                 content = self._splitter.width()
@@ -2778,6 +3070,8 @@ class DocumentView(QWidget):
             self._close_find()
         elif self._editing():
             self._leave_edit()
+        elif self._overlay is not None and self._overlay.isVisible():
+            self._hide_overlay(force=True)
 
     # -- overlay (hover chrome) -------------------------------------------
 
@@ -2802,6 +3096,7 @@ class DocumentView(QWidget):
         self._find_edit.setFixedWidth(220)
         self._find_edit.returnPressed.connect(lambda: self._find_next())
         self._find_edit.textChanged.connect(lambda text: self._update_hits(text, jump=True))
+        self._find_edit.installEventFilter(self)  # focus-out releases the pin
 
         self._find_status = QLabel("")
         self._find_status.setStyleSheet(f"color: {self._pal()['TEXT_MUTED']};")
@@ -2833,6 +3128,7 @@ class DocumentView(QWidget):
         self._replace_edit.setPlaceholderText("Заменить на")
         self._replace_edit.setFixedWidth(220)
         self._replace_edit.returnPressed.connect(self._replace_next)
+        self._replace_edit.installEventFilter(self)  # focus-out releases the pin
 
         self._replace_btn = QPushButton("Заменить")
         self._replace_btn.clicked.connect(self._replace_next)
@@ -2866,7 +3162,7 @@ class DocumentView(QWidget):
         if not self._editing():
             self._enter_edit()
         self._set_replace_mode(True)
-        self._show_overlay()
+        self._show_overlay(pin=True)
         self._place_overlay()
         self._find_edit.setFocus()
         self._find_edit.selectAll()
@@ -3006,15 +3302,57 @@ class DocumentView(QWidget):
         row.addStretch(1)
 
         panel.setVisible(False)
+        panel.installEventFilter(self)  # entering the panel is still "inside"
         self._overlay = panel
 
-    def _show_overlay(self) -> None:
+    def _show_overlay(self, pin: bool = False) -> None:
+        """Show the hover chrome; `pin` keeps it up until the action ends."""
         if self._reading_mode:  # reading mode: maximum text, no chrome
             return
         self._ensure_overlay()
+        if pin:
+            self._overlay_pin = True
+        self._overlay_hide.stop()
         self._overlay.setVisible(True)
         self._overlay.raise_()
         self._place_overlay()
+
+    def _hide_overlay(self, force: bool = False) -> None:
+        """Hide the chrome unless find/replace holds it open (or `force`)."""
+        self._overlay_hide.stop()
+        if force:
+            self._overlay_pin = False
+        if self._overlay_pin and not force:
+            return
+        if self._overlay is not None:
+            self._overlay.setVisible(False)
+
+    def _hover_overlay(self, point: QPoint) -> None:
+        """The panel lives at the preview's top edge: reveal it there, and get
+        out of the way as soon as the pointer moves down into the text."""
+        if self._reading_mode:
+            return
+        if point.y() <= self.OVERLAY_HOT_ZONE:
+            self._show_overlay()
+        else:
+            self._hide_overlay()
+
+    def _maybe_hide_overlay(self) -> None:
+        """Hide after the pointer left, unless it is on the panel itself."""
+        if self._overlay_pin:
+            return
+        overlay = self._overlay
+        if overlay is None or not overlay.isVisible():
+            return
+        if overlay.rect().contains(overlay.mapFromGlobal(QCursor.pos())):
+            return
+        overlay.setVisible(False)
+
+    def _release_overlay_pin(self) -> None:
+        """The find field lost focus: the panel no longer has to stay open."""
+        self._overlay_pin = False
+        if self._overlay is not None and self._overlay.isVisible():
+            self._overlay_hide.start()
 
     def _place_overlay(self) -> None:
         """Centre the overlay over the preview pane, near its top edge."""
@@ -3060,6 +3398,26 @@ class DocumentView(QWidget):
             if event.key() == Qt.Key.Key_Escape:
                 self._toc_filter.clear()
                 return True
+        if obj is getattr(self, "_code_copy_btn", None):
+            # the button is a child of the viewport: leaving it either returns
+            # the pointer to the code (a move keeps it up) or leaves the window
+            # (the delayed check then hides it)
+            if event.type() == QEvent.Type.Leave:
+                self._code_copy_hide.start()
+            elif event.type() == QEvent.Type.Enter:
+                self._code_copy_hide.stop()
+        if obj is getattr(self, "_overlay", None):
+            # entering the panel crosses the viewport (Leave there schedules a
+            # hide), so the panel keeps itself alive while the pointer is on it
+            if event.type() == QEvent.Type.Enter:
+                self._overlay_hide.stop()
+            elif event.type() == QEvent.Type.Leave:
+                self._overlay_hide.start()
+        if obj is getattr(self, "_find_edit", None) or obj is getattr(
+            self, "_replace_edit", None
+        ):
+            if event.type() == QEvent.Type.FocusOut:
+                self._release_overlay_pin()
         pane = self._pane_for(obj)
         if pane is None:
             return super().eventFilter(obj, event)
@@ -3126,6 +3484,19 @@ class DocumentView(QWidget):
             elif etype == QEvent.Type.MouseMove and self._autoscroll_pane is pane:
                 self._move_autoscroll(event.position().toPoint())
                 return True
+            elif etype == QEvent.Type.MouseMove and pane is self._browser:
+                # hover chrome for fenced code: the button sits over the card
+                # under the pointer and is gone as soon as it leaves it; the
+                # top edge of the preview summons the control panel
+                point = event.position().toPoint()
+                if obj is self._browser.viewport():
+                    self._hover_overlay(point)
+                    self._hover_code_copy(point)
+                else:
+                    self._hide_code_copy()
+                    self._hide_overlay()
+            elif etype == QEvent.Type.Leave and obj is self._browser.viewport():
+                self._on_preview_leave()
             elif (
                 etype == QEvent.Type.MouseButtonRelease
                 and pane is self._browser
@@ -3215,16 +3586,17 @@ class DocumentView(QWidget):
 
     def _toggle_find(self) -> None:
         self._set_replace_mode(False)  # Ctrl+F is the plain search
-        self._show_overlay()
+        self._show_overlay(pin=True)  # typing must not be interrupted by hover
         self._find_edit.setFocus()
         self._find_edit.selectAll()
         self._update_hits(self._find_edit.text())
 
     def _close_find(self) -> None:
-        """Clear the query; the field itself stays in the overlay."""
+        """Clear the query and let the panel go; the field stays built."""
         self._find_edit.clear()
         self._find_status.setText("")
         self._set_replace_mode(False)
+        self._hide_overlay(force=True)
         self._search_target().setFocus()
 
     def _search_pattern(self, text: str) -> QRegularExpression | None:
@@ -3360,6 +3732,7 @@ class DocumentView(QWidget):
         anchor = self._browser.cursorForPosition(
             self._browser.viewport().rect().topLeft()
         ).position()
+        self._hide_code_copy()  # the font change moves every card
         self._zoom = max(-8, min(20, level))
         self._apply_preview_zoom()
         self._update_zoom_label()
@@ -3578,7 +3951,7 @@ class DocumentView(QWidget):
             return
         start = self._settings.value("last_dir", str(Path.home()))
         name, _ = QFileDialog.getOpenFileName(
-            self, APP_NAME, start, "Markdown (*.md *.markdown *.txt);;All files (*)"
+            self, APP_NAME, start, "Markdown/JSON (*.md *.markdown *.txt *.json);;All files (*)"
         )
         if not name:
             return
@@ -4225,7 +4598,7 @@ class MainWindow(QMainWindow):
         """Ctrl+O: pick one or more files, one tab each."""
         start = self._settings.value("last_dir", str(Path.home()))
         names, _ = QFileDialog.getOpenFileNames(
-            self, APP_NAME, start, "Markdown (*.md *.markdown *.txt);;All files (*)"
+            self, APP_NAME, start, "Markdown/JSON (*.md *.markdown *.txt *.json);;All files (*)"
         )
         if not names:
             return
@@ -5120,18 +5493,18 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def enterEvent(self, event):
+        # The hover panel is summoned by the preview's top edge, not by any
+        # entry into the window: it used to pop up every time the pointer
+        # crossed the frame and sat over the text (invariant 16).
         super().enterEvent(event)
-        view = self._current_view()
-        if view is not None:
-            view._show_overlay()
 
     def leaveEvent(self, event):
         super().leaveEvent(event)
         # hide only when the pointer really left the window, not just the
         # central widget (the overlay itself counts as inside)
         view = self._current_view()
-        if view is not None and not self.underMouse() and view._overlay is not None:
-            view._overlay.setVisible(False)
+        if view is not None and not self.underMouse():
+            view._hide_overlay()
 
     def eventFilter(self, obj, event):
         """Tab-bar middle click, then route filter events to the current view."""

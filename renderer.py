@@ -10,9 +10,10 @@ because the target engine has quirks that HTML alone doesn't cover:
     oversized images are given an explicit width (Qt ignores ``max-width``).
 """
 
+import json
 import re
 from collections import namedtuple
-from html import unescape
+from html import escape, unescape
 from pathlib import Path
 
 import mistune
@@ -190,3 +191,86 @@ def render_with_outline(text: str, base_dir: Path | None = None) -> tuple[str, l
 def render(text: str, base_dir: Path | None = None) -> str:
     """Convert markdown `text` (belonging to `base_dir`) to displayable HTML."""
     return render_with_outline(text, base_dir)[0]
+
+
+# --- JSON ------------------------------------------------------------------
+# JSON is shown pretty-printed in a normal code card (same `code-body` styling
+# as fenced code, so the hover copy button and the code card look apply), with
+# per-token colours and a top-level-key outline. Invalid JSON is still readable:
+# the parse error is reported and the raw text is kept in a code card.
+
+_JSON_INDENT = "  "
+
+
+def _json_key_html(key: str) -> str:
+    literal = json.dumps(str(key), ensure_ascii=False)
+    return f'<span class="json-key">{escape(literal, quote=False)}</span>'
+
+
+def _json_scalar_html(value) -> str:
+    if value is None:
+        return '<span class="json-null">null</span>'
+    if value is True:
+        return '<span class="json-bool">true</span>'
+    if value is False:
+        return '<span class="json-bool">false</span>'
+    if isinstance(value, str):
+        literal = json.dumps(value, ensure_ascii=False)
+        return f'<span class="json-string">{escape(literal, quote=False)}</span>'
+    if isinstance(value, (int, float)):
+        literal = json.dumps(value, allow_nan=True)
+        return f'<span class="json-number">{escape(literal, quote=False)}</span>'
+    return escape(json.dumps(value, ensure_ascii=False), quote=False)
+
+
+def _json_value_html(value, depth: int, outline: list[Heading], root: bool = False) -> str:
+    """Pretty-print one JSON value, colouring tokens and collecting the outline.
+
+    Only the root object's keys become outline entries (with `md-hN` anchors,
+    the prefix `_anchored_index` expects); nested keys would make the outline
+    as long as the document itself.
+    """
+    pad = _JSON_INDENT * depth          # closing bracket of this container
+    inner = _JSON_INDENT * (depth + 1)  # keys / items one level in
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        lines = []
+        for key, item in value.items():
+            prefix = ""
+            if root:
+                anchor = f"md-h{len(outline)}"
+                outline.append(Heading(1, str(key), anchor))
+                prefix = f'<a name="{anchor}"></a>'
+            child = _json_value_html(item, depth + 1, outline)
+            lines.append(f"{inner}{prefix}{_json_key_html(key)}: {child}")
+        return "{\n" + ",\n".join(lines) + "\n" + pad + "}"
+    if isinstance(value, list):
+        if not value:
+            return "[]"
+        lines = [f"{inner}{_json_value_html(item, depth + 1, outline)}" for item in value]
+        return "[\n" + ",\n".join(lines) + "\n" + pad + "]"
+    return _json_scalar_html(value)
+
+
+def render_json(text: str) -> tuple[str, list[Heading]]:
+    """Pretty-print JSON with syntax colours and a top-level-key outline.
+
+    A BOM is tolerated (some editors write one); a broken file is not an error
+    for the viewer: the message and the raw text are shown instead.
+    """
+    raw = text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        message = escape(exc.msg)
+        where = f"строка {exc.lineno}, колонка {exc.colno}"
+        html = (
+            f'<p class="json-error">JSON не разобран: {message} ({where}). '
+            f"Ниже — исходный текст.</p>"
+            f'<pre class="code-body json">{escape(raw, quote=False)}</pre>'
+        )
+        return html, []
+    outline: list[Heading] = []
+    body = _json_value_html(data, 0, outline, root=isinstance(data, dict))
+    return f'<pre class="code-body json">{body}</pre>', outline

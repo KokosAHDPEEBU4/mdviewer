@@ -36,3 +36,11 @@ for heading in outline:
     print(heading)
 print()
 print(html)
+
+JSON_SOURCE = '{"name": "md", "count": 3, "ok": true, "items": [1, null]}'
+print("\n=== JSON ===\n")
+json_html, json_outline = renderer.render_json(JSON_SOURCE)
+for heading in json_outline:
+    print(heading)
+print()
+print(json_html)

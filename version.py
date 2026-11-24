@@ -2,10 +2,10 @@
 PyInstaller spec (exe metadata) and the file-association installer."""
 
 APP_NAME = "MD Viewer"
-APP_VERSION = "2.9.5"
+APP_VERSION = "2.11.0"
 APP_PUBLISHER = "MD Viewer"
-APP_DESCRIPTION = "Fast markdown viewer"
+APP_DESCRIPTION = "Fast markdown and JSON viewer"
 
 # Windows file-type association (ProgID), see winassoc.py
 PROG_ID = "MDViewer.MarkdownFile"
-EXTENSIONS = (".md",)
+EXTENSIONS = (".md", ".json")

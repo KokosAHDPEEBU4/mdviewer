@@ -47,6 +47,14 @@ DARK = {
     "ACCENT_DIM": "#3d6ea8",
     "CODE_TEXT": "#e6e6e6",
     "CODE_INLINE_TEXT": "#e0ab6e",
+    # JSON syntax colours (renderer.render_json). Keep in both palettes: every
+    # token referenced by content_css must exist in DARK and LIGHT (invariant 32).
+    "JSON_KEY": "#9cdcfe",
+    "JSON_STRING": "#ce9178",
+    "JSON_NUMBER": "#b5cea8",
+    "JSON_BOOL": "#569cd6",
+    "JSON_NULL": "#c586c0",
+    "JSON_ERROR": "#f48771",
     "SUCCESS": "#7fd8a8",
     "MARK_BG": "#5c4a17",               # ==highlighted==
     "MARK_TEXT": "#ffe9a8",
@@ -95,6 +103,12 @@ LIGHT = {
     "ACCENT_DIM": "#3f7fc0",
     "CODE_TEXT": "#242424",
     "CODE_INLINE_TEXT": "#9a4a00",
+    "JSON_KEY": "#0451a5",
+    "JSON_STRING": "#a31515",
+    "JSON_NUMBER": "#098658",
+    "JSON_BOOL": "#0000ff",
+    "JSON_NULL": "#af00db",
+    "JSON_ERROR": "#c62828",
     "SUCCESS": "#1f8a4c",
     "MARK_BG": "#ffe58a",
     "MARK_TEXT": "#5c4a17",
@@ -278,6 +292,12 @@ def content_css(theme: str = DEFAULT_THEME) -> str:
     CODE_TEXT = p["CODE_TEXT"]
     SURFACE_2 = p["SURFACE_2"]
     ACCENT_DIM = p["ACCENT_DIM"]
+    JSON_KEY = p["JSON_KEY"]
+    JSON_STRING = p["JSON_STRING"]
+    JSON_NUMBER = p["JSON_NUMBER"]
+    JSON_BOOL = p["JSON_BOOL"]
+    JSON_NULL = p["JSON_NULL"]
+    JSON_ERROR = p["JSON_ERROR"]
     return f"""
 body {{
     margin-top: 0;
@@ -401,6 +421,20 @@ pre.code-body {{
     text-indent: 14px;
 }}
 pre.code-body.has-lang {{ margin-top: 0; }}
+
+/* JSON: pretty-printed inside a normal code card, with syntax colours. The
+   classes are emitted by renderer.render_json; Qt matches simple class
+   selectors fine, so no descendant combinators are needed. */
+.json-key {{ color: {JSON_KEY}; }}
+.json-string {{ color: {JSON_STRING}; }}
+.json-number {{ color: {JSON_NUMBER}; }}
+.json-bool {{ color: {JSON_BOOL}; }}
+.json-null {{ color: {JSON_NULL}; }}
+p.json-error {{
+    color: {JSON_ERROR};
+    margin-top: 12px;
+    margin-bottom: 8px;
+}}
 
 table.md {{ margin-top: 16px; margin-bottom: 16px; }}
 table.md th {{
@@ -753,6 +787,19 @@ QListWidget#treeList::item:selected {{
 #copyPopup QToolButton:hover {{ background-color: {SURFACE_2}; }}
 #copyPopup QToolButton[stale="true"] {{ color: {TEXT_MUTED}; font-style: italic; }}
 #copyPopup QToolButton[stale="true"]:hover {{ color: {TEXT}; }}
+
+/* Copy button over a fenced code block: it appears on hover in the card's
+   top-right corner, and flashes "Скопировано" after a click. */
+#codeCopy {{
+    color: {TEXT_MUTED};
+    background-color: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 5px;
+    padding: 2px 8px;
+    font-size: 11px;
+}}
+#codeCopy:hover {{ background-color: {SURFACE_2}; color: {TEXT}; }}
+#codeCopy[copied="true"] {{ color: {ACCENT}; border-color: {ACCENT_DIM}; }}
 
 #editorPanel QToolButton {{
     color: {TEXT};

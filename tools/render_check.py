@@ -20,7 +20,7 @@ from PyQt6.QtGui import QColor, QImage  # noqa: E402
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
 from main import create_app  # noqa: E402
-from renderer import render_with_outline  # noqa: E402
+from renderer import render_json, render_with_outline  # noqa: E402
 from theme import ACCENT, BG, CODE_BG, CODE_INLINE_BG, SUCCESS, SURFACE  # noqa: E402
 from viewer import Viewer  # noqa: E402
 
@@ -138,6 +138,7 @@ def main() -> int:
             failures.append(name)
 
     failures += _check_outline_budget()
+    failures += _check_json()
 
     print(f"\npng: {out}")
     return 1 if failures else 0
@@ -163,6 +164,30 @@ def _check_outline_budget() -> list[str]:
     else:
         print(f"ok   {'outline anchors':<18} all {len(outline)} headings anchored")
     failures += _check_table(render_with_outline)
+    return failures
+
+
+def _check_json() -> list[str]:
+    """JSON is pretty-printed with colour spans and a top-level-key outline."""
+    html, outline = render_json(
+        '{"name": "md", "count": 3, "ok": true, "items": [1, null]}'
+    )
+    checks = {
+        "json key spans": 'class="json-key"' in html,
+        "json string spans": 'class="json-string"' in html,
+        "json number spans": 'class="json-number"' in html,
+        "json bool/null spans": 'class="json-bool"' in html and 'class="json-null"' in html,
+        "json top-level outline": [h.label for h in outline]
+        == ["name", "count", "ok", "items"],
+        "json anchors": html.count('<a name="md-h') == len(outline),
+    }
+    bad, bad_outline = render_json('{"a": }')
+    checks["json error is shown"] = 'class="json-error"' in bad and bad_outline == []
+    failures = []
+    for name, ok in checks.items():
+        print(f"{'ok  ' if ok else 'FAIL'} {name:<18} {ok}")
+        if not ok:
+            failures.append(name)
     return failures
 
 
