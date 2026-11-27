@@ -5,6 +5,7 @@ Run from the project root:
 """
 
 import inspect
+import json
 import os
 import re
 import sys
@@ -28,11 +29,13 @@ from theme import (
     EDITOR_MIN,
     EDITOR_RATIO,
     EDITOR_SELECTION,
+    GUTTER_MIN,
     MEASURE,
     MIN_COLUMN,
     PREVIEW_HARD,
     PREVIEW_SELECTION,
     SPLIT_HANDLE,
+    column_side,
     side_margin,
 )
 from viewer import editor_cap_width, editor_width, layout_panes, toc_visible_for
@@ -87,6 +90,15 @@ def main() -> int:
     check("wide window grows the bars", side_margin(3440), 1072)
     check("column never exceeds MEASURE", 3440 - 2 * side_margin(3440) <= MEASURE, True)
     check("text column stays readable", 3440 - 2 * side_margin(3440) >= MIN_COLUMN, True)
+    # a width dragged by the column handles: 0 keeps the policy above
+    check("auto width keeps the side policy", column_side(1700), side_margin(1700))
+    check("user width centres the column", column_side(1700, 900), 400)
+    check("user width cannot exceed the pane", column_side(700, 1300), 20)
+    check("user width keeps the column readable",
+          column_side(1700, 100), (1700 - MIN_COLUMN) // 2)
+    check("a pane narrower than MIN_COLUMN leaves only the gutters",
+          column_side(300, 900), GUTTER_MIN)
+    check("no gap is eaten on a tiny pane", 300 - 2 * column_side(300, 900) < MIN_COLUMN, True)
 
     # --- pane shrink policy, pure function traces (avail excludes handles)
     check("read: TOC yields to keep the column", layout_panes(586, False, True, 240, 520), (166, 0, 420))
@@ -708,9 +720,15 @@ def main() -> int:
         win._browser.verticalScrollBar().setValue(int(lay.blockBoundingRect(first).top()))
         for _ in range(2):
             app.processEvents()
-        spacing = lay.blockBoundingRect(doc.find("line 01").block()).top() - lay.blockBoundingRect(first).top()
-        hit = win._browser.cursorForPosition(QPoint(8, int(spacing * 1.5))).block().text()
-        check("click inside a code block maps to that line", hit.startswith("line 01"), True)
+        # the body is one block with <br> line separators now, so click on the
+        # rect of a middle line and check the hit lands inside that same line
+        target = "line 05"
+        offset = doc.toPlainText().index(target)
+        cursor = QTextCursor(doc)
+        cursor.setPosition(offset)
+        hit = win._browser.cursorForPosition(win._browser.cursorRect(cursor).center())
+        check("click inside a code block maps to that line",
+              offset <= hit.position() <= offset + len(target), True)
         win.close()
         app.processEvents()
 
@@ -1733,6 +1751,9 @@ def main() -> int:
               runs[0].text, ".pill { display: inline-flex; }\n.chip { gap: 6px; }")
         check("a card without a language is copied whole",
               runs[1].text, "plain\nline two")
+        header = win._browser.document().findBlockByNumber(runs[1].card_start)
+        check("a no-language card still has a header",
+              header.text().split("\u2028")[0], "код")
         win._hide_code_copy()  # a live cursor may have hovered during show()
         check("no copy button without a hover",
               win._code_copy_btn is None or not win._code_copy_btn.isVisible(), True)
@@ -1780,6 +1801,20 @@ def main() -> int:
         finally:
             viewer_mod.QApplication.clipboard = original_clipboard
 
+        # selecting across code lines uses U+2028 now (one block); the copy
+        # strip must still turn them into real newlines
+        document = win._browser.document()
+        plain = document.toPlainText()
+        cursor = QTextCursor(document)
+        cursor.setPosition(plain.index(".pill"))
+        cursor.setPosition(plain.index(".chip"), QTextCursor.MoveMode.KeepAnchor)
+        win._browser.setTextCursor(cursor)
+        app.processEvents()
+        check("a code selection copies real newlines",
+              win._plain_selection(), ".pill { display: inline-flex; }")
+        win._browser.setTextCursor(QTextCursor(document))
+        app.processEvents()
+
         _move_to("Text between cards.")
         check("leaving the card hides the button", button.isVisible(), False)
 
@@ -1802,6 +1837,131 @@ def main() -> int:
             app.processEvents()
         win._confirm_discard = lambda: True
         win._leave_edit()
+        win.close()
+        app.processEvents()
+
+    # --- column boundaries: visible strips, dragged to set the text width
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "column.md"
+        path.write_text(
+            "# Title\n\n" + "".join(f"line {index}\n\n" for index in range(40)),
+            encoding="utf-8",
+        )
+        settings = QSettings(tempfile.mkdtemp(), "column_check")
+        win = viewer_mod.Viewer(path, settings)
+        win.resize(1500, 600)
+        win.show()
+        for _ in range(3):
+            app.processEvents()
+
+        check("automatic column keeps the default policy",
+              win._side, column_side(win._browser.contentsRect().width()))
+        left, right = win._column_handles
+        check("column boundaries are visible",
+              left.isVisible() and right.isVisible(), True)
+        check("the right boundary sits on the column edge",
+              right.x(), win._browser.width() - win._side)
+        check("the left boundary sits on the column edge",
+              left.x() + left.width(), win._side)
+
+        # drag the right boundary 100 px left: the mirrored left edge moves too,
+        # so the column narrows by 200 px and the persisted width follows
+        start = win._browser.viewport().width()
+        win._begin_column_drag(1, 1000.0)
+        win._drag_column(900.0)
+        win._end_column_drag()
+        check("dragging a boundary resizes the column",
+              abs(win._browser.viewport().width() - (start - 200)) <= 1, True)
+        check("the dragged width is persisted",
+              int(win._settings.value("column_width")), win._column_width)
+        check("the boundary follows the dragged width",
+              right.x(), win._browser.width() - win._side)
+
+        win._reset_column_width()
+        check("double-click restores the automatic width", win._column_width, 0)
+        check("the automatic side comes back",
+              win._side, column_side(win._browser.contentsRect().width()))
+        check("the reset is persisted",
+              int(win._settings.value("column_width", -1)), 0)
+
+        # the real mouse path: press -> move -> release on the strip itself
+        auto = win._browser.contentsRect().width() - 2 * win._side
+        p1 = QPointF(right.rect().center())
+        g1 = QPointF(right.mapToGlobal(p1.toPoint()))
+        g2 = QPointF(g1.x() - 60, g1.y())
+        QApplication.sendEvent(right, QMouseEvent(
+            QEvent.Type.MouseButtonPress, p1, g1,
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier))
+        QApplication.sendEvent(right, QMouseEvent(
+            QEvent.Type.MouseMove, p1, g2,
+            Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier))
+        QApplication.sendEvent(right, QMouseEvent(
+            QEvent.Type.MouseButtonRelease, p1, g2,
+            Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier))
+        check("dragging the strip with the mouse resizes the column",
+              win._browser.contentsRect().width() - 2 * win._side, auto - 120)
+        check("the mouse drag persists the width",
+              int(win._settings.value("column_width")), win._column_width)
+        win._reset_column_width()
+        QApplication.sendEvent(right, QMouseEvent(
+            QEvent.Type.MouseButtonPress, p1, g1,
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier))
+        QApplication.sendEvent(right, QMouseEvent(
+            QEvent.Type.MouseButtonRelease, p1, g1,
+            Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier))
+        check("a click without a drag keeps the automatic width",
+              win._column_width, 0)
+
+        # a width change rewraps the text: the reader must stay on the same line
+        win._browser.verticalScrollBar().setValue(420)
+        app.processEvents()
+        before = win._browser.cursorForPosition(QPoint(0, 0)).block().text()
+        win._begin_column_drag(1, 1000.0)
+        win._drag_column(900.0)
+        win._end_column_drag()
+        for _ in range(3):
+            app.processEvents()
+        after = win._browser.cursorForPosition(QPoint(0, 0)).block().text()
+        check("the reading position survives a width drag", after, before)
+        win._reset_column_width()
+        for _ in range(2):
+            app.processEvents()  # the deferred anchor restore runs here
+        win._browser.verticalScrollBar().setValue(0)
+        app.processEvents()
+
+        win._set_theme("light")
+        check("boundaries take the light theme colour",
+              right._line.name().lower(),
+              theme_mod.palette("light")["BORDER"].lower())
+        win._set_theme("dark")
+
+        win._set_column_width(100)
+        check("the column never gets narrower than MIN_COLUMN",
+              win._browser.contentsRect().width() - 2 * win._side >= MIN_COLUMN, True)
+        win._set_column_width(99999)
+        check("the column never exceeds the pane",
+              win._browser.contentsRect().width() - 2 * win._side
+              <= win._browser.contentsRect().width() - GUTTER_MIN * 2, True)
+
+        win._set_reading_mode(True)
+        check("reading mode hides the boundaries", left.isVisible(), False)
+        win._set_reading_mode(False)
+        check("leaving reading mode shows them again", left.isVisible(), True)
+
+        # a fresh view picks the stored width up
+        settings.setValue("column_width", 880)
+        other = viewer_mod.Viewer(path, settings)
+        other.resize(1500, 600)
+        other.show()
+        for _ in range(2):
+            app.processEvents()
+        check("a new view restores the stored width", other._column_width, 880)
+        other.close()
         win.close()
         app.processEvents()
 
@@ -1972,6 +2132,10 @@ def main() -> int:
         check("json renders number spans", 'class="json-number"' in html, True)
         check("json renders bool/null spans",
               'class="json-bool"' in html and 'class="json-null"' in html, True)
+        check("json has a card header",
+              'class="code-lang">json<br></p>' in html, True)
+        check("json is a labelled code card",
+              'class="code-body has-lang json"' in html, True)
         check("json outline lists top-level keys",
               [h.label for h in outline], ["name", "count", "ok", "items", "nested"])
         check("json anchors use the md-h prefix",
@@ -1982,6 +2146,8 @@ def main() -> int:
         check("broken json does not crash", bad_outline, [])
         check("broken json shows an error", 'class="json-error"' in bad_html, True)
         check("broken json keeps the raw text", '{"a": }' in bad_html, True)
+        check("broken json keeps the card header",
+              'class="code-lang">json<br></p>' in bad_html, True)
 
         settings = QSettings(tempfile.mkdtemp(), "json_check")
         win = viewer_mod.Viewer(good, settings)
@@ -1994,6 +2160,56 @@ def main() -> int:
         check("json is pretty-printed", '\n  "count": 3' in preview, True)
         check("json outline is populated in the viewer", len(win._outline), 5)
         check("json is viewable", viewer_mod.DocumentView._viewable(good), True)
+        check("json is a copyable card", len(win._code_runs), 1)
+        check("json copy excludes the header",
+              win._code_runs[0].text.startswith('{\n  "name"'), True)
+        # the current section must follow the anchor position even when the
+        # anchor sits after the cursor in the same line (a key's indentation)
+        doc = win._browser.document()
+        anchors = {}
+        anchor_blocks = {}
+        block = doc.begin()
+        while block.isValid():
+            fragment = block.begin()
+            while fragment != block.end():
+                piece = fragment.fragment()
+                if piece.isValid():
+                    for name in piece.charFormat().anchorNames():
+                        if name.startswith("md-h"):
+                            index = int(name[4:])
+                            anchors[index] = piece.position()
+                            anchor_blocks[index] = block
+                fragment += 1
+            block = block.next()
+        check("json anchors are found", len(anchors), 5)
+        check("a later json key becomes the current section",
+              viewer_mod.DocumentView._anchored_index(
+                  anchor_blocks[3], anchors[3]), 3)
+        check("the first json key stays first",
+              viewer_mod.DocumentView._anchored_index(
+                  anchor_blocks[0], anchors[0]), 0)
+        header = win._browser.document().findBlockByNumber(win._code_runs[0].card_start)
+        check("the copy button sits on the json header",
+              header.text().split("\u2028")[0], "json")
+
+        # clicking a key in the outline must highlight that key, not the one
+        # above it (an indented key line starts after the x=0 hit-test point)
+        big = Path(folder) / "big.json"
+        big.write_text(json.dumps({f"key{index}": index for index in range(80)}),
+                       encoding="utf-8")
+        big_win = viewer_mod.Viewer(big, QSettings(tempfile.mkdtemp(), "big_json"))
+        big_win.resize(900, 500)
+        big_win.show()
+        for _ in range(3):
+            app.processEvents()
+        big_win._outline_clicked(big_win._toc.item(40))
+        for _ in range(2):
+            app.processEvents()
+        check("outline click selects the clicked json key",
+              big_win._current_section_index(), 40)
+        big_win.close()
+        for _ in range(2):
+            app.processEvents()
         win.close()
         for _ in range(2):
             app.processEvents()

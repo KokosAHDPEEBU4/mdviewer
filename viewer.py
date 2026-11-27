@@ -86,6 +86,7 @@ from syncsel import SourceMap
 from theme import (
     ACCENT,
     ACCENT_DIM,
+    BORDER,
     CODE_BG,
     DEFAULT_THEME,
     EDITOR_HARD,
@@ -94,6 +95,7 @@ from theme import (
     EDITOR_PREF,
     EDITOR_RATIO,
     EDITOR_SELECTION,
+    GUTTER_MIN,
     HYST,
     HL_OVERLAY_ALPHA,
     MEASURE,
@@ -110,12 +112,12 @@ from theme import (
     TREE_MIN_WIDTH,
     TREE_WIDTH,
     app_qss,
+    column_side,
     content_css,
     is_light,
     normalize,
     palette,
     retheme_tables,
-    side_margin,
 )
 from version import APP_NAME, APP_VERSION
 
@@ -569,6 +571,94 @@ class ScrollIndicator(QWidget):
         painter.drawEllipse(centre + self._dot, 4, 4)
 
 
+class ColumnHandle(QWidget):
+    """A draggable boundary of the reading column.
+
+    It lives in the preview's side margin (a child of the `QTextBrowser`, not
+    of its viewport), so it never covers text or the scrollbar. The inner edge
+    of the strip is the column boundary; a faint line keeps the limit visible
+    all the time and brightens with a small grip while hovered. Dragging moves
+    the boundary and mirrors it on the other side, so the column stays centred;
+    the width is stored in QSettings by the view. Double-click restores the
+    automatic policy.
+    """
+
+    WIDTH = 8  # grab strip inside the margin (the scrollbar starts right after)
+
+    def __init__(self, view: "DocumentView", sign: int):
+        super().__init__(view._browser)
+        self._view = view
+        self._sign = -1 if sign < 0 else 1  # -1 = left boundary, +1 = right
+        self._line = QColor(BORDER)
+        self._hover_line = QColor(ACCENT_DIM)
+        self._hover = False
+        self.setFixedWidth(self.WIDTH)
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+        # a plain child widget is transparent; the line is all we paint
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+
+    def set_colours(self, line: str, hover: str) -> None:
+        """Theme switch: recolour the faint line and its hover state."""
+        self._line = QColor(line)
+        self._hover_line = QColor(hover)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        colour = QColor(self._hover_line if self._hover else self._line)
+        if not self._hover:
+            colour.setAlpha(150)  # visible, but not a frame around the page
+        x = self.width() - 1 if self._sign < 0 else 0
+        painter.setPen(QPen(colour, 1))
+        painter.drawLine(x, 0, x, self.height())
+        if self._hover:
+            # three dots on the boundary: the "you can drag me" grip
+            centre = self.height() // 2
+            painter.setBrush(colour)
+            painter.setPen(Qt.PenStyle.NoPen)
+            for offset in (-8, 0, 8):
+                painter.drawEllipse(QPoint(x, centre + offset), 2, 2)
+        painter.end()
+
+    def enterEvent(self, event):
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._view._begin_column_drag(self._sign, event.globalPosition().x())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            self._view._drag_column(event.globalPosition().x())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._view._end_column_drag()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._view._reset_column_width()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
 class DocumentView(QWidget):
     SCROLL_DEAD_ZONE = 12   # px the pointer must move before autoscroll kicks in
     WHEEL_STEP = 40.0       # accumulated wheel units that make one zoom level
@@ -723,6 +813,20 @@ class DocumentView(QWidget):
         self._browser.selectionChanged.connect(self._highlight_editor_from_preview)
         self._browser.selectionChanged.connect(self._update_copy_popup)
         self._preview_base_font = QFont(self._browser.document().defaultFont())
+
+        # The reading column is centred by viewport margins; its boundaries are
+        # two drag strips living in those side margins. `_column_width` is the
+        # user's width (0 = the automatic MEASURE policy of theme.side_margin).
+        try:
+            self._column_width = max(
+                0, int(self._settings.value("column_width", 0) or 0)
+            )
+        except (TypeError, ValueError):
+            self._column_width = 0
+        self._column_drag = None  # (sign, start_x, start_width, start_pref)
+        self._column_anchor = None  # preview char to pin across a width drag
+        self._column_handles = (ColumnHandle(self, -1), ColumnHandle(self, 1))
+        self._refresh_column_handles()
 
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
         self._splitter.setChildrenCollapsible(False)
@@ -994,6 +1098,12 @@ class DocumentView(QWidget):
         editor = getattr(self, "_editor", None)
         if editor is not None and hasattr(editor, "set_palette_colours"):
             editor.set_palette_colours(p["CODE_BG"], p["TEXT_MUTED"])
+        self._refresh_column_handles()
+
+    def _refresh_column_handles(self) -> None:
+        p = self._pal()
+        for handle in getattr(self, "_column_handles", ()) or ():
+            handle.set_colours(p["BORDER"], p["ACCENT_DIM"])
 
     def _apply_theme(self, name: str) -> None:
         """Switch this view to `name`, re-rendering and keeping the position.
@@ -1006,9 +1116,7 @@ class DocumentView(QWidget):
         name = normalize(name)
         self._theme = name
         self._refresh_theme_chrome()
-        anchor = self._browser.cursorForPosition(
-            self._browser.viewport().rect().topLeft()
-        ).position()
+        anchor = self._preview_top_cursor().position()
         self._render(self._text)
         self._scroll_preview_to(anchor)
 
@@ -1096,9 +1204,7 @@ class DocumentView(QWidget):
         # remember the character on the top edge, exactly like a zoom or `load`:
         # the document is about to be rebuilt, so a raw scroll pixel would point
         # at different text afterwards
-        anchor = self._browser.cursorForPosition(
-            self._browser.viewport().rect().topLeft()
-        ).position()
+        anchor = self._preview_top_cursor().position()
         self._text = text
         self._encoding = encoding or self._encoding
         self._newline = newline or self._newline
@@ -1114,16 +1220,126 @@ class DocumentView(QWidget):
         self._scroll_preview_to(anchor)
         return True
 
+    def _preview_top_cursor(self):
+        """Cursor on the top visual line, sampled inside the line.
+
+        The old `viewport().rect().topLeft()` point (x=0) falls to the *left*
+        of an indented line — code/JSON lines start 14 px in — and Qt then
+        hit-tests the line above, so section/anchor bookkeeping slipped one
+        line back. The middle of the viewport is always on the top line.
+        """
+        view = self._browser.viewport().rect()
+        # y=0 itself belongs to the line *above* (its bottom edge): one pixel in
+        return self._browser.cursorForPosition(
+            QPoint(max(1, view.width() // 2), view.top() + 1)
+        )
+
     def _set_margins(self) -> None:
-        """Keep the text column at a readable width.
+        """Keep the text column at the chosen (or automatic) width.
 
         Done with viewport margins rather than CSS: a resize then costs a
-        geometry update instead of re-parsing the whole document.
+        geometry update instead of re-parsing the whole document. The same
+        margins host the two column handles, so they are re-parked here too
+        (their position depends on the width even when the inset does not).
         """
-        side = side_margin(self._browser.contentsRect().width())
+        side = column_side(self._browser.contentsRect().width(), self._column_width)
         if side != self._side:
             self._side = side
             self._browser.setViewportMargins(side, 0, side, 0)
+        self._place_column_handles()
+
+    def _place_column_handles(self) -> None:
+        """Park the boundary strips in the side margins, inside the column edges."""
+        handles = getattr(self, "_column_handles", None)
+        if not handles:
+            return
+        browser = self._browser
+        grab = ColumnHandle.WIDTH
+        side = max(0, self._side)
+        left, right = handles
+        left.setGeometry(max(0, side - grab), 0, grab, browser.height())
+        right.setGeometry(max(0, browser.width() - side), 0, grab, browser.height())
+        visible = not self._reading_mode and side >= grab
+        left.setVisible(visible)
+        right.setVisible(visible)
+        if visible:
+            left.raise_()
+            right.raise_()
+
+    def _begin_column_drag(self, sign: int, global_x: float) -> None:
+        """Start dragging a boundary: remember the span in global coordinates.
+
+        Global coordinates keep the drag steady while the inset (and therefore
+        the handle itself) moves under the pointer on every step.
+        """
+        # the column includes the side insets; the viewport additionally loses
+        # the scrollbar width, which must not be shaved off on every drag
+        column = self._browser.contentsRect().width() - 2 * max(0, self._side)
+        self._column_drag = (sign, global_x, column, self._column_width)
+        # a width change rewraps the document; pin the character the reader is
+        # looking at so the drag does not scroll them somewhere else
+        self._column_anchor = self._preview_top_cursor().position()
+        self._hide_code_copy()
+        self._hide_copy_popup()
+        self._hide_overlay()
+
+    def _drag_column(self, global_x: float) -> None:
+        if self._column_drag is None:
+            return
+        sign, start_x, start_width, _ = self._column_drag
+        # the other boundary mirrors this one, so the column grows by two
+        # pixels per dragged pixel and the edge follows the pointer exactly
+        self._set_column_width(start_width + 2 * sign * (global_x - start_x))
+
+    def _end_column_drag(self) -> None:
+        drag = self._column_drag
+        self._column_drag = None
+        if drag is None or self._column_width == drag[3]:
+            self._column_anchor = None  # a click, not a drag: nothing moved
+            return
+        self._settings.setValue("column_width", int(self._column_width))
+        self._broadcast_column_width()
+        # the layout settles on the next event loop turn, then re-pin the reader
+        QTimer.singleShot(0, self._restore_column_anchor)
+
+    def _restore_column_anchor(self) -> None:
+        anchor = self._column_anchor
+        self._column_anchor = None
+        if anchor is not None:
+            self._scroll_preview_to(anchor)
+
+    def _set_column_width(self, width: float) -> None:
+        """Clamp a dragged width to the window and to MIN_COLUMN, then apply it."""
+        limit = max(1, self._browser.contentsRect().width() - GUTTER_MIN * 2)
+        if limit < MIN_COLUMN:
+            target = limit
+        else:
+            target = max(MIN_COLUMN, min(int(round(width)), limit))
+        self._column_width = target
+        self._set_margins()
+
+    def _reset_column_width(self) -> None:
+        """Double-click on a boundary: back to the automatic MEASURE policy."""
+        anchor = self._preview_top_cursor().position()
+        self._column_width = 0
+        self._column_drag = None
+        self._column_anchor = anchor
+        self._settings.setValue("column_width", 0)
+        self._set_margins()
+        self._broadcast_column_width()
+        QTimer.singleShot(0, self._restore_column_anchor)
+
+    def _apply_column_width(self, width: int) -> None:
+        self._column_width = max(0, int(width))
+        self._set_margins()
+
+    def _broadcast_column_width(self) -> None:
+        """A width dragged in one tab applies to every open tab and window."""
+        for window in _live_windows():
+            for index in range(window._tabs.count()):
+                view = window._tabs.widget(index)
+                if view is not None and view is not self:
+                    view._apply_column_width(self._column_width)
 
     def _on_splitter_moved(self, *_args) -> None:
         """A user drag: remember the pane widths as the new preferences.
@@ -1270,22 +1486,52 @@ class DocumentView(QWidget):
         as the document re-wraps (a resize, entering edit mode), so the section
         is derived from the viewport cursor instead.
         """
-        cursor = self._browser.cursorForPosition(self._browser.viewport().rect().topLeft())
-        index = self._anchored_index(cursor.block())
+        cursor = self._preview_top_cursor()
+        index = self._anchored_index(cursor.block(), cursor.position())
         return index if index is not None else 0
 
     @staticmethod
-    def _anchored_index(block):
-        """Outline index of the nearest `md-hN` anchor at or above `block`."""
+    def _anchored_index(block, position=None):
+        """Outline index of the nearest `md-hN` anchor at or above `position`.
+
+        The anchor usually sits a few characters *after* the top-left cursor:
+        a JSON key line starts with indentation and a heading can have a prefix
+        fragment. Anchors on the cursor's own visual line therefore count even
+        when they are after `position`; anchors further down are not. Earlier
+        blocks contribute their last anchor (ordinary headings have one).
+        """
+        limit = position if position is not None else 10**12
+        line_start = None
+        line_end = None
+        first = True
         while block.isValid():
+            if first and position is not None:
+                layout = block.layout()
+                offset = max(0, position - block.position())
+                line = layout.lineForTextPosition(offset) if layout is not None else None
+                if line.isValid():
+                    line_start = block.position() + line.textStart()
+                    line_end = line_start + line.textLength()
+            found = None
             fragment = block.begin()
             while fragment != block.end():
                 piece = fragment.fragment()
                 if piece.isValid():
                     for name in piece.charFormat().anchorNames():
-                        if name.startswith("md-h"):
-                            return int(name[4:])
+                        if not name.startswith("md-h"):
+                            continue
+                        same_line = (
+                            line_start is not None
+                            and line_start <= piece.position() <= line_end
+                        )
+                        if piece.position() <= limit or same_line:
+                            found = int(name[4:])  # last one in document order
                 fragment += 1
+            if found is not None:
+                return found
+            limit = 10**12  # earlier blocks: any anchor is above the viewport
+            line_start = line_end = None
+            first = False
             block = block.previous()
         return None
 
@@ -1467,6 +1713,7 @@ class DocumentView(QWidget):
             self._toc_user_visible = self._reading_toc_saved
             self._reading_toc_saved = None
             self._relayout()
+        self._place_column_handles()  # no grab strips over the fullscreen text
         self._sync_crumbs()
 
     def _open_link(self, url: QUrl, new_tab: bool | None = None) -> None:
@@ -1713,9 +1960,7 @@ class DocumentView(QWidget):
         # the preview column shrinks a little when the editor opens (the window
         # may be capped by the screen), which rewraps the whole document; pin the
         # character at the top so the reader is not thrown to another section
-        self._preview_anchor = self._browser.cursorForPosition(
-            self._browser.viewport().rect().topLeft()
-        ).position()
+        self._preview_anchor = self._preview_top_cursor().position()
         QTimer.singleShot(200, self._clear_preview_anchor)
         # remember the target *before* the layout changes below: the window
         # resize re-wraps the preview, so re-reading the viewport after the
@@ -1763,8 +2008,7 @@ class DocumentView(QWidget):
 
     def _visible_paragraph(self) -> str:
         """Rendered text of the paragraph at the top of the preview viewport."""
-        corner = self._browser.viewport().rect().topLeft()
-        return self._browser.cursorForPosition(corner).block().text().strip()
+        return self._preview_top_cursor().block().text().strip()
 
     def _section_fraction(self):
         """How far the viewport top is into the current section (0..1).
@@ -2166,6 +2410,10 @@ class DocumentView(QWidget):
         back: opaque bars painted *after* the native pass cover the text, so
         the selected line could no longer be read through its highlight.)
         """
+        if widget is self._browser:
+            # code cards draw their own outline here: Qt rich text has no
+            # block borders, and a painted 1px line never hides glyphs
+            self._paint_code_card_borders(painter)
         other = self._editor if widget is self._browser else self._browser
         layers = self._hl_layers.get(widget, [])
         if not layers or other is None:
@@ -2178,6 +2426,42 @@ class DocumentView(QWidget):
         for cursor in cursors:
             for rect in self._cursor_rects(widget, cursor):
                 painter.fillRect(rect, tint)
+
+    def _paint_code_card_borders(self, painter) -> None:
+        """Outline every visible code/JSON card over the painted text.
+
+        The card fill is solid because its per-line blocks use
+        `line-height: 100%` (invariant 3), but Qt cannot put a border on a
+        block, so the 1px rounded outline is drawn in the viewport overlay
+        pass. Runs are in document order, so off-screen cards are skipped by
+        character position and the loop stops below the viewport.
+        """
+        runs = getattr(self, "_code_runs", None)
+        if not runs:
+            return
+        viewport = self._browser.viewport().rect()
+        document = self._browser.document()
+        # character positions of the visible band let us skip off-screen cards
+        # without a cursorRect/layout query for each of them
+        top_pos = self._browser.cursorForPosition(viewport.topLeft()).position()
+        bottom_pos = self._browser.cursorForPosition(viewport.bottomLeft()).position()
+        painter.save()
+        painter.setPen(QPen(QColor(self._pal()["BORDER"]), 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for run in runs:
+            first = document.findBlockByNumber(run.card_start)
+            last = document.findBlockByNumber(run.end)
+            if not first.isValid() or not last.isValid():
+                continue
+            if last.position() < top_pos:
+                continue
+            if first.position() > bottom_pos:
+                break
+            rect = self._code_run_rect(run)
+            if rect.isNull():
+                continue
+            painter.drawRoundedRect(rect.adjusted(0, 0, -1, -1), 6, 6)
+        painter.restore()
 
     @staticmethod
     def _cursor_rects(widget, cursor):
@@ -2405,15 +2689,17 @@ class DocumentView(QWidget):
         Qt's rich-text importer turns every line of a `<pre>` into its own
         block; each of them carries the code background and the left inset from
         the stylesheet. A card is therefore a contiguous run of such blocks,
-        optionally preceded by the language caption (`p.code-lang`, same
-        background but a muted foreground). The caption is kept out of the
-        copied text.
+        directly preceded by its header (`p.code-lang`: SURFACE background,
+        muted text, same inset). The header is part of the card for the hover
+        button but is kept out of the copied text.
         """
         self._code_runs = []
         self._code_run_by_block = {}
         document = self._browser.document()
-        code_bg = self._pal()["CODE_BG"].lower()
-        muted = self._pal()["TEXT_MUTED"].lower()
+        palette = self._pal()
+        code_bg = palette["CODE_BG"].lower()
+        surface = palette["SURFACE"].lower()
+        muted = palette["TEXT_MUTED"].lower()
         start = None
         last = None
         card_start = None
@@ -2421,9 +2707,7 @@ class DocumentView(QWidget):
         lines: list[str] = []
         block = document.begin()
         while block.isValid():
-            caption = self._is_code_line(block, code_bg) and self._is_code_caption(
-                block, muted
-            )
+            caption = self._is_code_caption(block, surface, muted)
             if caption:
                 if start is not None:
                     self._add_code_run(start, last, lines, card_start)
@@ -2440,7 +2724,9 @@ class DocumentView(QWidget):
                         else start
                     )
                     lines = []
-                lines.append(block.text())
+                # body lines are separate blocks; U+2028 only appears in a
+                # two-line header, but normalizing it keeps the copy robust
+                lines.append(block.text().replace("\u2028", "\n"))
                 last = block.blockNumber()
                 pending_caption = None
             else:
@@ -2477,12 +2763,17 @@ class DocumentView(QWidget):
         )
 
     @staticmethod
-    def _is_code_caption(block, muted: str) -> bool:
-        """The language label above a code card (muted text on the code bg)."""
+    def _is_code_caption(block, surface: str, muted: str) -> bool:
+        """The header bar above a code card (SURFACE bar, muted label)."""
+        fmt = block.blockFormat()
+        background = fmt.background()
         foreground = block.charFormat().foreground()
         return (
-            foreground.style() != Qt.BrushStyle.NoBrush
+            background.style() != Qt.BrushStyle.NoBrush
+            and background.color().name().lower() == surface
+            and foreground.style() != Qt.BrushStyle.NoBrush
             and foreground.color().name().lower() == muted
+            and fmt.textIndent() > 0
         )
 
     def _code_run_at(self, point: QPoint):
@@ -2565,7 +2856,7 @@ class DocumentView(QWidget):
             return False
         size = button.size()
         x = max(6, viewport.width() - size.width() - 10)
-        y = max(6, min(rect.top() + 8, viewport.height() - size.height() - 6))
+        y = max(4, min(rect.top() + 4, viewport.height() - size.height() - 6))
         button.move(x, y)
         return True
 
@@ -2642,7 +2933,10 @@ class DocumentView(QWidget):
     def _plain_selection(self) -> str:
         """Selected preview text as plain lines; images contribute nothing."""
         text = self._browser.textCursor().selectedText()
-        return text.replace("\u2029", "\n").replace("\uFFFC", "").strip("\n")
+        # a header is one block with a U+2028 line separator, ordinary text
+        # separates paragraphs with U+2029; both must copy as real newlines
+        text = text.replace("\u2029", "\n").replace("\u2028", "\n")
+        return text.replace("\uFFFC", "").strip("\n")
 
     def _md_selection(self) -> tuple[str, bool]:
         """Markdown behind the preview selection, and whether it is still editable.
@@ -3389,14 +3683,18 @@ class DocumentView(QWidget):
         font moved but `_zoom` and the label stayed at 100%). Autoscroll is
         tracked separately per pane, so starting it in one never moves the other.
         """
-        if obj is self._splitter and event.type() == QEvent.Type.Resize:
+        # `getattr` guards the construction window: column handles are children
+        # of the browser and their creation sends events before `_splitter`
+        # exists; an AttributeError in a filter slot aborts the process
+        if obj is getattr(self, "_splitter", None) and event.type() == QEvent.Type.Resize:
             # the splitter resizes a step after the window, so its Resize carries
             # the final width; laying out here avoids a stale-width pass
             self._relayout(event.size().width())
             return False
-        if obj is self._toc_filter and event.type() == QEvent.Type.KeyPress:
+        toc_filter = getattr(self, "_toc_filter", None)
+        if obj is toc_filter and event.type() == QEvent.Type.KeyPress:
             if event.key() == Qt.Key.Key_Escape:
-                self._toc_filter.clear()
+                toc_filter.clear()
                 return True
         if obj is getattr(self, "_code_copy_btn", None):
             # the button is a child of the viewport: leaving it either returns
@@ -3729,9 +4027,7 @@ class DocumentView(QWidget):
         character at the top of the viewport is captured first and re-pinned
         after the relayout, so zooming keeps the reader in place.
         """
-        anchor = self._browser.cursorForPosition(
-            self._browser.viewport().rect().topLeft()
-        ).position()
+        anchor = self._preview_top_cursor().position()
         self._hide_code_copy()  # the font change moves every card
         self._zoom = max(-8, min(20, level))
         self._apply_preview_zoom()
@@ -3777,9 +4073,7 @@ class DocumentView(QWidget):
         self._sync_timer.start()
 
     def _preview_top_position(self) -> int:
-        return self._browser.cursorForPosition(
-            self._browser.viewport().rect().topLeft()
-        ).position()
+        return self._preview_top_cursor().position()
 
     def _editor_top_position(self) -> int:
         return self._editor.cursorForPosition(

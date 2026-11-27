@@ -68,7 +68,12 @@ _TASK_OPEN, _TASK_DONE = '<span class="task-box">&#9744;</span> ', (
 
 
 def _code_block(lang: str | None, body: str) -> str:
-    """Fenced code -> a card laid out with plain blocks.
+    """Fenced code -> a card with a header bar, like a chat code block.
+
+    Every card gets a header row: the language when the fence names one, and
+    "код" otherwise. The header carries the hover copy button (the button is a
+    viewport overlay parked over this row, see `viewer._code_run_rect`), so the
+    control never sits on top of the code itself.
 
     It used to be a single-cell table so ``td`` padding would pad the code, but
     Qt's hit-testing inside a multi-line table cell is broken: clicking between
@@ -77,11 +82,28 @@ def _code_block(lang: str | None, body: str) -> str:
     correctly, and `text-indent` (which Qt honours, unlike `padding`) supplies
     the left inset; the line-height leading acts as the vertical padding.
     """
-    label = f"{(lang or '').removeprefix('language-').strip()}"
-    caption = f'<p class="code-lang">{label}</p>' if label else ""
-    klass = "code-body has-lang" if label else "code-body"
-    code = f'<pre class="{klass}">{body}</pre>'
+    label = f"{(lang or '').removeprefix('language-').strip()}" or "код"
+    # the trailing <br> makes a second, empty header line: its block background
+    # is then a solid ~30 px bar (Qt paints block background only over glyph
+    # lines, so a single line would leave the leading as page-coloured gaps)
+    caption = f'<p class="code-lang">{escape(label)}<br></p>'
+    code = f'<pre class="code-body has-lang">{_code_body_html(body)}</pre>'
     return caption + code
+
+
+def _code_body_html(body: str) -> str:
+    """Prepare a fenced body for the `<pre>`.
+
+    Lines stay real newlines: Qt imports each as its own block, so every line
+    keeps the stylesheet's `text-indent` (with one `<br>` block only the first
+    line would be indented). The card is solid because `pre.code-body` uses
+    `line-height: 100%`: adjacent per-line backgrounds then touch, whereas any
+    extra leading left page-coloured stripes between them (invariant 3).
+    """
+    text = body.replace("\r\n", "\n").replace("\r", "\n")
+    if text.endswith("\n"):
+        text = text[:-1]  # a fence's final newline must not become an empty line
+    return text
 
 
 def _checkbox(match: re.Match) -> str:
@@ -268,9 +290,15 @@ def render_json(text: str) -> tuple[str, list[Heading]]:
         html = (
             f'<p class="json-error">JSON не разобран: {message} ({where}). '
             f"Ниже — исходный текст.</p>"
-            f'<pre class="code-body json">{escape(raw, quote=False)}</pre>'
+            f'<p class="code-lang">json<br></p>'
+            f'<pre class="code-body has-lang json">'
+            f"{_code_body_html(escape(raw, quote=False))}</pre>"
         )
         return html, []
     outline: list[Heading] = []
     body = _json_value_html(data, 0, outline, root=isinstance(data, dict))
-    return f'<pre class="code-body json">{body}</pre>', outline
+    return (
+        '<p class="code-lang">json<br></p>'
+        f'<pre class="code-body has-lang json">{_code_body_html(body)}</pre>',
+        outline,
+    )

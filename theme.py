@@ -269,6 +269,23 @@ def side_margin(width: int) -> int:
     return min(side, max(GUTTER_MIN, (width - MIN_COLUMN) // 2))
 
 
+def column_side(width: int, column: int = 0) -> int:
+    """Inset for the reading column: user width `column`, or automatic policy.
+
+    `column == 0` keeps the original `side_margin` behaviour (grow to MEASURE,
+    then centre). A positive value is the width dragged by the column handles:
+    it is clamped to the window (two gutters) and to MIN_COLUMN, and never
+    shrinks below the gutters when the pane itself gets narrow in edit mode.
+    """
+    if column <= 0:
+        return side_margin(width)
+    limit = max(1, width - GUTTER_MIN * 2)
+    target = max(MIN_COLUMN, min(int(column), limit))
+    if limit < MIN_COLUMN:
+        target = limit
+    return max(GUTTER_MIN, (width - target) // 2)
+
+
 def content_css(theme: str = DEFAULT_THEME) -> str:
     """Stylesheet for the rendered document of `theme`."""
     # Local names shadow the dark module constants above, so the CSS body stays
@@ -399,11 +416,13 @@ code {{
    hit-testing inside a multi-line cell is broken, so clicking one code line
    selected from the bottom of the card. */
 p.code-lang {{
-    background-color: {CODE_BG};
+    background-color: {SURFACE};
     color: {TEXT_MUTED};
     font-family: {SANS};
     font-size: 11px;
-    line-height: 150%;
+    /* two tight lines (label + the <br> line) make a solid ~30 px bar: Qt
+       paints a block background only over glyph lines, not over leading */
+    line-height: 100%;
     margin-top: 16px;
     margin-bottom: 0;
     text-indent: 14px;
@@ -412,7 +431,9 @@ p.code-lang {{
 pre.code-body {{
     font-family: {MONO};
     font-size: 0.9em;
-    line-height: 158%;
+    /* 100% keeps adjacent per-line backgrounds touching: any extra leading is
+       painted in the page colour and showed as stripes through the card */
+    line-height: 100%;
     color: {CODE_TEXT};
     background-color: {CODE_BG};
     white-space: pre-wrap;
@@ -792,7 +813,7 @@ QListWidget#treeList::item:selected {{
    top-right corner, and flashes "Скопировано" after a click. */
 #codeCopy {{
     color: {TEXT_MUTED};
-    background-color: {SURFACE};
+    background-color: transparent;  /* sits on the card's header bar */
     border: 1px solid {BORDER};
     border-radius: 5px;
     padding: 2px 8px;
